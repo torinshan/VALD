@@ -26,13 +26,27 @@ tryCatch({
 # BigQuery Configuration and Setup
 ################################################################################
 
-# Get environment variables
-project <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
-dataset <- Sys.getenv("BQ_DATASET", "vald_data")
+# Get environment variables (default dataset now = analytics)
+project  <- Sys.getenv("GCP_PROJECT",  "sac-vald-hub")
+dataset  <- Sys.getenv("BQ_DATASET",   "analytics")
+location <- Sys.getenv("BQ_LOCATION",  "US")
 
-# Authenticate to BigQuery using Application Default Credentials
+cat("GCP Project:", project, "\n")
+cat("BQ Dataset:", dataset, "\n")
+cat("BQ Location:", location, "\n")
+
+# Authenticate to BigQuery (prefer the creds file written by github-auth action)
 tryCatch({
-  bigrquery::bq_auth()
+  cred_candidates <- c(
+    Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+    Sys.getenv("GOOGLE_GHA_CREDS_PATH")
+  )
+  cred_candidates <- cred_candidates[nzchar(cred_candidates) & file.exists(cred_candidates)]
+  if (length(cred_candidates) > 0) {
+    bigrquery::bq_auth(path = cred_candidates[[1]])
+  } else {
+    bigrquery::bq_auth()  # fall back to ambient ADC if available
+  }
 }, error = function(e) {
   cat("BigQuery authentication failed:", e$message, "\n")
   quit(status = 1)
@@ -41,17 +55,18 @@ tryCatch({
 # Create BigQuery connection
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
 
-# Ensure dataset exists
+# Ensure dataset exists (respect location)
 ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
   tryCatch({
-    bq_dataset_create(ds)
-    cat("Created BigQuery dataset:", dataset, "\n")
+    bq_dataset_create(ds, location = location)
+    cat("Created BigQuery dataset:", dataset, "in", location, "\n")
   }, error = function(e) {
     cat("Failed to create BigQuery dataset:", e$message, "\n")
     quit(status = 1)
   })
 }
+
 
 ################################################################################
 # Logging Functions
