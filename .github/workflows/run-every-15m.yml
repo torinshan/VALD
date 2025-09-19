@@ -68,9 +68,7 @@ jobs:
           VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
           VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
           VALD_REGION: use
-        run: |
-          echo "Starting VALD data processing..."
-          Rscript scripts/run.R
+      run: Rscript .github/scripts/run.R
 
       # Optional: check last few log rows (uses analytics dataset)
       - name: Check processing logs
