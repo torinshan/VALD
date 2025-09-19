@@ -19,7 +19,7 @@ jobs:
     
     env:
       GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: vald_data  # Match the script default
+      BQ_DATASET: analytics  # Match the script default
     
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +30,10 @@ jobs:
         with:
           workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
           service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
-          export_environment_variables: true
           create_credentials_file: true
+          token_format: 'access_token'
+          access_token_lifetime: '3600s'
+          scopes: 'https://www.googleapis.com/auth/cloud-platform'
       
       # gcloud + bq CLI for post-run queries
       - name: Setup gcloud SDK
