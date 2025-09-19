@@ -1,30 +1,26 @@
 #!/usr/bin/env Rscript
 
-# Load required libraries
-- suppressPackageStartupMessages({
--   library(bigrquery)
--   library(DBI)
--   library(tidyverse)
--   library(valdr)
--   library(data.table)
--   library(hms)
--   library(lubridate)
-- })
-+ suppressPackageStartupMessages({
-+   library(bigrquery)
-+   library(DBI)
-+   library(dplyr)
-+   library(tidyr)
-+   library(readr)
-+   library(stringr)
-+   library(purrr)
-+   library(tibble)
-+   library(valdr)
-+   library(data.table)
-+   library(hms)
-+   library(lubridate)
-+ })
-
+# Load required libraries with error handling
+tryCatch({
+  suppressPackageStartupMessages({
+    library(bigrquery)
+    library(DBI)
+    library(dplyr)
+    library(tidyr)
+    library(readr)
+    library(stringr)
+    library(purrr)
+    library(tibble)
+    library(valdr)
+    library(data.table)
+    library(hms)
+    library(lubridate)
+  })
+}, error = function(e) {
+  cat("Error loading required packages:", e$message, "\n")
+  cat("Please ensure all required packages are installed\n")
+  quit(status = 1)
+})
 
 ################################################################################
 # BigQuery Configuration and Setup
@@ -35,7 +31,12 @@ project <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
 dataset <- Sys.getenv("BQ_DATASET", "vald_data")
 
 # Authenticate to BigQuery using Application Default Credentials
-bigrquery::bq_auth()
+tryCatch({
+  bigrquery::bq_auth()
+}, error = function(e) {
+  cat("BigQuery authentication failed:", e$message, "\n")
+  quit(status = 1)
+})
 
 # Create BigQuery connection
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
@@ -43,7 +44,13 @@ con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
 # Ensure dataset exists
 ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
-  bq_dataset_create(ds)
+  tryCatch({
+    bq_dataset_create(ds)
+    cat("Created BigQuery dataset:", dataset, "\n")
+  }, error = function(e) {
+    cat("Failed to create BigQuery dataset:", e$message, "\n")
+    quit(status = 1)
+  })
 }
 
 ################################################################################
@@ -66,14 +73,15 @@ create_log_entry <- function(message, level = "INFO") {
   )
   
   log_tbl <- bq_table(ds, "vald_processing_log")
-  if (!bq_table_exists(log_tbl)) {
-    bq_table_create(log_tbl, fields = log_df)
-  }
   
   tryCatch({
+    if (!bq_table_exists(log_tbl)) {
+      bq_table_create(log_tbl, fields = log_df)
+    }
     bq_table_upload(log_tbl, log_df, write_disposition = "WRITE_APPEND")
   }, error = function(e) {
     cat("Failed to write log to BigQuery:", e$message, "\n")
+    # Don't quit here - logging failure shouldn't stop the main process
   })
   
   return(log_message)
@@ -140,14 +148,25 @@ read_bq_table <- function(table_name) {
 # VALD API Setup
 ################################################################################
 
-# API Info
-client_id <- Sys.getenv("VALD_CLIENT_ID", "x8Wjx5KFP6ADOA==")
-client_secret <- Sys.getenv("VALD_CLIENT_SECRET", "exaWIZgFHYNlQjm3g3GZbKmuE2Hz2lQhzAw=")
-tenant_id <- Sys.getenv("VALD_TENANT_ID", "5fdae4f6-232d-46d4-8757-83ef6873f496")
-region <- Sys.getenv("VALD_REGION", "use")
+# API Info with error handling
+tryCatch({
+  client_id <- Sys.getenv("VALD_CLIENT_ID", "x8Wjx5KFP6ADOA==")
+  client_secret <- Sys.getenv("VALD_CLIENT_SECRET", "exaWIZgFHYNlQjm3g3GZbKmuE2Hz2lQhzAw=")
+  tenant_id <- Sys.getenv("VALD_TENANT_ID", "5fdae4f6-232d-46d4-8757-83ef6873f496")
+  region <- Sys.getenv("VALD_REGION", "use")
 
-set_credentials(client_id, client_secret, tenant_id, region)
-set_start_date("2024-01-01T00:00:00Z")
+  if (client_id == "" || client_secret == "" || tenant_id == "") {
+    stop("Missing required VALD API credentials")
+  }
+
+  set_credentials(client_id, client_secret, tenant_id, region)
+  set_start_date("2024-01-01T00:00:00Z")
+  
+  create_log_entry("VALD API credentials configured successfully")
+}, error = function(e) {
+  create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
+  quit(status = 1)
+})
 
 ################################################################################
 # Get Current Data State from BigQuery
@@ -180,8 +199,14 @@ if (nrow(current_dates) > 0) {
 
 count_tests_current <- nrow(test_ids)
 
-# Get all tests from VALD API
-all_tests <- get_forcedecks_tests_only(start_date = NULL) 
+# Get all tests from VALD API with error handling
+tryCatch({
+  all_tests <- get_forcedecks_tests_only(start_date = NULL)
+  create_log_entry("Successfully retrieved tests from VALD API")
+}, error = function(e) {
+  create_log_entry(paste("Failed to retrieve tests from VALD API:", e$message), "ERROR")
+  quit(status = 1)
+})
 
 all_tests <- all_tests %>% 
   mutate(
@@ -395,6 +420,9 @@ append_and_finalize <- function(new_df, old_df, keys = NULL, table_name = "Unkno
 ################################################################################
 # Main Processing Logic
 ################################################################################
+
+# Wrap main processing in error handling
+tryCatch({
 
 # If Statement based code
 if (count_mismatch && date_mismatch) {
@@ -1253,6 +1281,13 @@ if (count_mismatch && date_mismatch) {
   create_log_entry("NO PROCESSING branch completed successfully")
 }
 
+# Catch any errors in main processing
+}, error = function(e) {
+  create_log_entry(paste("CRITICAL ERROR in main processing:", e$message), "ERROR")
+  create_log_entry(paste("Error traceback:", paste(traceback(), collapse = "\n")), "ERROR")
+  quit(status = 1)
+})
+
 # Final script completion logging
 create_log_entry("=== SCRIPT EXECUTION SUMMARY ===")
 create_log_entry(paste("Final route executed:", route_taken))
@@ -1261,4 +1296,10 @@ create_log_entry(paste("Total execution time:",
 create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
 
 # Close BigQuery connection
-DBI::dbDisconnect(con)
+tryCatch({
+  DBI::dbDisconnect(con)
+}, error = function(e) {
+  create_log_entry(paste("Warning: Could not close BigQuery connection:", e$message), "WARN")
+})
+
+cat("Script completed successfully\n")
