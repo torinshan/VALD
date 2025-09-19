@@ -1,20 +1,30 @@
 #!/usr/bin/env Rscript
 
 # Load required libraries
-suppressPackageStartupMessages({
-  library(bigrquery)
-  library(DBI)
-  library(dplyr)
-  library(tidyr)
-  library(readr)
-  library(stringr)
-  library(purrr)
-  library(tibble)
-  library(valdr)
-  library(data.table)
-  library(hms)
-  library(lubridate)
-})
+- suppressPackageStartupMessages({
+-   library(bigrquery)
+-   library(DBI)
+-   library(tidyverse)
+-   library(valdr)
+-   library(data.table)
+-   library(hms)
+-   library(lubridate)
+- })
++ suppressPackageStartupMessages({
++   library(bigrquery)
++   library(DBI)
++   library(dplyr)
++   library(tidyr)
++   library(readr)
++   library(stringr)
++   library(purrr)
++   library(tibble)
++   library(valdr)
++   library(data.table)
++   library(hms)
++   library(lubridate)
++ })
+
 
 ################################################################################
 # BigQuery Configuration and Setup
