@@ -30,7 +30,6 @@ tryCatch({
 project  <- Sys.getenv("GCP_PROJECT",  "sac-vald-hub")
 dataset  <- Sys.getenv("BQ_DATASET",   "analytics")
 location <- Sys.getenv("BQ_LOCATION",  "US")
-
 cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
@@ -45,7 +44,7 @@ tryCatch({
   if (length(cred_candidates) > 0) {
     bigrquery::bq_auth(path = cred_candidates[[1]])
   } else {
-    bigrquery::bq_auth()  # fall back to ambient ADC if available
+    bigrquery::bq_auth()  # fallback to ambient ADC if present
   }
 }, error = function(e) {
   cat("BigQuery authentication failed:", e$message, "\n")
@@ -54,19 +53,15 @@ tryCatch({
 
 # Create BigQuery connection
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
-
-# Ensure dataset exists (respect location)
 ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
-  tryCatch({
-    bq_dataset_create(ds, location = location)
-    cat("Created BigQuery dataset:", dataset, "in", location, "\n")
-  }, error = function(e) {
-    cat("Failed to create BigQuery dataset:", e$message, "\n")
-    quit(status = 1)
-  })
+  bq_dataset_create(ds, location = location)
+  cat("Created BigQuery dataset:", dataset, "in", location, "\n")
 }
-
+- name: Who am I (GCP)?
+  run: |
+    gcloud auth list
+    gcloud config list
 
 ################################################################################
 # Logging Functions
