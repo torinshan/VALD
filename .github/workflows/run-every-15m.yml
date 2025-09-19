@@ -30,6 +30,8 @@ jobs:
         with:
           workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
           service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          export_environment_variables: true
+          create_credentials_file: true
       
       # gcloud + bq CLI for post-run queries
       - name: Setup gcloud SDK
@@ -37,6 +39,17 @@ jobs:
         with:
           project_id: sac-vald-hub
           install_components: bq
+      
+      # Test authentication
+      - name: Test GCP Authentication
+        run: |
+          echo "Testing GCP authentication..."
+          gcloud auth list
+          echo "Testing BigQuery access..."
+          bq ls --project_id=sac-vald-hub || echo "BigQuery test failed"
+          echo "Environment variables:"
+          echo "GOOGLE_APPLICATION_CREDENTIALS: $GOOGLE_APPLICATION_CREDENTIALS"
+          echo "GCLOUD_PROJECT: $GCLOUD_PROJECT"
       
       # R setup (binary packages via RSPM where possible)
       - uses: r-lib/actions/setup-r@v2
