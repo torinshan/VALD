@@ -1,188 +1,105 @@
-name: VALD Data Processing to BigQuery
+name: R → BigQuery every 15m (WIF)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # Every 15 minutes (UTC)
-  workflow_dispatch:         # Manual trigger
-
-env:
-  GCP_PROJECT: sac-vald-hub
-  BQ_DATASET: vald_data
+    - cron: "*/15 * * * *"   # UTC
+  workflow_dispatch:
 
 jobs:
-  process-vald-data:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45      # Increased for comprehensive processing
-    
+    timeout-minutes: 25
+    concurrency:
+      group: vald-q15
+      cancel-in-progress: false
     permissions:
-      id-token: write
+      id-token: write     # needed for keyless auth
       contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        id: auth
+      # Keyless auth to GCP via Workload Identity Federation
+      - id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
           service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
 
-      - name: Set up Cloud SDK
+      # Ensure gcloud + bq CLI are present (handy for summary queries)
+      - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
-
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.3.2'
+          project_id: sac-vald-hub
+          install_components: bq
 
-      - name: Cache R packages
-        uses: actions/cache@v4
+      # R setup (use binaries from RSPM where possible)
+      - uses: r-lib/actions/setup-r@v2
         with:
-          path: ${{ env.R_LIBS_USER }}
-          key: ${{ runner.os }}-r-${{ hashFiles('DESCRIPTION') }}-v2
-          restore-keys: |
-            ${{ runner.os }}-r-
+          use-public-rspm: true
 
-      - name: Install system dependencies
+      # System libs required by curl/xml/graphics-heavy packages
+      - name: System libs
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libcurl4-openssl-dev \
-            libssl-dev \
-            libxml2-dev \
-            libgit2-dev \
-            libharfbuzz-dev \
-            libfribidi-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libpng-dev \
-            libtiff5-dev \
-            libjpeg-dev
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libfreetype6-dev libpng-dev \
+            libtiff5-dev libjpeg-dev zlib1g-dev \
+            libharfbuzz-dev libfribidi-dev
 
-      - name: Install R packages
+      # Install only what the script actually uses (CRAN-only, incl. valdr)
+      - name: Install R packages (CRAN)
         run: |
-          # Install from CRAN
-          install.packages(c(
-            "bigrquery", "DBI", "tidyverse", "data.table", 
-            "hms", "lubridate", "httr", "jsonlite", "remotes"
-          ), repos = "https://cloud.r-project.org", dependencies = TRUE)
-          
-          # Install valdr from GitHub (assuming it's available)
-          # You may need to adjust this based on where valdr is hosted
-          tryCatch({
-            remotes::install_github("valdperformance/valdr")
-          }, error = function(e) {
-            cat("Warning: Could not install valdr package:", e$message, "\n")
-            cat("Please ensure valdr is available or remove valdr dependency\n")
-          })
-        shell: Rscript {0}
+          R -q -e "install.packages(c(
+            'DBI','bigrquery',
+            'dplyr','tidyr','readr','stringr','purrr','tibble',
+            'data.table','hms','lubridate',
+            'httr','jsonlite','xml2','curl',
+            'valdr'
+          ), repos='https://cloud.r-project.org')"
 
-      - name: Create BigQuery dataset if not exists
-        run: |
-          bq mk --location=US --dataset $GCP_PROJECT:$BQ_DATASET || echo "Dataset already exists"
-
-      - name: Upload roster data (if exists)
-        run: |
-          if [ -f ".github/vald_roster.csv" ]; then
-            echo "Uploading roster data to BigQuery..."
-            bq load --source_format=CSV --autodetect \
-              --field_delimiter="," \
-              --replace \
-              $GCP_PROJECT:$BQ_DATASET.vald_roster \
-              .github/vald_roster.csv
-          else
-            echo "No roster data file found at .github/vald_roster.csv"
-          fi
-
-      - name: Run VALD data processing
+      # Run your R script (path must match your repo)
+      - name: Run script
         env:
+          GCP_PROJECT: sac-vald-hub
+          BQ_DATASET: analytics
           VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
           VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
           VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-          VALD_REGION: ${{ secrets.VALD_REGION }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_ACTOR: ${{ github.actor }}
+          VALD_REGION: use
         run: |
           echo "Starting VALD data processing..."
           Rscript scripts/run.R
-        continue-on-error: false
 
-      - name: Check processing results
+      # Optional: check last few log rows (uses analytics dataset)
+      - name: Check processing logs
         if: always()
+        env:
+          GCP_PROJECT: sac-vald-hub
+          BQ_DATASET: analytics
         run: |
           echo "Checking processing logs..."
           bq query --use_legacy_sql=false --format=pretty \
-          --max_rows=20 \
-          "SELECT 
-             timestamp, 
-             level, 
-             message,
-             run_id
-           FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
-           WHERE run_id = '${{ github.run_id }}' 
-           ORDER BY timestamp DESC 
+          "SELECT timestamp, level, message
+           FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\`
+           WHERE run_id = '${{ github.run_id }}'
+           ORDER BY timestamp DESC
            LIMIT 20"
 
-      - name: Validate data upload
-        if: success()
-        run: |
-          echo "Validating data uploads..."
-          
-          # Check each table for row counts
-          tables=("vald_fd_jumps" "vald_fd_dj" "vald_fd_rsi" "vald_fd_rebound" "vald_fd_sl_jumps" "vald_fd_imtp" "vald_nord_all" "dates" "tests")
-          
-          for table in "${tables[@]}"; do
-            echo "Checking $table..."
-            bq query --use_legacy_sql=false --format=csv \
-            "SELECT 
-               '$table' as table_name,
-               COUNT(*) as row_count,
-               MAX(date) as latest_date
-             FROM \`$GCP_PROJECT.$BQ_DATASET.$table\`
-             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)" || echo "$table may be empty or not exist"
-          done
-
+      # Optional: concise summary by level for this run
       - name: Create summary report
-      if: always()
-      env:
-      GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics
-      run: |
-      echo "Creating processing summary..."
-      bq query --use_legacy_sql=false --format=pretty \
-      "SELECT 
-       level,
-       COUNT(*) AS message_count
-     FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
-     WHERE run_id = '${{ github.run_id }}'
-     GROUP BY level
-     ORDER BY level"
-
-      - name: Notify on failure
-        if: failure()
+        if: always()
+        env:
+          GCP_PROJECT: sac-vald-hub
+          BQ_DATASET: analytics
         run: |
-          echo "❌ VALD data processing failed!"
-          echo "Check the logs above and BigQuery processing_log table for details"
-          echo "Run ID: ${{ github.run_id }}"
-          
-          # Get error summary
+          echo "Creating processing summary..."
           bq query --use_legacy_sql=false --format=pretty \
           "SELECT 
-             timestamp, 
-             message
+             level,
+             COUNT(*) AS message_count
            FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
-           WHERE run_id = '${{ github.run_id }}' 
-             AND level IN ('ERROR', 'WARN')
-           ORDER BY timestamp DESC 
-           LIMIT 10" || echo "Could not retrieve error logs"
-
-      - name: Success notification
-        if: success()
-        run: |
-          echo "✅ VALD data processing completed successfully!"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Check BigQuery dataset: $GCP_PROJECT.$BQ_DATASET for updated data"
-          
+           WHERE run_id = '${{ github.run_id }}'
+           GROUP BY level
+           ORDER BY level"
