@@ -69,15 +69,17 @@ jobs:
           ), repos='https://cloud.r-project.org')"
 
       # Run your R script
-      - name: Run R pipeline
-        env:
-          VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
-          VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-          VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-          VALD_REGION: use
-        run: |
-          echo "Starting VALD data processing..."
-          Rscript .github/scripts/run.R
+      name: Run R pipeline
+      env:
+        GCP_PROJECT: sac-vald-hub
+        BQ_DATASET: analytics
+        VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
+        VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
+        VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
+        VALD_REGION: use
+      run: |
+        echo "Starting VALD data processing..."
+        Rscript .github/scripts/run.R
 
       # Inspect logs for this run (don't fail build if empty yet)
       - name: Check processing logs
