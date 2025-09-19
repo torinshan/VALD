@@ -56,11 +56,11 @@ jobs:
             'dplyr','tidyr','readr','stringr','purrr','tibble',
             'data.table','hms','lubridate',
             'httr','jsonlite','xml2','curl',
-            'valdr'
+            'valdr'   # <-- from CRAN
           ), repos='https://cloud.r-project.org')"
 
       # Run your R script (path must match your repo)
-      - name: Run script
+      - name: Run R pipeline
         env:
           GCP_PROJECT: sac-vald-hub
           BQ_DATASET: analytics
@@ -68,7 +68,9 @@ jobs:
           VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
           VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
           VALD_REGION: use
-      run: Rscript .github/scripts/run.R
+        run: |
+          echo "Starting VALD data processing..."
+          Rscript .github/scripts/run.R
 
       # Optional: check last few log rows (uses analytics dataset)
       - name: Check processing logs
@@ -78,12 +80,12 @@ jobs:
           BQ_DATASET: analytics
         run: |
           echo "Checking processing logs..."
-          bq query --use_legacy_sql=false --format=pretty \
+          bq query --use_legacy_sql=false --location=US --format=pretty \
           "SELECT timestamp, level, message
            FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\`
            WHERE run_id = '${{ github.run_id }}'
            ORDER BY timestamp DESC
-           LIMIT 20"
+           LIMIT 20" || echo "No logs yet."
 
       # Optional: concise summary by level for this run
       - name: Create summary report
@@ -93,11 +95,11 @@ jobs:
           BQ_DATASET: analytics
         run: |
           echo "Creating processing summary..."
-          bq query --use_legacy_sql=false --format=pretty \
+          bq query --use_legacy_sql=false --location=US --format=pretty \
           "SELECT 
              level,
              COUNT(*) AS message_count
            FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
            WHERE run_id = '${{ github.run_id }}'
            GROUP BY level
-           ORDER BY level"
+           ORDER BY level" || echo "No summary available."
