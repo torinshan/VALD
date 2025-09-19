@@ -2,7 +2,7 @@ name: R → BigQuery every 15m (WIF)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # UTC
+    - cron: "*/15 * * * *"  # Fixed cron expression
   workflow_dispatch:
 
 jobs:
@@ -12,36 +12,37 @@ jobs:
     concurrency:
       group: vald-q15
       cancel-in-progress: false
+    
     permissions:
-      id-token: write     # needed for keyless auth
+      id-token: write # needed for keyless auth
       contents: read
-
+    
     env:
       GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics
-
+      BQ_DATASET: vald_data  # Match the script default
+    
     steps:
       - uses: actions/checkout@v4
-
+      
       # Keyless auth to GCP via Workload Identity Federation
       - id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
           service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
-
+      
       # gcloud + bq CLI for post-run queries
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: sac-vald-hub
           install_components: bq
-
+      
       # R setup (binary packages via RSPM where possible)
       - uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
-
+      
       # System libs needed by common CRAN packages
       - name: System libs
         run: |
@@ -51,58 +52,88 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libpng-dev \
             libtiff5-dev libjpeg-dev zlib1g-dev \
             libharfbuzz-dev libfribidi-dev
-
+      
       # Fail fast if the script path is wrong
       - name: Verify script exists
         run: |
-          test -f .github/scripts/run.R || { echo "Missing: .github/scripts/run.R"; ls -R; exit 1; }
-
-      # Install only what the script actually uses (CRAN-only, incl. valdr)
+          test -f .github/scripts/run.R || { 
+            echo "Missing: .github/scripts/run.R"; 
+            ls -R; 
+            exit 1; 
+          }
+      
+      # Install R packages with proper error handling
       - name: Install R packages (CRAN)
         run: |
-          R -q -e "install.packages(c(
+          R -q -e "
+          packages <- c(
             'DBI','bigrquery',
             'dplyr','tidyr','readr','stringr','purrr','tibble',
             'data.table','hms','lubridate',
             'httr','jsonlite','xml2','curl',
-            'valdr'
-          ), repos='https://cloud.r-project.org')"
-
-      # Run your R script
-      name: Run R pipeline
-      env:
-        GCP_PROJECT: sac-vald-hub
-        BQ_DATASET: analytics
-        VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
-        VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-        VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-        VALD_REGION: use
-      run: |
-        echo "Starting VALD data processing..."
-        Rscript .github/scripts/run.R
-
+            'valdr',
+            'rlang','lifecycle'
+          )
+          
+          install.packages(packages, repos='https://cloud.r-project.org')
+          
+          # Verify all packages loaded successfully
+          for(pkg in packages) {
+            if(!require(pkg, character.only = TRUE, quietly = TRUE)) {
+              stop(paste('Failed to load package:', pkg))
+            }
+          }
+          
+          cat('All packages installed and loaded successfully\n')
+          "
+      
+      # Run your R script with better error handling
+      - name: Run R pipeline
+        env:
+          VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
+          VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
+          VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
+          VALD_REGION: use
+        run: |
+          echo "Starting VALD data processing..."
+          echo "GCP Project: $GCP_PROJECT"
+          echo "BQ Dataset: $BQ_DATASET"
+          
+          # Run with explicit error handling
+          if ! Rscript .github/scripts/run.R; then
+            echo "R script failed with exit code $?"
+            exit 1
+          fi
+          
+          echo "R script completed successfully"
+      
+      # Create dataset if it doesn't exist
+      - name: Ensure BigQuery dataset exists
+        if: always()
+        run: |
+          echo "Ensuring BigQuery dataset exists..."
+          bq mk --dataset --location=US "$GCP_PROJECT:$BQ_DATASET" || echo "Dataset already exists or creation failed"
+      
       # Inspect logs for this run (don't fail build if empty yet)
       - name: Check processing logs
         if: always()
         run: |
           echo "Checking processing logs..."
           bq query --use_legacy_sql=false --location=US --format=pretty \
-          "SELECT timestamp, level, message
-           FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\`
-           WHERE run_id = '${{ github.run_id }}'
-           ORDER BY timestamp DESC
-           LIMIT 20" || echo "No logs yet."
-
+            "SELECT timestamp, level, message 
+             FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
+             WHERE run_id = '${{ github.run_id }}' 
+             ORDER BY timestamp DESC 
+             LIMIT 20" || echo "No logs yet."
+      
       # Compact summary by level
       - name: Create summary report
         if: always()
         run: |
           echo "Creating processing summary..."
           bq query --use_legacy_sql=false --location=US --format=pretty \
-          "SELECT 
-             level,
-             COUNT(*) AS message_count
-           FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
-           WHERE run_id = '${{ github.run_id }}'
-           GROUP BY level
-           ORDER BY level" || echo "No summary available."
+            "SELECT level, COUNT(*) AS message_count 
+             FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
+             WHERE run_id = '${{ github.run_id }}' 
+             GROUP BY level 
+             ORDER BY level" || echo "No summary available."
