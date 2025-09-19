@@ -107,7 +107,7 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
         run: |
           echo "Starting VALD data processing..."
-          Rscript scripts/vald_processing.R
+          Rscript scripts/run.R
         continue-on-error: false
 
       - name: Check processing results
@@ -146,17 +146,20 @@ jobs:
           done
 
       - name: Create summary report
-        if: always()
-        run: |
-          echo "Creating processing summary..."
-          bq query --use_legacy_sql=false --format=pretty \
-          "SELECT 
-             level,
-             COUNT(*) as message_count
-           FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
-           WHERE run_id = '${{ github.run_id }}'
-           GROUP BY level
-           ORDER BY level"
+      if: always()
+      env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+      run: |
+      echo "Creating processing summary..."
+      bq query --use_legacy_sql=false --format=pretty \
+      "SELECT 
+       level,
+       COUNT(*) AS message_count
+     FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
+     WHERE run_id = '${{ github.run_id }}'
+     GROUP BY level
+     ORDER BY level"
 
       - name: Notify on failure
         if: failure()
