@@ -1,10 +1,10 @@
-name: Debug Access Token
+name: Debug Auth Outputs
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug-token:
+  debug-auth-outputs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     
@@ -28,14 +28,30 @@ jobs:
           token_format: 'access_token'
           access_token_lifetime: '3600s'
       
-      - name: Debug Access Token
+      - name: Debug Auth Step Outputs
         run: |
-          echo "=== Access Token Debug ==="
-          echo "GOOGLE_ACCESS_TOKEN set: $([ -n "$GOOGLE_ACCESS_TOKEN" ] && echo "YES" || echo "NO")"
-          echo "GOOGLE_ACCESS_TOKEN length: ${#GOOGLE_ACCESS_TOKEN}"
-          if [[ -n "$GOOGLE_ACCESS_TOKEN" ]]; then
-            echo "First 20 chars: ${GOOGLE_ACCESS_TOKEN:0:20}..."
-          fi
+          echo "=== Auth Step Outputs ==="
+          echo "Auth step access_token output: ${{ steps.auth.outputs.access_token }}"
+          echo "Auth step token output: ${{ steps.auth.outputs.token }}"
+          echo "Auth step credentials_file_path: ${{ steps.auth.outputs.credentials_file_path }}"
+          
+          echo "=== Environment Variables ==="
+          echo "GOOGLE_ACCESS_TOKEN: $GOOGLE_ACCESS_TOKEN"
+          echo "GOOGLE_APPLICATION_CREDENTIALS: $GOOGLE_APPLICATION_CREDENTIALS"
+          echo "GCLOUD_ACCESS_TOKEN: $GCLOUD_ACCESS_TOKEN"
+          
+          echo "=== All environment variables containing GOOGLE or TOKEN ==="
+          env | grep -i -E "(google|token)" || echo "No matching environment variables found"
+      
+      - name: Try gcloud to get access token
+        run: |
+          echo "=== Getting access token via gcloud ==="
+          gcloud auth print-access-token > access_token.txt
+          echo "Access token length: $(wc -c < access_token.txt)"
+          echo "First 20 chars: $(head -c 20 access_token.txt)..."
+          
+          # Set as environment variable for next step
+          echo "MANUAL_ACCESS_TOKEN=$(cat access_token.txt)" >> $GITHUB_ENV
       
       - uses: r-lib/actions/setup-r@v2
         with:
@@ -45,100 +61,63 @@ jobs:
         run: |
           R -q -e "install.packages(c('bigrquery', 'DBI', 'httr'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')"
       
-      - name: Test Access Token Authentication
+      - name: Test with manual access token
         run: |
           R -q -e "
-          cat('=== Testing Access Token Authentication ===\n')
+          cat('=== Testing with Manual Access Token ===\n')
           
           library(bigrquery)
           library(DBI)
           library(httr)
           
-          # Check if access token is available
-          access_token <- Sys.getenv('GOOGLE_ACCESS_TOKEN')
-          cat('Access token available:', nchar(access_token) > 0, '\n')
-          cat('Access token length:', nchar(access_token), '\n')
+          # Use the access token we got from gcloud
+          access_token <- Sys.getenv('MANUAL_ACCESS_TOKEN')
+          cat('Manual access token length:', nchar(access_token), '\n')
           
           if (nchar(access_token) > 0) {
-            cat('First 20 characters:', substr(access_token, 1, 20), '...\n')
-            
-            # Method A: Use access token directly with httr
-            cat('\n--- Method A: Direct API call with access token ---\n')
+            cat('Testing direct BigQuery API call...\n')
             tryCatch({
-              # Test direct BigQuery API call
               url <- paste0('https://bigquery.googleapis.com/bigquery/v2/projects/', Sys.getenv('GCP_PROJECT'), '/datasets')
               response <- GET(url, add_headers(Authorization = paste('Bearer', access_token)))
               
               if (status_code(response) == 200) {
                 cat('Direct API call SUCCESS\n')
-                content_data <- content(response, as = 'parsed')
-                cat('Found', length(content_data\$datasets), 'datasets\n')
+                
+                # Now try to use this token with bigrquery
+                cat('Setting token for bigrquery...\n')
+                
+                # Method 1: Try setting environment variable
+                Sys.setenv(GOOGLE_ACCESS_TOKEN = access_token)
+                
+                # Clear any existing auth
+                bq_deauth()
+                
+                # Try to authenticate
+                bq_auth()
+                
+                # Test BigQuery connection
+                con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+                result <- dbGetQuery(con, 'SELECT 1 as test_value')
+                dbDisconnect(con)
+                
+                cat('BigQuery connection test PASSED\n')
+                cat('SUCCESS: Authentication working with manual access token\n')
+                
               } else {
-                cat('Direct API call FAILED with status:', status_code(response), '\n')
+                cat('Direct API call failed with status:', status_code(response), '\n')
+                cat('Response content:', content(response, as = 'text'), '\n')
               }
               
             }, error = function(e) {
-              cat('Method A FAILED:', e\$message, '\n')
+              cat('Error:', e\$message, '\n')
             })
-            
-            # Method B: Create OAuth token object for bigrquery
-            cat('\n--- Method B: OAuth token for bigrquery ---\n')
-            tryCatch({
-              # Create token object
-              token_obj <- oauth2.0_token(
-                endpoint = oauth_endpoints('google'),
-                app = oauth_app('bigrquery', key = 'dummy', secret = 'dummy'),
-                credentials = list(access_token = access_token)
-              )
-              
-              # Set token for bigrquery
-              bq_auth(token = token_obj)
-              cat('Token object created and set\n')
-              
-              # Test BigQuery connection
-              con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
-              result <- dbGetQuery(con, 'SELECT 1 as test_value')
-              dbDisconnect(con)
-              cat('BigQuery connection test PASSED\n')
-              cat('Method B SUCCESS: OAuth token approach\n')
-              quit(status = 0)
-              
-            }, error = function(e) {
-              cat('Method B FAILED:', e\$message, '\n')
-            })
-            
-            # Method C: Set token as environment variable for gargle
-            cat('\n--- Method C: Environment variable approach ---\n')
-            tryCatch({
-              # Set the token for gargle to find
-              Sys.setenv(GARGLE_OAUTH_TOKEN = access_token)
-              
-              # Clear existing auth and try again
-              bq_deauth()
-              bq_auth()
-              
-              # Test BigQuery connection
-              con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
-              result <- dbGetQuery(con, 'SELECT 1 as test_value')
-              dbDisconnect(con)
-              cat('BigQuery connection test PASSED\n')
-              cat('Method C SUCCESS: Environment variable approach\n')
-              quit(status = 0)
-              
-            }, error = function(e) {
-              cat('Method C FAILED:', e\$message, '\n')
-            })
-            
           } else {
-            cat('No access token found in environment\n')
+            cat('No manual access token available\n')
           }
-          
-          cat('All access token methods failed\n')
-          quit(status = 1)
           "
       
       - name: Summary
         if: always()
         run: |
           echo "=== Summary ==="
-          echo "This test checks if we can use the access token instead of the credentials file."
+          echo "This checks auth step outputs and tries to get access token manually via gcloud."
