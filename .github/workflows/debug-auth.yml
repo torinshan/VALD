@@ -1,0 +1,145 @@
+name: Debug Authentication
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: 'access_token'
+          access_token_lifetime: '3600s'
+      
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: sac-vald-hub
+          install_components: bq
+      
+      - name: Debug Environment Variables
+        run: |
+          echo "=== Environment Variables ==="
+          echo "GOOGLE_APPLICATION_CREDENTIALS: $GOOGLE_APPLICATION_CREDENTIALS"
+          echo "GOOGLE_GHA_CREDS_PATH: $GOOGLE_GHA_CREDS_PATH"
+          echo "GCLOUD_PROJECT: $GCLOUD_PROJECT"
+          echo "GOOGLE_CLOUD_PROJECT: $GOOGLE_CLOUD_PROJECT"
+          echo "GCP_PROJECT: $GCP_PROJECT"
+          echo "BQ_DATASET: $BQ_DATASET"
+          
+      - name: Debug File System
+        run: |
+          echo "=== File System Debug ==="
+          echo "Working directory: $(pwd)"
+          echo "Files in working directory:"
+          ls -la
+          echo "Looking for credential files:"
+          find . -name "*creds*" -o -name "*.json" | head -10
+          if [[ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+            echo "Credentials file details:"
+            ls -la "$GOOGLE_APPLICATION_CREDENTIALS" || echo "Credentials file not found"
+            if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+              echo "First 100 characters of credentials file:"
+              head -c 100 "$GOOGLE_APPLICATION_CREDENTIALS"
+            fi
+          fi
+      
+      - name: Test gcloud Authentication
+        run: |
+          echo "=== Testing gcloud Authentication ==="
+          gcloud auth list
+          echo "Active account:"
+          gcloud auth list --filter=status:ACTIVE --format="value(account)"
+          echo "Testing gcloud access:"
+          gcloud projects describe $GCP_PROJECT || echo "gcloud project access failed"
+      
+      - name: Test BigQuery CLI
+        run: |
+          echo "=== Testing BigQuery CLI ==="
+          bq ls --project_id=$GCP_PROJECT || echo "BigQuery CLI access failed"
+          bq query --use_legacy_sql=false --location=US "SELECT 1 as test" || echo "BigQuery query failed"
+      
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      
+      - name: Install minimal R packages
+        run: |
+          R -q -e "
+          install.packages(c('bigrquery', 'DBI'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')
+          "
+      
+      - name: Test R Authentication
+        run: |
+          R -q -e "
+          cat('=== R Authentication Test ===\n')
+          
+          library(bigrquery)
+          library(DBI)
+          
+          cat('Environment variables in R:\n')
+          cat('GOOGLE_APPLICATION_CREDENTIALS:', Sys.getenv('GOOGLE_APPLICATION_CREDENTIALS'), '\n')
+          cat('GCP_PROJECT:', Sys.getenv('GCP_PROJECT'), '\n')
+          
+          creds_file <- Sys.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+          cat('Credentials file path:', creds_file, '\n')
+          cat('File exists:', file.exists(creds_file), '\n')
+          
+          if (file.exists(creds_file)) {
+            cat('File size:', file.size(creds_file), 'bytes\n')
+            cat('File permissions:\n')
+            print(file.info(creds_file))
+          }
+          
+          cat('Attempting authentication...\n')
+          tryCatch({
+            if (nchar(creds_file) > 0 && file.exists(creds_file)) {
+              cat('Using credentials file\n')
+              bq_auth(path = creds_file)
+            } else {
+              cat('Using default authentication\n')
+              bq_auth()
+            }
+            cat('Authentication appeared successful\n')
+          }, error = function(e) {
+            cat('Authentication error:', e\$message, '\n')
+            quit(status = 1)
+          })
+          
+          cat('Testing BigQuery connection...\n')
+          tryCatch({
+            con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+            result <- dbGetQuery(con, 'SELECT 1 as test_value')
+            dbDisconnect(con)
+            cat('BigQuery test successful. Result:', result\$test_value, '\n')
+          }, error = function(e) {
+            cat('BigQuery connection error:', e\$message, '\n')
+            quit(status = 1)
+          })
+          
+          cat('All authentication tests passed!\n')
+          "
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Debug Summary ==="
+          echo "Check the logs above to identify where authentication is failing."
+          echo "The test progresses through: Environment -> Files -> gcloud -> bq CLI -> R"
