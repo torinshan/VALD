@@ -83,7 +83,7 @@ jobs:
       - name: Install minimal R packages
         run: |
           R -q -e "
-          install.packages(c('bigrquery', 'DBI'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')
+          install.packages(c('bigrquery', 'DBI', 'gargle', 'jsonlite'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')
           "
       
       - name: Test R Authentication Methods
@@ -234,5 +234,5 @@ jobs:
         if: always()
         run: |
           echo "=== Debug Summary ==="
-          echo "Check the logs above to identify where authentication is failing."
-          echo "The test progresses through: Environment -> Files -> gcloud -> bq CLI -> R"
+          echo "Check the logs above to identify which authentication method works."
+          echo "The test progresses through 6 different R authentication approaches."
