@@ -48,15 +48,6 @@ jobs:
         with:
           use-public-rspm: true
       
-      # Cache R packages to speed up builds
-      - name: Cache R packages
-        uses: actions/cache@v3
-        with:
-          path: /home/runner/work/_temp/Library
-          key: ${{ runner.os }}-r-${{ hashFiles('**/*.R') }}
-          restore-keys: |
-            ${{ runner.os }}-r-
-
       - name: System libs
         run: |
           sudo apt-get update
@@ -69,28 +60,26 @@ jobs:
       - name: Verify script exists
         run: test -f .github/scripts/run.R
       
-      - name: Install R packages (CRAN)
+      # Cache R packages to speed up builds
+      - name: Cache R packages
+        uses: actions/cache@v3
+        with:
+          path: /home/runner/work/_temp/Library
+          key: ${{ runner.os }}-r-${{ hashFiles('**/*.R') }}
+          restore-keys: |
+            ${{ runner.os }}-r-
+
+      # Install only core packages
+      - name: Install R packages
         run: |
           R -q -e "
-          packages <- c(
-            'DBI','bigrquery',
-            'dplyr','tidyr','readr','stringr','purrr','tibble',
-            'data.table','hms','lubridate',
-            'httr','jsonlite','xml2','curl',
-            'valdr',
-            'rlang','lifecycle'
-          )
-          
-          install.packages(packages, repos='https://packagemanager.posit.co/cran/__linux__/noble/latest', Ncpus = parallel::detectCores())
-          
-          # Verify all packages loaded successfully
+          packages <- c('bigrquery','dplyr','data.table','lubridate','valdr')
+          install.packages(packages, repos='https://packagemanager.posit.co/cran/__linux__/noble/latest', Ncpus=2)
           for(pkg in packages) {
             if(!require(pkg, character.only = TRUE, quietly = TRUE)) {
               stop(paste('Failed to load package:', pkg))
             }
           }
-          
-          cat('All packages installed and loaded successfully\n')
           "
       
       - name: Run R pipeline
