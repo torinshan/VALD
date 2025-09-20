@@ -39,14 +39,44 @@ cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
 
-# Authenticate to BigQuery
+# Authenticate to BigQuery using working method
 tryCatch({
-  creds_file <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-  if (nchar(creds_file) > 0 && file.exists(creds_file)) {
-    bigrquery::bq_auth(path = creds_file)
+  cat("=== Authenticating to BigQuery ===\n")
+  
+  # Get access token from gcloud (this works since gcloud auth is successful)
+  access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
+  access_token <- access_token_result[1]  # Get first line
+  
+  if (nchar(access_token) > 0) {
+    cat("Access token obtained from gcloud\n")
+    
+    # Create gargle token object (Method 4 from debug - this works!)
+    library(gargle)
+    token <- gargle::gargle2.0_token(
+      scope = 'https://www.googleapis.com/auth/bigquery',
+      client = gargle::gargle_client(),
+      credentials = list(access_token = access_token)
+    )
+    
+    # Set token for bigrquery
+    bigrquery::bq_auth(token = token)
+    cat("BigQuery authentication successful\n")
+    
+    # Test authentication immediately
+    test_con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
+    test_result <- DBI::dbGetQuery(test_con, "SELECT 1 as test")
+    DBI::dbDisconnect(test_con)
+    
+    if (nrow(test_result) == 1 && test_result$test == 1) {
+      cat("Authentication test passed\n")
+    } else {
+      stop("Authentication test failed")
+    }
+    
   } else {
-    bigrquery::bq_auth()
+    stop("Could not obtain access token from gcloud")
   }
+  
 }, error = function(e) {
   cat("BigQuery authentication failed:", e$message, "\n")
   quit(status = 1)
