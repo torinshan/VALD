@@ -86,7 +86,7 @@ jobs:
           install.packages(c('bigrquery', 'DBI'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')
           "
       
-      - name: Test R Authentication
+      - name: Test R Authentication Methods
         run: |
           R -q -e "
           cat('=== R Authentication Test ===\n')
@@ -102,39 +102,132 @@ jobs:
           cat('Credentials file path:', creds_file, '\n')
           cat('File exists:', file.exists(creds_file), '\n')
           
-          if (file.exists(creds_file)) {
-            cat('File size:', file.size(creds_file), 'bytes\n')
-            cat('File permissions:\n')
-            print(file.info(creds_file))
-          }
-          
-          cat('Attempting authentication...\n')
+          # Method 1: Default bq_auth() - no parameters
+          cat('\n--- Method 1: Default bq_auth() ---\n')
           tryCatch({
-            if (nchar(creds_file) > 0 && file.exists(creds_file)) {
-              cat('Using credentials file\n')
-              bq_auth(path = creds_file)
-            } else {
-              cat('Using default authentication\n')
-              bq_auth()
-            }
-            cat('Authentication appeared successful\n')
-          }, error = function(e) {
-            cat('Authentication error:', e\$message, '\n')
-            quit(status = 1)
-          })
-          
-          cat('Testing BigQuery connection...\n')
-          tryCatch({
+            bq_auth()
+            cat('Method 1 SUCCESS: Default bq_auth()\n')
+            
+            # Test BigQuery connection
             con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
             result <- dbGetQuery(con, 'SELECT 1 as test_value')
             dbDisconnect(con)
-            cat('BigQuery test successful. Result:', result\$test_value, '\n')
+            cat('BigQuery connection test PASSED\n')
+            cat('SUCCESS: Authentication working with default bq_auth()\n')
+            quit(status = 0)
+            
           }, error = function(e) {
-            cat('BigQuery connection error:', e\$message, '\n')
-            quit(status = 1)
+            cat('Method 1 FAILED:', e\$message, '\n')
           })
           
-          cat('All authentication tests passed!\n')
+          # Method 2: bq_auth with explicit path
+          cat('\n--- Method 2: bq_auth(path = file) ---\n')
+          tryCatch({
+            bq_auth(path = creds_file)
+            cat('Method 2 SUCCESS: bq_auth with path\n')
+            
+            # Test BigQuery connection
+            con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+            result <- dbGetQuery(con, 'SELECT 1 as test_value')
+            dbDisconnect(con)
+            cat('BigQuery connection test PASSED\n')
+            cat('SUCCESS: Authentication working with explicit path\n')
+            quit(status = 0)
+            
+          }, error = function(e) {
+            cat('Method 2 FAILED:', e\$message, '\n')
+          })
+          
+          # Method 3: Use gargle directly
+          cat('\n--- Method 3: Using gargle directly ---\n')
+          tryCatch({
+            library(gargle)
+            cat('Trying gargle::credentials_service_account()\n')
+            token <- credentials_service_account(path = creds_file)
+            cat('Gargle token created successfully\n')
+            
+            # Set the token for bigrquery
+            bq_auth(token = token)
+            cat('Method 3 SUCCESS: gargle token\n')
+            
+            # Test BigQuery connection
+            con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+            result <- dbGetQuery(con, 'SELECT 1 as test_value')
+            dbDisconnect(con)
+            cat('BigQuery connection test PASSED\n')
+            cat('SUCCESS: Authentication working with gargle token\n')
+            quit(status = 0)
+            
+          }, error = function(e) {
+            cat('Method 3 FAILED:', e\$message, '\n')
+          })
+          
+          # Method 4: Set GOOGLE_APPLICATION_CREDENTIALS and restart session
+          cat('\n--- Method 4: Reset and try again ---\n')
+          tryCatch({
+            # Clear any existing auth
+            bq_deauth()
+            cat('Cleared existing auth\n')
+            
+            # Set environment variable explicitly
+            Sys.setenv(GOOGLE_APPLICATION_CREDENTIALS = creds_file)
+            cat('Set GOOGLE_APPLICATION_CREDENTIALS explicitly\n')
+            
+            # Try auth again
+            bq_auth()
+            cat('Method 4 SUCCESS: After reset\n')
+            
+            # Test BigQuery connection
+            con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+            result <- dbGetQuery(con, 'SELECT 1 as test_value')
+            dbDisconnect(con)
+            cat('BigQuery connection test PASSED\n')
+            cat('SUCCESS: Authentication working after reset\n')
+            quit(status = 0)
+            
+          }, error = function(e) {
+            cat('Method 4 FAILED:', e\$message, '\n')
+          })
+          
+          # Method 5: Check if its a scope issue
+          cat('\n--- Method 5: Try with specific scopes ---\n')
+          tryCatch({
+            bq_deauth()
+            bq_auth(scopes = 'https://www.googleapis.com/auth/bigquery')
+            cat('Method 5 SUCCESS: With specific scopes\n')
+            
+            # Test BigQuery connection
+            con <- dbConnect(bigquery(), project = Sys.getenv('GCP_PROJECT'))
+            result <- dbGetQuery(con, 'SELECT 1 as test_value')
+            dbDisconnect(con)
+            cat('BigQuery connection test PASSED\n')
+            cat('SUCCESS: Authentication working with specific scopes\n')
+            quit(status = 0)
+            
+          }, error = function(e) {
+            cat('Method 5 FAILED:', e\$message, '\n')
+          })
+          
+          # Method 6: Check the credentials file content format
+          cat('\n--- Method 6: Debug credentials file format ---\n')
+          tryCatch({
+            library(jsonlite)
+            creds_content <- fromJSON(creds_file)
+            cat('Credentials file type:', creds_content\$type, '\n')
+            cat('Available fields:', paste(names(creds_content), collapse=', '), '\n')
+            
+            if ('type' %in% names(creds_content) && creds_content\$type == 'external_account') {
+              cat('This is a workload identity federation credential\n')
+              cat('Audience:', creds_content\$audience, '\n')
+              cat('Subject token type:', creds_content\$subject_token_type, '\n')
+            }
+            
+          }, error = function(e) {
+            cat('Method 6 FAILED:', e\$message, '\n')
+          })
+          
+          cat('\n=== All authentication methods failed ===\n')
+          quit(status = 1)
           "
       
       - name: Summary
