@@ -73,7 +73,14 @@ jobs:
       - name: Install R packages
         run: |
           R -q -e "
-          packages <- c('bigrquery','dplyr','data.table','lubridate','valdr')
+          packages <- c(
+            'DBI','bigrquery',
+            'dplyr','tidyr','readr','stringr','purrr','tibble',
+            'data.table','hms','lubridate',
+            'httr','jsonlite','xml2','curl',
+            'valdr','gargle',
+            'rlang','lifecycle'
+          )
           install.packages(packages, repos='https://packagemanager.posit.co/cran/__linux__/noble/latest', Ncpus=2)
           for(pkg in packages) {
             if(!require(pkg, character.only = TRUE, quietly = TRUE)) {
