@@ -2,7 +2,7 @@ name: R → BigQuery every 15m (WIF)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # Fixed cron expression
+    - cron: "*/15 * * * *"  # Every 15 minutes
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     
     env:
       GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics  # Match the script default
+      BQ_DATASET: analytics
     
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +33,6 @@ jobs:
           create_credentials_file: true
           token_format: 'access_token'
           access_token_lifetime: '3600s'
-          scopes: 'https://www.googleapis.com/auth/cloud-platform'
       
       # gcloud + bq CLI for post-run queries
       - name: Setup gcloud SDK
@@ -42,16 +41,45 @@ jobs:
           project_id: sac-vald-hub
           install_components: bq
       
-      # Test authentication
+      # Test authentication before proceeding
       - name: Test GCP Authentication
         run: |
           echo "Testing GCP authentication..."
-          gcloud auth list
+          gcloud auth list --filter=status:ACTIVE --format="value(account)" || {
+            echo "❌ gcloud authentication failed"
+            exit 1
+          }
+          
           echo "Testing BigQuery access..."
-          bq ls --project_id=sac-vald-hub || echo "BigQuery test failed"
-          echo "Environment variables:"
-          echo "GOOGLE_APPLICATION_CREDENTIALS: $GOOGLE_APPLICATION_CREDENTIALS"
-          echo "GCLOUD_PROJECT: $GCLOUD_PROJECT"
+          bq ls --project_id=sac-vald-hub --max_results=1 || {
+            echo "❌ BigQuery access failed"
+            exit 1
+          }
+          
+          echo "✅ Authentication successful"
+          echo "Active service account: $(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          
+          # Verify credentials file exists and is readable
+          if [[ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+            echo "Credentials file: $GOOGLE_APPLICATION_CREDENTIALS"
+            if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+              echo "✅ Credentials file exists and is readable"
+              # Show first few characters to verify it's a valid JSON
+              head -c 50 "$GOOGLE_APPLICATION_CREDENTIALS" | grep -q "{"
+              if [[ $? -eq 0 ]]; then
+                echo "✅ Credentials file appears to be valid JSON"
+              else
+                echo "❌ Credentials file doesn't appear to be valid JSON"
+                exit 1
+              fi
+            else
+              echo "❌ Credentials file not found"
+              exit 1
+            fi
+          else
+            echo "❌ GOOGLE_APPLICATION_CREDENTIALS not set"
+            exit 1
+          fi
       
       # R setup (binary packages via RSPM where possible)
       - uses: r-lib/actions/setup-r@v2
@@ -72,15 +100,18 @@ jobs:
       - name: Verify script exists
         run: |
           test -f .github/scripts/run.R || { 
-            echo "Missing: .github/scripts/run.R"; 
-            ls -R; 
+            echo "❌ Missing: .github/scripts/run.R"; 
+            ls -la .github/scripts/ || echo "No scripts directory found"
             exit 1; 
           }
+          echo "✅ R script found"
       
       # Install R packages with proper error handling
       - name: Install R packages (CRAN)
         run: |
           R -q -e "
+          cat('Installing required packages...\n')
+          
           packages <- c(
             'DBI','bigrquery',
             'dplyr','tidyr','readr','stringr','purrr','tibble',
@@ -90,16 +121,23 @@ jobs:
             'rlang','lifecycle'
           )
           
-          install.packages(packages, repos='https://cloud.r-project.org')
+          # Install packages
+          install.packages(packages, repos='https://cloud.r-project.org', dependencies=TRUE)
           
-          # Verify all packages loaded successfully
+          # Verify all packages can be loaded
+          failed_packages <- c()
           for(pkg in packages) {
             if(!require(pkg, character.only = TRUE, quietly = TRUE)) {
-              stop(paste('Failed to load package:', pkg))
+              failed_packages <- c(failed_packages, pkg)
             }
           }
           
-          cat('All packages installed and loaded successfully\n')
+          if(length(failed_packages) > 0) {
+            cat('❌ Failed to load packages:', paste(failed_packages, collapse=', '), '\n')
+            quit(status = 1)
+          }
+          
+          cat('✅ All packages installed and loaded successfully\n')
           "
       
       # Run your R script with better error handling
@@ -110,24 +148,40 @@ jobs:
           VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
           VALD_REGION: use
         run: |
-          echo "Starting VALD data processing..."
+          echo "🚀 Starting VALD data processing..."
           echo "GCP Project: $GCP_PROJECT"
           echo "BQ Dataset: $BQ_DATASET"
+          echo "Credentials file: $GOOGLE_APPLICATION_CREDENTIALS"
           
-          # Run with explicit error handling
-          if ! Rscript .github/scripts/run.R; then
-            echo "R script failed with exit code $?"
+          # Verify credentials are still valid before running R
+          gcloud auth list --filter=status:ACTIVE --format="value(account)" > /dev/null || {
+            echo "❌ Authentication lost before R execution"
+            exit 1
+          }
+          
+          # Run R script with explicit error handling
+          if Rscript .github/scripts/run.R; then
+            echo "✅ R script completed successfully"
+          else
+            R_EXIT_CODE=$?
+            echo "❌ R script failed with exit code $R_EXIT_CODE"
             exit 1
           fi
-          
-          echo "R script completed successfully"
       
       # Create dataset if it doesn't exist
       - name: Ensure BigQuery dataset exists
         if: always()
         run: |
           echo "Ensuring BigQuery dataset exists..."
-          bq mk --dataset --location=US "$GCP_PROJECT:$BQ_DATASET" || echo "Dataset already exists or creation failed"
+          bq mk --dataset --location=US "$GCP_PROJECT:$BQ_DATASET" 2>/dev/null || {
+            # Check if it failed because dataset already exists
+            if bq ls --project_id="$GCP_PROJECT" | grep -q "$BQ_DATASET"; then
+              echo "✅ Dataset already exists"
+            else
+              echo "❌ Failed to create dataset and it doesn't exist"
+              exit 1
+            fi
+          }
       
       # Inspect logs for this run (don't fail build if empty yet)
       - name: Check processing logs
@@ -139,7 +193,7 @@ jobs:
              FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
              WHERE run_id = '${{ github.run_id }}' 
              ORDER BY timestamp DESC 
-             LIMIT 20" || echo "No logs yet."
+             LIMIT 20" 2>/dev/null || echo "ℹ️ No logs yet or table doesn't exist."
       
       # Compact summary by level
       - name: Create summary report
@@ -151,4 +205,4 @@ jobs:
              FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
              WHERE run_id = '${{ github.run_id }}' 
              GROUP BY level 
-             ORDER BY level" || echo "No summary available."
+             ORDER BY level" 2>/dev/null || echo "ℹ️ No summary available yet."
