@@ -1117,12 +1117,21 @@ if (count_mismatch && date_mismatch) {
             (100 - percent_rank(start_to_peak_force) * 100) +
             percent_rank(rfd_at_100ms) * 100,
           performance_score = percent_rank(calc_performance_score) * 100
-        ) %>%
-        group_by(team) %>%
-        mutate(
-          team_performance_score = percent_rank(calc_performance_score) * 100
-        ) %>%
-        ungroup() %>%
+        )
+      
+      # Only add team performance score if team column exists
+      if ("team" %in% names(forcedecks_IMTP_clean)) {
+        forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
+          group_by(team) %>%
+          mutate(
+            team_performance_score = percent_rank(calc_performance_score) * 100
+          ) %>%
+          ungroup()
+      } else {
+        create_log_entry("No team column found in IMTP data, skipping team performance scores", "WARN")
+      }
+      
+      forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
         select(-calc_performance_score)
     }
     
