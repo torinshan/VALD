@@ -73,7 +73,7 @@ jobs:
       - name: Install R packages
         run: |
           R -q -e "
-          packages <- c(
+          rpackages <- c(
             'DBI','bigrquery',
             'dplyr','tidyr','readr','stringr','purrr','tibble',
             'data.table','hms','lubridate',
