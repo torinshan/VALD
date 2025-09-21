@@ -134,6 +134,62 @@ create_log_entry(paste("BigQuery dataset:", dataset))
 # BigQuery Helper Functions
 ################################################################################
 
+# Fix data type for body_weight_lbs in vald_fd_rsi table
+fix_rsi_data_type <- function() {
+  create_log_entry("Checking and fixing body_weight_lbs data type in vald_fd_rsi table")
+  
+  # Check current data type
+  check_query <- sprintf("SELECT data_type FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` 
+                         WHERE table_name = 'vald_fd_rsi' AND column_name = 'body_weight_lbs'", 
+                        project, dataset)
+  
+  tryCatch({
+    current_type <- DBI::dbGetQuery(con, check_query)
+    
+    if (nrow(current_type) > 0 && current_type$data_type[1] == "STRING") {
+      create_log_entry("body_weight_lbs is STRING type, converting to FLOAT64")
+      
+      fix_query <- sprintf("
+        CREATE OR REPLACE TABLE `%s.%s.vald_fd_rsi` AS 
+        SELECT 
+          * EXCEPT(body_weight_lbs),
+          SAFE_CAST(body_weight_lbs AS FLOAT64) AS body_weight_lbs
+        FROM `%s.%s.vald_fd_rsi`
+      ", project, dataset, project, dataset)
+      
+      DBI::dbExecute(con, fix_query)
+      create_log_entry("Successfully converted body_weight_lbs to FLOAT64 in vald_fd_rsi")
+      
+    } else {
+      create_log_entry("body_weight_lbs is already FLOAT64 type or column not found")
+    }
+    
+  }, error = function(e) {
+    create_log_entry(paste("Error checking/fixing body_weight_lbs data type:", e$message), "WARN")
+  })
+}
+
+# Check if table exists and has data
+table_exists_and_has_data <- function(table_name) {
+  tbl <- bq_table(ds, table_name)
+  if (!bq_table_exists(tbl)) {
+    create_log_entry(paste("Table", table_name, "does not exist"), "WARN")
+    return(FALSE)
+  }
+  
+  # Check if table has any rows
+  tryCatch({
+    count_query <- sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", project, dataset, table_name)
+    result <- DBI::dbGetQuery(con, count_query)
+    has_data <- result$row_count > 0
+    create_log_entry(paste("Table", table_name, "exists with", result$row_count, "rows"))
+    return(has_data)
+  }, error = function(e) {
+    create_log_entry(paste("Error checking table", table_name, "row count:", e$message), "ERROR")
+    return(FALSE)
+  })
+}
+
 safe_bq_query <- function(query, description = "") {
   tryCatch({
     result <- DBI::dbGetQuery(con, query)
@@ -171,9 +227,23 @@ upload_to_bq <- function(data, table_name, write_disposition = "WRITE_TRUNCATE")
   })
 }
 
+# Read BQ table with proper error handling
 read_bq_table <- function(table_name) {
+  if (!table_exists_and_has_data(table_name)) {
+    create_log_entry(paste("Table", table_name, "does not exist or is empty, returning empty data frame"), "INFO")
+    return(data.frame())
+  }
+  
   query <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
-  return(safe_bq_query(query, paste("reading", table_name)))
+  result <- safe_bq_query(query, paste("reading", table_name))
+  
+  if (nrow(result) == 0) {
+    create_log_entry(paste("Table", table_name, "exists but returned no data"), "WARN")
+    return(data.frame())
+  }
+  
+  create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows"))
+  return(result)
 }
 
 ################################################################################
@@ -200,8 +270,16 @@ tryCatch({
 })
 
 ################################################################################
+# Fix RSI Data Type Issue
+################################################################################
+
+fix_rsi_data_type()
+
+################################################################################
 # Get Current Data State from BigQuery
 ################################################################################
+
+create_log_entry("=== READING CURRENT DATA STATE FROM BIGQUERY ===")
 
 current_dates <- read_bq_table("dates")
 if (nrow(current_dates) > 0) {
@@ -209,15 +287,19 @@ if (nrow(current_dates) > 0) {
     select(date) %>% 
     unique() %>%
     mutate(date = as.Date(date))
+  create_log_entry(paste("Found", nrow(current_dates), "existing dates in BigQuery"))
 } else {
   current_dates <- data.frame(date = as.Date(character(0)))
+  create_log_entry("No existing dates found in BigQuery")
 }
 
 test_ids <- read_bq_table("tests")
 if (nrow(test_ids) > 0) {
   test_ids <- test_ids %>% unique()
+  create_log_entry(paste("Found", nrow(test_ids), "existing tests in BigQuery"))
 } else {
   test_ids <- data.frame(test_ID = character(0))
+  create_log_entry("No existing tests found in BigQuery")
 }
 
 if (nrow(current_dates) > 0) {
@@ -227,6 +309,14 @@ if (nrow(current_dates) > 0) {
 }
 
 count_tests_current <- nrow(test_ids)
+
+create_log_entry(paste("Current state - Latest date:", latest_date_current, "Test count:", count_tests_current))
+
+################################################################################
+# Get All Tests from VALD API
+################################################################################
+
+create_log_entry("=== FETCHING ALL TESTS FROM VALD API ===")
 
 tryCatch({
   all_tests <- get_forcedecks_tests_only(start_date = NULL)
@@ -267,6 +357,8 @@ all_count <- all_tests %>%
 
 latest_date_all <- max(all_dates$date, na.rm = TRUE)
 count_tests_all <- nrow(all_count)
+
+create_log_entry(paste("API data - Latest date:", latest_date_all, "Test count:", count_tests_all))
 
 date_mismatch <- latest_date_current != latest_date_all
 count_mismatch <- count_tests_current != count_tests_all
@@ -427,6 +519,7 @@ if (count_mismatch && date_mismatch) {
   set_start_date(date_count_start_date)
   
   # Import existing data from BigQuery
+  create_log_entry("=== IMPORTING EXISTING DATA FROM BIGQUERY ===")
   forcedecks_jump_clean_imported <- read_bq_table("vald_fd_jumps")
   forcedecks_SLJ_clean_imported <- read_bq_table("vald_fd_sl_jumps")
   nordboard_clean_imported <- read_bq_table("vald_nord_all")
