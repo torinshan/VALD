@@ -415,65 +415,69 @@ clean_column_headers <- function(df, remove_index = TRUE) {
   return(df)
 }
 
-process_vald_roster_detailed <- function(roster_data) {
-  roster_processed <- roster_data %>%
-    filter(!is.na(`Category 1`) | !is.na(`Group 1`)) %>%
-    mutate(
-      team = `Category 1`,
-      sport = case_when(
-        str_detect(team, "Football") ~ "Football",
-        str_detect(team, "Soccer") ~ "Soccer", 
-        str_detect(team, "Basketball") ~ "Basketball",
-        str_detect(team, "Softball") ~ "Softball",
-        str_detect(team, "Gymnastics") ~ "Gymnastics",
-        str_detect(team, "Track") ~ "Track & Field",
-        str_detect(team, "Volleyball") ~ "Volleyball",
-        TRUE ~ "Other"
-      ),
-      position = case_when(
-        !is.na(`Group 4`) & sport == "Football" ~ `Group 4`,
-        !is.na(`Group 3`) & sport == "Football" & 
-          `Group 3` %in% c("WR", "RB", "TE", "QB", "DB", "LB", "DL", "OL") ~ `Group 3`,
-        !is.na(`Group 2`) & sport == "Football" & 
-          `Group 2` %in% c("WR", "RB", "TE", "QB", "DB", "LB", "DL", "OL") ~ `Group 2`,
-        !is.na(`Group 1`) & sport == "Football" & 
-          `Group 1` %in% c("WR", "RB", "TE", "QB", "DB", "LB", "DL", "OL") ~ `Group 1`,
-        sport != "Football" & !is.na(`Group 1`) ~ `Group 1`,
-        TRUE ~ "Unspecified"
-      ),
-      position_class = case_when(
-        sport == "Football" & position %in% c("TE", "LB") ~ "Combo",
-        sport == "Football" & position %in% c("DB", "WR") ~ "Skill", 
-        sport == "Football" & position %in% c("DL", "OL") ~ "Line",
-        sport == "Football" & position == "RB" ~ "Offense",
-        sport == "Football" & position == "QB" ~ "Offense",
-        sport == "Football" & (`Group 1` == "Skill" | `Group 2` == "Skill" | `Group 3` == "Skill") ~ "Skill",
-        sport == "Football" & (`Group 1` == "Combo" | `Group 2` == "Combo" | `Group 3` == "Combo") ~ "Combo",
-        sport == "Football" & (`Group 1` == "Line" | `Group 2` == "Line" | `Group 3` == "Line") ~ "Line",
-        sport == "Football" & (`Group 1` == "SPEC" | `Group 2` == "SPEC" | `Group 3` == "SPEC") ~ "Special Teams",
-        TRUE ~ NA_character_
-      ),
-      unit = case_when(
-        sport == "Football" & (`Group 1` == "Offense" | `Group 2` == "Offense" | `Group 3` == "Offense") ~ "Offense",
-        sport == "Football" & (`Group 1` == "Defense" | `Group 2` == "Defense" | `Group 3` == "Defense") ~ "Defense", 
-        sport == "Football" & position %in% c("QB", "RB", "WR", "TE", "OL") ~ "Offense",
-        sport == "Football" & position %in% c("DB", "LB", "DL") ~ "Defense",
-        TRUE ~ NA_character_
-      ),
-      athlete_status = case_when(
-        `Group 1` %in% c("Staff", "Archive") ~ "Staff/Archive",
-        `Group 1` == "Alum" ~ "Alumni", 
-        team == "Uncategorised" ~ "Research/Intern",
-        TRUE ~ "Active Athlete"
-      ),
-      gender = case_when(
-        str_detect(team, "Women|W's") ~ "Women",
-        str_detect(team, "Men") ~ "Men", 
-        `Group 1` %in% c("Women's Soccer", "Men's Soccer") ~ str_extract(`Group 1`, "Women's|Men's"),
-        TRUE ~ "Mixed/Unknown"
-      )
-    )
-  return(roster_processed)
+process_simple_roster <- function(roster_data) {
+  # Check if we have any data
+  if (nrow(roster_data) == 0) {
+    create_log_entry("Roster data is empty, returning empty roster", "WARN")
+    return(data.frame(
+      external_id = character(0), position = character(0), sport = character(0), 
+      height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+      email = character(0), vald_id = character(0), family_name = character(0), 
+      weight = numeric(0), given_name = character(0)
+    ))
+  }
+  
+  # Define the columns we want to keep
+  required_columns <- c("external_id", "position", "sport", "height", "sex", 
+                       "date_of_birth", "email", "vald_id", "family_name", 
+                       "weight", "given_name")
+  
+  actual_cols <- names(roster_data)
+  create_log_entry(paste("Roster columns found:", paste(head(actual_cols, 10), collapse = ", ")))
+  
+  # Select only the columns we need (if they exist)
+  available_columns <- intersect(required_columns, actual_cols)
+  missing_columns <- setdiff(required_columns, actual_cols)
+  
+  if (length(missing_columns) > 0) {
+    create_log_entry(paste("Missing roster columns:", paste(missing_columns, collapse = ", ")), "WARN")
+  }
+  
+  if (length(available_columns) == 0) {
+    create_log_entry("No required roster columns found", "ERROR")
+    return(data.frame(
+      external_id = character(0), position = character(0), sport = character(0), 
+      height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+      email = character(0), vald_id = character(0), family_name = character(0), 
+      weight = numeric(0), given_name = character(0)
+    ))
+  }
+  
+  # Select available columns and add missing ones as NA
+  roster_clean <- roster_data %>%
+    select(any_of(available_columns))
+  
+  # Add missing columns as NA with correct types
+  for (col in missing_columns) {
+    if (col == "height") {
+      roster_clean[[col]] <- NA_integer_
+    } else if (col == "weight") {
+      roster_clean[[col]] <- NA_real_
+    } else if (col == "date_of_birth") {
+      roster_clean[[col]] <- as.Date(NA)
+    } else {
+      roster_clean[[col]] <- NA_character_
+    }
+  }
+  
+  # Reorder columns to match required order
+  roster_clean <- roster_clean %>%
+    select(all_of(required_columns))
+  
+  create_log_entry(paste("Simplified roster processed:", nrow(roster_clean), "rows with", 
+                        length(available_columns), "available columns"))
+  
+  return(roster_clean)
 }
 
 append_and_finalize <- function(new_df, old_df, keys = NULL, table_name = "Unknown") {
@@ -555,20 +559,8 @@ if (count_mismatch && date_mismatch) {
   if (nrow(Vald_roster_raw) > 0) {
     create_log_entry("Reading roster data from BigQuery")
     
-    if ("vald-id" %in% names(Vald_roster_raw)) {
-      Vald_roster_raw <- Vald_roster_raw %>% mutate(vald_id = `vald-id`)
-    } else if ("vald_id" %in% names(Vald_roster_raw)) {
-      # Already has vald_id column
-    } else {
-      create_log_entry("Warning: No vald_id or vald-id column found in roster data", "WARN")
-    }
-    
-    Vald_roster <- Vald_roster_raw %>% 
-      process_vald_roster_detailed() %>% 
-      select(any_of(c("vald_id", "team", "position_class", "unit", "position", "athlete_status"))) %>% 
-      filter(athlete_status == "Active Athlete")
-      
-    create_log_entry(paste("Processed", nrow(Vald_roster), "active athletes from roster"))
+    Vald_roster <- process_simple_roster(Vald_roster_raw)
+    create_log_entry(paste("Processed", nrow(Vald_roster), "athletes from BigQuery roster"))
     
   } else {
     create_log_entry("Roster not found in BigQuery, trying GitHub fallback", "WARN")
@@ -579,32 +571,24 @@ if (count_mismatch && date_mismatch) {
       
       if (nrow(Vald_roster_raw) > 0) {
         create_log_entry("Successfully read roster from GitHub")
-        
-        if ("vald-id" %in% names(Vald_roster_raw)) {
-          Vald_roster_raw <- Vald_roster_raw %>% mutate(vald_id = `vald-id`)
-        } else if ("vald_id" %in% names(Vald_roster_raw)) {
-          # Already has vald_id column
-        }
-        
-        Vald_roster <- Vald_roster_raw %>% 
-          process_vald_roster_detailed() %>% 
-          select(any_of(c("vald_id", "team", "position_class", "unit", "position", "athlete_status"))) %>% 
-          filter(athlete_status == "Active Athlete")
-          
-        create_log_entry(paste("Processed", nrow(Vald_roster), "active athletes from GitHub roster"))
+        Vald_roster <- process_simple_roster(Vald_roster_raw)
+        create_log_entry(paste("Processed", nrow(Vald_roster), "athletes from GitHub roster"))
       } else {
-        Vald_roster <- data.frame()
+        Vald_roster <- data.frame(
+          external_id = character(0), position = character(0), sport = character(0), 
+          height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+          email = character(0), vald_id = character(0), family_name = character(0), 
+          weight = numeric(0), given_name = character(0)
+        )
         create_log_entry("GitHub roster file was empty", "WARN")
       }
     }, error = function(e) {
       create_log_entry(paste("Failed to read roster from GitHub:", e$message), "WARN")
       Vald_roster <- data.frame(
-        vald_id = character(0),
-        team = character(0),
-        position_class = character(0),
-        unit = character(0),
-        position = character(0),
-        athlete_status = character(0)
+        external_id = character(0), position = character(0), sport = character(0), 
+        height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+        email = character(0), vald_id = character(0), family_name = character(0), 
+        weight = numeric(0), given_name = character(0)
       )
     })
   }
@@ -696,8 +680,7 @@ if (count_mismatch && date_mismatch) {
   
   mergable_roster <- roster %>% 
     select(-first_name, -last_name) %>% 
-    left_join(Vald_roster, by = "vald_id") %>% 
-    select(-any_of(c("athlete_status", "position_class", "unit")))
+    left_join(Vald_roster %>% select(vald_id, position, sport), by = "vald_id")
   
   # Mass Merge
   forcedecks_raw <- mergable_trials %>% 
@@ -1296,6 +1279,7 @@ if (count_mismatch && date_mismatch) {
   upload_to_bq(forcedecks_IMTP_clean, "vald_fd_imtp", "WRITE_TRUNCATE")
   upload_to_bq(dates, "dates", "WRITE_TRUNCATE")
   upload_to_bq(tests, "tests", "WRITE_TRUNCATE")
+  upload_to_bq(Vald_roster, "vald_roster", "WRITE_TRUNCATE")
   
   create_log_entry("=== FULL PROCESSING COMPLETED ===")
   create_log_entry("All data files successfully written to BigQuery")
