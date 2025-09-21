@@ -205,27 +205,367 @@ safe_bq_query <- function(query, description = "") {
   })
 }
 
-upload_to_bq <- function(data, table_name, write_disposition = "WRITE_TRUNCATE") {
-  if (nrow(data) == 0) {
-    create_log_entry(paste("No data to upload for table:", table_name), "WARN")
-    return()
-  }
+# Enhanced data validation and upload functions with strict data type enforcement
+standardize_data_types <- function(data, table_name) {
+  create_log_entry(paste("Standardizing data types for", table_name), "INFO")
   
-  tbl <- bq_table(ds, table_name)
+  # Define expected data types for common columns
+  character_columns <- c("name", "triallimb", "vald_id", "test_id", "team", "position", 
+                        "position_class", "test_type", "full_name", "external_id", 
+                        "email", "family_name", "given_name", "sport", "sex")
   
-  tryCatch({
-    if (!bq_table_exists(tbl)) {
-      bq_table_create(tbl, fields = data[0, ])
-      create_log_entry(paste("Created table:", table_name))
+  date_columns <- c("date", "date_of_birth")
+  time_columns <- c("time")
+  integer_columns <- c("height", "reps_left", "reps_right")
+  
+  # All other columns should be float/numeric
+  
+  original_data <- data
+  conversion_log <- list()
+  
+  for (col_name in names(data)) {
+    original_type <- class(data[[col_name]])[1]
+    target_type <- "numeric"  # Default to numeric/float
+    
+    # Determine target type based on column name
+    if (col_name %in% character_columns) {
+      target_type <- "character"
+    } else if (col_name %in% date_columns) {
+      target_type <- "Date"
+    } else if (col_name %in% time_columns) {
+      target_type <- "hms"
+    } else if (col_name %in% integer_columns) {
+      target_type <- "integer"
     }
     
-    bq_table_upload(tbl, data, write_disposition = write_disposition)
-    create_log_entry(paste("Uploaded", nrow(data), "rows to", table_name))
-  }, error = function(e) {
-    create_log_entry(paste("Failed to upload to", table_name, ":", e$message), "ERROR")
-    stop(e)
-  })
+    # Convert if needed
+    if (original_type != target_type) {
+      conversion_log[[col_name]] <- paste(original_type, "->", target_type)
+      
+      tryCatch({
+        if (target_type == "character") {
+          data[[col_name]] <- as.character(data[[col_name]])
+          
+        } else if (target_type == "Date") {
+          if (is.character(data[[col_name]]) || is.factor(data[[col_name]])) {
+            data[[col_name]] <- as.Date(data[[col_name]])
+          } else if (is.numeric(data[[col_name]])) {
+            data[[col_name]] <- as.Date(data[[col_name]], origin = "1970-01-01")
+          }
+          
+        } else if (target_type == "hms") {
+          if (is.character(data[[col_name]])) {
+            data[[col_name]] <- hms::as_hms(data[[col_name]])
+          } else if ("POSIXct" %in% class(data[[col_name]]) || "POSIXt" %in% class(data[[col_name]])) {
+            # Convert POSIXct to hms (time portion only)
+            data[[col_name]] <- hms::as_hms(format(data[[col_name]], "%H:%M:%S"))
+          }
+          
+        } else if (target_type == "integer") {
+          # Convert to integer, handling NAs properly
+          if (is.character(data[[col_name]])) {
+            data[[col_name]] <- as.integer(as.numeric(data[[col_name]]))
+          } else {
+            data[[col_name]] <- as.integer(data[[col_name]])
+          }
+          
+        } else if (target_type == "numeric") {
+          # Convert to numeric/float
+          if (is.character(data[[col_name]])) {
+            # Handle character strings that might be numbers
+            numeric_vals <- suppressWarnings(as.numeric(data[[col_name]]))
+            data[[col_name]] <- numeric_vals
+          } else if (is.factor(data[[col_name]])) {
+            # Convert factors to numeric
+            data[[col_name]] <- as.numeric(as.character(data[[col_name]]))
+          } else if (is.logical(data[[col_name]])) {
+            # Convert logical to numeric (TRUE=1, FALSE=0)
+            data[[col_name]] <- as.numeric(data[[col_name]])
+          } else {
+            data[[col_name]] <- as.numeric(data[[col_name]])
+          }
+          
+          # Clean up numeric data
+          if (is.numeric(data[[col_name]])) {
+            # Replace infinite values with NA
+            data[[col_name]][is.infinite(data[[col_name]])] <- NA
+            # Replace NaN with NA
+            data[[col_name]][is.nan(data[[col_name]])] <- NA
+          }
+        }
+        
+      }, error = function(e) {
+        create_log_entry(paste("Failed to convert", col_name, "to", target_type, ":", e$message), "ERROR")
+        conversion_log[[col_name]] <- paste(conversion_log[[col_name]], "(FAILED)")
+      })
+    }
+  }
+  
+  # Log conversions made
+  if (length(conversion_log) > 0) {
+    create_log_entry(paste("Data type conversions for", table_name, ":"), "INFO")
+    for (col in names(conversion_log)) {
+      create_log_entry(paste("  ", col, ":", conversion_log[[col]]), "INFO")
+    }
+  } else {
+    create_log_entry(paste("No data type conversions needed for", table_name), "INFO")
+  }
+  
+  # Verify final data types
+  final_types <- sapply(data, function(x) class(x)[1])
+  problematic_types <- names(final_types)[final_types %in% c("list", "function", "environment")]
+  
+  if (length(problematic_types) > 0) {
+    create_log_entry(paste("WARNING: Still have problematic data types in", table_name, ":", paste(problematic_types, collapse = ", ")), "WARN")
+  }
+  
+  return(data)
 }
+
+validate_data_frame <- function(data, table_name) {
+  validation_log <- list()
+  
+  # Check basic structure
+  if (nrow(data) == 0) {
+    validation_log$empty <- TRUE
+    create_log_entry(paste("WARNING:", table_name, "data frame is empty"), "WARN")
+    return(list(valid = FALSE, issues = validation_log, data = data))
+  }
+  
+  if (ncol(data) == 0) {
+    validation_log$no_columns <- TRUE
+    create_log_entry(paste("ERROR:", table_name, "data frame has no columns"), "ERROR")
+    return(list(valid = FALSE, issues = validation_log, data = data))
+  }
+  
+  # Standardize data types FIRST
+  data <- standardize_data_types(data, table_name)
+  
+  # Check for completely NA columns
+  na_columns <- names(data)[sapply(data, function(x) all(is.na(x)))]
+  if (length(na_columns) > 0) {
+    validation_log$all_na_columns <- na_columns
+    create_log_entry(paste("WARNING:", table_name, "has columns with all NA values:", paste(na_columns, collapse = ", ")), "WARN")
+  }
+  
+  # Check for invalid column names
+  invalid_cols <- names(data)[!grepl("^[a-zA-Z_][a-zA-Z0-9_]*$", names(data))]
+  if (length(invalid_cols) > 0) {
+    validation_log$invalid_column_names <- invalid_cols
+    create_log_entry(paste("ERROR:", table_name, "has invalid column names:", paste(invalid_cols, collapse = ", ")), "ERROR")
+    
+    # Fix invalid column names
+    fixed_names <- make.names(names(data), unique = TRUE)
+    fixed_names <- gsub("\\.", "_", fixed_names)
+    fixed_names <- gsub("^X", "x_", fixed_names)
+    names(data) <- fixed_names
+    create_log_entry(paste("FIXED: Invalid column names corrected for", table_name), "INFO")
+  }
+  
+  # Additional data quality checks
+  for (col in names(data)) {
+    col_class <- class(data[[col]])[1]
+    
+    # Check for problematic data types
+    if (col_class %in% c("list", "function", "environment")) {
+      validation_log$problematic_types <- c(validation_log$problematic_types, paste(col, ":", col_class))
+      create_log_entry(paste("ERROR:", table_name, "column", col, "has problematic type:", col_class), "ERROR")
+    }
+    
+    # Check for very long strings that might cause BigQuery issues
+    if (is.character(data[[col]])) {
+      max_length <- max(nchar(data[[col]]), na.rm = TRUE)
+      if (max_length > 10000) {
+        validation_log$long_strings <- c(validation_log$long_strings, paste(col, ":", max_length))
+        create_log_entry(paste("WARNING:", table_name, "column", col, "has very long strings (max:", max_length, "chars)"), "WARN")
+        
+        # Truncate very long strings
+        data[[col]][nchar(data[[col]]) > 10000] <- substr(data[[col]][nchar(data[[col]]) > 10000], 1, 10000)
+        create_log_entry(paste("FIXED: Truncated long strings in", col), "INFO")
+      }
+    }
+    
+    # Validate date columns
+    if (col %in% c("date", "date_of_birth") && !inherits(data[[col]], "Date")) {
+      validation_log$date_issues <- c(validation_log$date_issues, col)
+      create_log_entry(paste("WARNING:", table_name, "column", col, "should be Date type but is", col_class), "WARN")
+    }
+    
+    # Validate time columns
+    if (col == "time" && !inherits(data[[col]], "hms")) {
+      validation_log$time_issues <- c(validation_log$time_issues, col)
+      create_log_entry(paste("WARNING:", table_name, "column", col, "should be hms type but is", col_class), "WARN")
+    }
+  }
+  
+  # Final data type summary
+  final_types <- sapply(data, function(x) class(x)[1])
+  numeric_cols <- sum(final_types == "numeric")
+  character_cols <- sum(final_types == "character")
+  date_cols <- sum(final_types == "Date")
+  time_cols <- sum(final_types == "hms")
+  other_cols <- length(final_types) - numeric_cols - character_cols - date_cols - time_cols
+  
+  create_log_entry(paste("Final data types for", table_name, "- Numeric:", numeric_cols, 
+                        "Character:", character_cols, "Date:", date_cols, 
+                        "Time:", time_cols, "Other:", other_cols), "INFO")
+  
+  return(list(valid = TRUE, issues = validation_log, data = data))
+}
+
+# Enhanced upload function with retry logic and better error handling
+enhanced_upload_to_bq <- function(data, table_name, write_disposition = "WRITE_TRUNCATE", max_retries = 3) {
+  create_log_entry(paste("=== Starting upload process for", table_name, "==="), "INFO")
+  
+  # Validate data first
+  validation_result <- validate_data_frame(data, table_name)
+  
+  if (!validation_result$valid) {
+    create_log_entry(paste("Data validation failed for", table_name), "ERROR")
+    return(FALSE)
+  }
+  
+  if (nrow(validation_result$data) == 0) {
+    create_log_entry(paste("No data to upload for table:", table_name), "WARN")
+    return(TRUE) # Not an error, just no data
+  }
+  
+  validated_data <- validation_result$data
+  tbl <- bq_table(ds, table_name)
+  
+  # Check current table schema if it exists
+  table_exists <- bq_table_exists(tbl)
+  
+  if (table_exists) {
+    tryCatch({
+      current_schema <- bq_table_meta(tbl)
+      current_fields <- current_schema$schema$fields
+      current_col_names <- sapply(current_fields, function(x) x$name)
+      
+      data_col_names <- names(validated_data)
+      
+      # Check for column mismatches
+      missing_in_data <- setdiff(current_col_names, data_col_names)
+      missing_in_table <- setdiff(data_col_names, current_col_names)
+      
+      if (length(missing_in_data) > 0) {
+        create_log_entry(paste("Columns in table but not in data:", paste(missing_in_data, collapse = ", ")), "WARN")
+      }
+      
+      if (length(missing_in_table) > 0) {
+        create_log_entry(paste("New columns in data:", paste(missing_in_table, collapse = ", ")), "INFO")
+        
+        # If there are new columns and we're truncating, recreate the table
+        if (write_disposition == "WRITE_TRUNCATE") {
+          create_log_entry(paste("Recreating table", table_name, "with new schema"), "INFO")
+          bq_table_delete(tbl)
+          table_exists <- FALSE
+        }
+      }
+      
+    }, error = function(e) {
+      create_log_entry(paste("Could not check table schema for", table_name, ":", e$message), "WARN")
+    })
+  }
+  
+  # Attempt upload with retries
+  for (attempt in 1:max_retries) {
+    tryCatch({
+      create_log_entry(paste("Upload attempt", attempt, "for", table_name), "INFO")
+      
+      if (!table_exists) {
+        # Create table with data schema
+        create_log_entry(paste("Creating new table:", table_name), "INFO")
+        bq_table_create(tbl, fields = validated_data[0, ])
+        create_log_entry(paste("Successfully created table:", table_name), "INFO")
+      }
+      
+      # Perform the upload
+      create_log_entry(paste("Uploading", nrow(validated_data), "rows to", table_name), "INFO")
+      bq_table_upload(tbl, validated_data, write_disposition = write_disposition)
+      
+      # Verify upload success
+      tryCatch({
+        upload_verification <- DBI::dbGetQuery(con, sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", project, dataset, table_name))
+        actual_rows <- upload_verification$row_count[1]
+        
+        if (write_disposition == "WRITE_TRUNCATE") {
+          expected_rows <- nrow(validated_data)
+        } else {
+          expected_rows <- "unknown (append mode)"
+        }
+        
+        create_log_entry(paste("Upload verification for", table_name, "- Expected:", expected_rows, "Actual:", actual_rows), "INFO")
+        
+        if (write_disposition == "WRITE_TRUNCATE" && actual_rows != nrow(validated_data)) {
+          create_log_entry(paste("Row count mismatch for", table_name, "- uploaded:", nrow(validated_data), "found:", actual_rows), "WARN")
+        }
+        
+      }, error = function(e) {
+        create_log_entry(paste("Could not verify upload for", table_name, ":", e$message), "WARN")
+      })
+      
+      create_log_entry(paste("Successfully uploaded", nrow(validated_data), "rows to", table_name), "INFO")
+      return(TRUE)
+      
+    }, error = function(e) {
+      error_msg <- as.character(e$message)
+      create_log_entry(paste("Upload attempt", attempt, "failed for", table_name), "ERROR")
+      create_log_entry(paste("Error details:", error_msg), "ERROR")
+      
+      # Log additional error context
+      if (grepl("schema", error_msg, ignore.case = TRUE)) {
+        create_log_entry("Schema-related error detected. Checking data types...", "ERROR")
+        
+        # Log data types for debugging
+        type_summary <- sapply(validated_data, function(x) paste(class(x), collapse = ","))
+        create_log_entry(paste("Data types:", paste(names(type_summary), type_summary, sep = ":", collapse = "; ")), "ERROR")
+      }
+      
+      if (grepl("quota", error_msg, ignore.case = TRUE)) {
+        create_log_entry("Quota-related error detected. This may be a temporary issue.", "ERROR")
+      }
+      
+      if (grepl("permission", error_msg, ignore.case = TRUE)) {
+        create_log_entry("Permission-related error detected. Check BigQuery permissions.", "ERROR")
+      }
+      
+      # If this isn't the last attempt, wait before retrying
+      if (attempt < max_retries) {
+        wait_time <- attempt * 5 # Wait 5, 10, 15 seconds
+        create_log_entry(paste("Waiting", wait_time, "seconds before retry..."), "INFO")
+        Sys.sleep(wait_time)
+        
+        # On retry, try recreating the table if it's a schema issue
+        if (grepl("schema", error_msg, ignore.case = TRUE) && table_exists) {
+          tryCatch({
+            create_log_entry(paste("Attempting to recreate table", table_name, "due to schema issues"), "INFO")
+            bq_table_delete(tbl)
+            table_exists <- FALSE
+          }, error = function(e2) {
+            create_log_entry(paste("Could not delete table for recreation:", e2$message), "ERROR")
+          })
+        }
+      } else {
+        # Final attempt failed
+        create_log_entry(paste("All", max_retries, "upload attempts failed for", table_name), "ERROR")
+        create_log_entry(paste("Final error:", error_msg), "ERROR")
+        
+        # Try to provide helpful debugging info
+        create_log_entry(paste("Data frame summary for", table_name, ":"), "ERROR")
+        create_log_entry(paste("  Dimensions:", nrow(validated_data), "x", ncol(validated_data)), "ERROR")
+        create_log_entry(paste("  Columns:", paste(names(validated_data), collapse = ", ")), "ERROR")
+        
+        stop(paste("Failed to upload", table_name, "after", max_retries, "attempts:", error_msg))
+      }
+    })
+  }
+  
+  return(FALSE)
+}
+
+# Replace the old upload_to_bq function
+upload_to_bq <- enhanced_upload_to_bq
 
 # Read BQ table with proper error handling
 read_bq_table <- function(table_name) {
@@ -1278,17 +1618,83 @@ if (count_mismatch && date_mismatch) {
   dates <- append_and_finalize(dates, dates_imported, keys = "date", table_name = "Dates")
   tests <- append_and_finalize(tests, tests_imported, keys = "test_ID", table_name = "Tests")
   
-  # Upload all processed data to BigQuery
-  upload_to_bq(forcedecks_jump_clean, "vald_fd_jumps", "WRITE_TRUNCATE")
-  upload_to_bq(forcedecks_SLJ_clean, "vald_fd_sl_jumps", "WRITE_TRUNCATE")
-  upload_to_bq(nordboard_clean, "vald_nord_all", "WRITE_TRUNCATE")
-  upload_to_bq(forcedecks_RSI_clean, "vald_fd_rsi", "WRITE_TRUNCATE")
-  upload_to_bq(forcedecks_jump_DJ_clean, "vald_fd_dj", "WRITE_TRUNCATE")
-  upload_to_bq(forcedecks_rebound_clean, "vald_fd_rebound", "WRITE_TRUNCATE")
-  upload_to_bq(forcedecks_IMTP_clean, "vald_fd_imtp", "WRITE_TRUNCATE")
-  upload_to_bq(dates, "dates", "WRITE_TRUNCATE")
-  upload_to_bq(tests, "tests", "WRITE_TRUNCATE")
-  upload_to_bq(Vald_roster, "vald_roster", "WRITE_TRUNCATE")
+  # Upload all processed data to BigQuery with enhanced error handling
+  create_log_entry("=== STARTING BIGQUERY UPLOADS ===", "INFO")
+  
+  upload_results <- list()
+  
+  # Upload each dataset with detailed logging
+  datasets_to_upload <- list(
+    "vald_fd_jumps" = forcedecks_jump_clean,
+    "vald_fd_sl_jumps" = forcedecks_SLJ_clean,
+    "vald_nord_all" = nordboard_clean,
+    "vald_fd_rsi" = forcedecks_RSI_clean,
+    "vald_fd_dj" = forcedecks_jump_DJ_clean,
+    "vald_fd_rebound" = forcedecks_rebound_clean,
+    "vald_fd_imtp" = forcedecks_IMTP_clean,
+    "dates" = dates,
+    "tests" = tests,
+    "vald_roster" = Vald_roster
+  )
+  
+  for (table_name in names(datasets_to_upload)) {
+    dataset <- datasets_to_upload[[table_name]]
+    
+    create_log_entry(paste("Preparing to upload", table_name), "INFO")
+    
+    tryCatch({
+      # Pre-upload data summary
+      if (nrow(dataset) > 0) {
+        create_log_entry(paste(table_name, "pre-upload summary: ", nrow(dataset), "rows,", ncol(dataset), "columns"), "INFO")
+        
+        # Log column names for debugging
+        col_preview <- if(ncol(dataset) > 10) {
+          paste(paste(names(dataset)[1:10], collapse = ", "), "... (", ncol(dataset) - 10, "more)")
+        } else {
+          paste(names(dataset), collapse = ", ")
+        }
+        create_log_entry(paste(table_name, "columns:", col_preview), "INFO")
+        
+        upload_results[[table_name]] <- enhanced_upload_to_bq(dataset, table_name, "WRITE_TRUNCATE")
+        
+        if (upload_results[[table_name]]) {
+          create_log_entry(paste("SUCCESS: Uploaded", table_name), "INFO")
+        } else {
+          create_log_entry(paste("FAILED: Upload failed for", table_name), "ERROR")
+        }
+      } else {
+        create_log_entry(paste("SKIPPED:", table_name, "- no data to upload"), "WARN")
+        upload_results[[table_name]] <- TRUE # Not a failure, just no data
+      }
+      
+    }, error = function(e) {
+      create_log_entry(paste("CRITICAL ERROR uploading", table_name, ":", e$message), "ERROR")
+      upload_results[[table_name]] <- FALSE
+      
+      # Continue with other uploads rather than stopping entirely
+      create_log_entry(paste("Continuing with remaining uploads despite", table_name, "failure"), "WARN")
+    })
+  }
+  
+  # Summary of upload results
+  create_log_entry("=== UPLOAD SUMMARY ===", "INFO")
+  successful_uploads <- sum(unlist(upload_results), na.rm = TRUE)
+  total_uploads <- length(upload_results)
+  
+  for (table_name in names(upload_results)) {
+    status <- if (upload_results[[table_name]]) "SUCCESS" else "FAILED"
+    create_log_entry(paste(table_name, ":", status), if (upload_results[[table_name]]) "INFO" else "ERROR")
+  }
+  
+  create_log_entry(paste("Upload summary:", successful_uploads, "of", total_uploads, "tables uploaded successfully"), "INFO")
+  
+  if (successful_uploads < total_uploads) {
+    failed_tables <- names(upload_results)[!unlist(upload_results)]
+    create_log_entry(paste("Failed uploads:", paste(failed_tables, collapse = ", ")), "ERROR")
+    
+    # Don't stop the entire process for upload failures - log and continue
+    create_log_entry("Some uploads failed but continuing with script completion", "WARN")
+  }
   
   create_log_entry("=== FULL PROCESSING COMPLETED ===")
   create_log_entry("All data files successfully written to BigQuery")
