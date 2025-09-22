@@ -503,7 +503,15 @@ validate_data_frame <- function(data, table_name) {
 }
 
 # Enhanced upload function with retry logic and better error handling
-enhanced_upload_to_bq <- function(data, table_name, write_disposition = "WRITE_TRUNCATE", max_retries = 3) {
+enhanced_upload_to_bq <- function(
+  data,
+  table_name,
+  write_disposition = "WRITE_TRUNCATE",
+  max_retries = 3,
+  project_id = project,     # <- capture once
+  dataset_id = dataset,     # <- capture once
+  con_arg    = con          # <- capture the connection used for queries
+) {
   create_log_entry(paste("=== Starting upload process for", table_name, "==="), "INFO")
   
   # Validate data first
@@ -569,37 +577,39 @@ enhanced_upload_to_bq <- function(data, table_name, write_disposition = "WRITE_T
         create_log_entry(paste("Successfully created table:", table_name), "INFO")
       }
       
-      # Perform the upload
+            # Perform the upload
       create_log_entry(paste("Uploading", nrow(validated_data), "rows to", table_name), "INFO")
       bq_table_upload(tbl, validated_data, write_disposition = write_disposition)
       
-      # Verify upload success
+      # ---------- VERIFY UPLOAD (safe identifier, no global lookups) ----------
       tryCatch({
-        # Ensure all parameters are single strings
-        project_str <- as.character(project)[1]
-        dataset_str <- as.character(dataset)[1] 
+        # Lock scalars (don’t trust globals that might be shadowed)
+        project_str    <- as.character(project)[1]
+        dataset_str    <- as.character(Sys.getenv("BQ_DATASET", "analytics"))[1]
         table_name_str <- as.character(table_name)[1]
-        
-        verification_query <- sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", 
-                                    project_str, dataset_str, table_name_str)
-        
+      
+        # Build a fully-qualified, correctly quoted identifier: `proj.dataset.table`
+        tbl_id <- DBI::Id(project = project_str, dataset = dataset_str, table = table_name_str)
+        quoted <- DBI::dbQuoteIdentifier(con, tbl_id)
+      
+        verification_query <- glue::glue("SELECT COUNT(*) AS row_count FROM {quoted}")
         create_log_entry(paste("Verification query:", verification_query), "DEBUG")
-        
+      
         upload_verification <- DBI::dbGetQuery(con, verification_query)
         actual_rows <- upload_verification$row_count[1]
-        
-        if (write_disposition == "WRITE_TRUNCATE") {
-          expected_rows <- nrow(validated_data)
-        } else {
-          expected_rows <- "unknown (append mode)"
+      
+        expected_rows <- if (write_disposition == "WRITE_TRUNCATE") nrow(validated_data) else NA_integer_
+        create_log_entry(
+          paste("Upload verification for", table_name, "- Expected:", expected_rows, "Actual:", actual_rows),
+          "INFO"
+        )
+      
+        if (!is.na(expected_rows) && actual_rows != expected_rows) {
+          create_log_entry(
+            paste("Row count mismatch for", table_name, "- uploaded:", nrow(validated_data), "found:", actual_rows),
+            "WARN"
+          )
         }
-        
-        create_log_entry(paste("Upload verification for", table_name, "- Expected:", expected_rows, "Actual:", actual_rows), "INFO")
-        
-        if (write_disposition == "WRITE_TRUNCATE" && actual_rows != nrow(validated_data)) {
-          create_log_entry(paste("Row count mismatch for", table_name, "- uploaded:", nrow(validated_data), "found:", actual_rows), "WARN")
-        }
-        
       }, error = function(e) {
         create_log_entry(paste("Could not verify upload for", table_name, ":", e$message), "WARN")
       })
