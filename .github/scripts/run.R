@@ -209,8 +209,8 @@ safe_bq_query <- function(query, description = "") {
 standardize_data_types <- function(data, table_name) {
   create_log_entry(paste("Standardizing data types for", table_name), "INFO")
   
-  # Define expected data types for common columns
-  character_columns <- c("name", "triallimb", "vald_id", "test_id", "team", "position", 
+  # Define expected data types for common columns (including both cases)
+  character_columns <- c("name", "triallimb", "vald_id", "test_id", "test_ID", "team", "position", 
                         "position_class", "test_type", "full_name", "external_id", 
                         "email", "family_name", "given_name", "sport", "sex")
   
@@ -218,7 +218,25 @@ standardize_data_types <- function(data, table_name) {
   time_columns <- c("time")
   integer_columns <- c("height", "reps_left", "reps_right")
   
-  # All other columns should be float/numeric
+  # Handle duplicate columns first
+  if ("test_ID" %in% names(data) && "test_id" %in% names(data)) {
+    create_log_entry(paste("Found duplicate test ID columns in", table_name, "- removing test_id and keeping test_ID"), "WARN")
+    data <- data %>% select(-test_id)
+  }
+  
+  # Check for other potential duplicates
+  duplicate_patterns <- list(
+    c("vald_id", "vald_ID"),
+    c("team", "Team"),
+    c("position", "Position")
+  )
+  
+  for (pattern in duplicate_patterns) {
+    if (all(pattern %in% names(data))) {
+      create_log_entry(paste("Found duplicate columns in", table_name, ":", paste(pattern, collapse = ", "), "- keeping", pattern[1]), "WARN")
+      data <- data %>% select(-all_of(pattern[-1]))
+    }
+  }
   
   original_data <- data
   conversion_log <- list()
@@ -486,7 +504,17 @@ enhanced_upload_to_bq <- function(data, table_name, write_disposition = "WRITE_T
       
       # Verify upload success
       tryCatch({
-        upload_verification <- DBI::dbGetQuery(con, sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", project, dataset, table_name))
+        # Ensure all parameters are single strings
+        project_str <- as.character(project)[1]
+        dataset_str <- as.character(dataset)[1] 
+        table_name_str <- as.character(table_name)[1]
+        
+        verification_query <- sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", 
+                                    project_str, dataset_str, table_name_str)
+        
+        create_log_entry(paste("Verification query:", verification_query), "DEBUG")
+        
+        upload_verification <- DBI::dbGetQuery(con, verification_query)
         actual_rows <- upload_verification$row_count[1]
         
         if (write_disposition == "WRITE_TRUNCATE") {
