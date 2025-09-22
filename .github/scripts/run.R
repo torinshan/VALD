@@ -144,7 +144,7 @@ upload_logs_to_bigquery <- function() {
     
     # Create table if it doesn't exist
     if (!bq_table_exists(log_tbl)) {
-      bq_table_create(log_tbl, fields = log_entries[0, ])
+      bq_table_create(log_tbl, fields = bigrquery::as_bq_fields(log_entries))
       cat("Created vald_processing_log table\n")
     }
     
@@ -571,9 +571,8 @@ enhanced_upload_to_bq <- function(
       create_log_entry(paste("Upload attempt", attempt, "for", table_name), "INFO")
       
       if (!table_exists) {
-        # Create table with data schema
         create_log_entry(paste("Creating new table:", table_name), "INFO")
-        bq_table_create(tbl, fields = validated_data[0, ])
+        bq_table_create(tbl, fields = bigrquery::as_bq_fields(validated_data))
         create_log_entry(paste("Successfully created table:", table_name), "INFO")
       }
       
@@ -583,22 +582,20 @@ enhanced_upload_to_bq <- function(
       
       # ---------- VERIFY UPLOAD (safe identifier, no global lookups) ----------
       tryCatch({
-        # Lock scalars (don’t trust globals that might be shadowed)
-        project_str    <- as.character(project)[1]
-        dataset_str    <- as.character(Sys.getenv("BQ_DATASET", "analytics"))[1]
+        project_str    <- as.character(project_id)[1]
+        dataset_str    <- as.character(dataset_id)[1]
         table_name_str <- as.character(table_name)[1]
       
-        # Build a fully-qualified, correctly quoted identifier: `proj.dataset.table`
         tbl_id <- DBI::Id(project = project_str, dataset = dataset_str, table = table_name_str)
-        quoted <- DBI::dbQuoteIdentifier(con, tbl_id)
+        quoted <- DBI::dbQuoteIdentifier(con_arg, tbl_id)
       
         verification_query <- glue::glue("SELECT COUNT(*) AS row_count FROM {quoted}")
         create_log_entry(paste("Verification query:", verification_query), "DEBUG")
       
-        upload_verification <- DBI::dbGetQuery(con, verification_query)
+        upload_verification <- DBI::dbGetQuery(con_arg, verification_query)
         actual_rows <- upload_verification$row_count[1]
-      
         expected_rows <- if (write_disposition == "WRITE_TRUNCATE") nrow(validated_data) else NA_integer_
+      
         create_log_entry(
           paste("Upload verification for", table_name, "- Expected:", expected_rows, "Actual:", actual_rows),
           "INFO"
