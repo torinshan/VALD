@@ -1019,6 +1019,50 @@ validate_test_ids <- function(data, stage_name) {
   }
 }
 
+# Assert uniqueness of test_ID in a data.frame
+assert_unique_test_ids_df <- function(df, stage_label = "unknown", key = "test_ID") {
+  if (!key %in% names(df)) {
+    create_log_entry(paste("assert_unique_test_ids_df:", stage_label, "- no", key, "column"), "WARN")
+    return(invisible(TRUE))
+  }
+  # only count non-NA/non-empty ids
+  ids <- as.character(df[[key]])
+  ids <- ids[!is.na(ids) & ids != ""]
+  dup_counts <- table(ids)
+  dups <- names(dup_counts[dup_counts > 1])
+  if (length(dups) > 0) {
+    create_log_entry(
+      paste0("DUPLICATE ", key, " detected in ", stage_label, 
+             " (first 5): ", paste(head(dups, 5), collapse = ", ")),
+      "ERROR"
+    )
+    stop(paste0("Non-unique ", key, " found in ", stage_label))
+  } else {
+    create_log_entry(paste("OK:", stage_label, "-", key, "is unique in data.frame"), "INFO")
+  }
+  invisible(TRUE)
+}
+
+# Assert uniqueness of test_ID in a BigQuery table
+assert_unique_test_ids_bq <- function(table_name, key = "test_ID", con_arg = con, project_id = project, dataset_id = dataset) {
+  q <- sprintf(
+    "SELECT COUNT(*) AS n, COUNT(DISTINCT %s) AS nd FROM `%s.%s.%s`",
+    key, project_id, dataset_id, table_name
+  )
+  res <- DBI::dbGetQuery(con_arg, q)
+  if (nrow(res) == 1 && !is.na(res$n[1]) && !is.na(res$nd[1]) && res$n[1] == res$nd[1]) {
+    create_log_entry(paste0("OK: ", table_name, " has unique ", key, " in BigQuery (", res$n[1], " rows)"), "INFO")
+    invisible(TRUE)
+  } else {
+    create_log_entry(
+      paste0("ERROR: ", table_name, " does NOT have unique ", key, 
+             " in BigQuery (rows=", res$n[1], ", distinct=", res$nd[1], ")"),
+      "ERROR"
+    )
+    stop(paste0(table_name, " violates uniqueness of ", key, " in BigQuery"))
+  }
+}
+             
 ################################################################################
 # SHARED PROCESSING FUNCTIONS (Used by both Full and Partial)
 ################################################################################
@@ -1388,6 +1432,7 @@ if (count_mismatch && date_mismatch) {
     }
     
     validate_test_ids(forcedecks_jump_clean, "CMJ_Final")
+    assert_unique_test_ids_df(forcedecks_jump_clean, "vald_fd_jumps (pre-upload)")
     create_log_entry(paste("CMJ data processed:", nrow(forcedecks_jump_clean), "records"))
   } else {
     forcedecks_jump_clean <- existing_data$forcedecks_jump_clean
@@ -1993,6 +2038,7 @@ if (count_mismatch && date_mismatch) {
       forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL")
       
       validate_test_ids(forcedecks_jump_clean, "Partial_CMJ_Final")
+      assert_unique_test_ids_df(forcedecks_jump_clean, "vald_fd_jumps (pre-upload, partial)")
       create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
       
     } else {
