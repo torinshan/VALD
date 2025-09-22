@@ -242,6 +242,40 @@ safe_bq_query <- function(query, description = "") {
   })
 }
 
+# FIXED: Clean column headers function with proper test_ID preservation
+clean_column_headers <- function(df, remove_index = TRUE) {
+  original_names <- names(df)
+  
+  if (remove_index) {
+    index_cols <- which(original_names %in% c("", "X", "...1", "X1") | 
+                          grepl("^\\.\\.\\.[0-9]+$", original_names) |
+                          grepl("^X[0-9]*$", original_names))
+    
+    if (length(index_cols) > 0) {
+      df <- df[, -index_cols, drop = FALSE]
+    }
+  }
+  
+  # CRITICAL: Identify test_ID column position before cleaning
+  test_id_positions <- which(names(df) %in% c("test_ID", "test_id"))
+  
+  cleaned_names <- names(df) %>%
+    gsub("([a-z])([A-Z])", "\\1_\\2", .) %>%
+    tolower() %>%
+    gsub("[^a-zA-Z0-9_]", "_", .) %>%
+    gsub("_{2,}", "_", .) %>%
+    gsub("^_|_$", "", .) %>%
+    ifelse(grepl("^[0-9]", .), paste0("x_", .), .)
+  
+  # CRITICAL: Restore test_ID as primary key after cleaning
+  if (length(test_id_positions) > 0) {
+    cleaned_names[test_id_positions] <- "test_ID"
+  }
+  
+  names(df) <- cleaned_names
+  return(df)
+}
+
 # Enhanced data validation and upload functions with strict data type enforcement
 standardize_data_types <- function(data, table_name) {
   create_log_entry(paste("Standardizing data types for", table_name), "INFO")
@@ -795,31 +829,6 @@ create_log_entry(paste("Processing route selected:", route_taken))
 # Processing Functions
 ################################################################################
 
-clean_column_headers <- function(df, remove_index = TRUE) {
-  original_names <- names(df)
-  
-  if (remove_index) {
-    index_cols <- which(original_names %in% c("", "X", "...1", "X1") | 
-                          grepl("^\\.\\.\\.[0-9]+$", original_names) |
-                          grepl("^X[0-9]*$", original_names))
-    
-    if (length(index_cols) > 0) {
-      df <- df[, -index_cols, drop = FALSE]
-    }
-  }
-  
-  cleaned_names <- names(df) %>%
-    gsub("([a-z])([A-Z])", "\\1_\\2", .) %>%
-    tolower() %>%
-    gsub("[^a-zA-Z0-9_]", "_", .) %>%
-    gsub("_{2,}", "_", .) %>%
-    gsub("^_|_$", "", .) %>%
-    ifelse(grepl("^[0-9]", .), paste0("x_", .), .)
-  
-  names(df) <- cleaned_names
-  return(df)
-}
-
 process_simple_roster <- function(roster_data) {
   # Check if we have any data
   if (nrow(roster_data) == 0) {
@@ -974,31 +983,23 @@ safe_append_with_primary_key <- function(new_data, old_data, primary_key = "test
   }
 }
 
-# Test ID validation function - updated to handle both test_ID and test_id
+# Test ID validation function - now standardized on test_ID throughout
 validate_test_ids <- function(data, stage_name) {
-  # Check for both test_ID (before cleaning) and test_id (after cleaning)
-  primary_key_col <- NULL
   if ("test_ID" %in% names(data)) {
-    primary_key_col <- "test_ID"
-  } else if ("test_id" %in% names(data)) {
-    primary_key_col <- "test_id"
-  }
-  
-  if (!is.null(primary_key_col)) {
-    na_count <- sum(is.na(data[[primary_key_col]]))
-    empty_count <- sum(data[[primary_key_col]] == "" | is.null(data[[primary_key_col]]), na.rm = TRUE)
-    unique_count <- length(unique(data[[primary_key_col]][!is.na(data[[primary_key_col]]) & data[[primary_key_col]] != ""]))
+    na_count <- sum(is.na(data$test_ID))
+    empty_count <- sum(data$test_ID == "" | is.null(data$test_ID), na.rm = TRUE)
+    unique_count <- length(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]))
     
     create_log_entry(paste("=== TEST_ID VALIDATION:", stage_name, "==="), "INFO")
-    create_log_entry(paste("  Primary key column:", primary_key_col))
+    create_log_entry(paste("  Primary key column: test_ID"))
     create_log_entry(paste("  Total rows:", nrow(data)))
     create_log_entry(paste("  NA test_IDs:", na_count))
     create_log_entry(paste("  Empty test_IDs:", empty_count))
     create_log_entry(paste("  Unique valid test_IDs:", unique_count))
-    create_log_entry(paste("  test_ID class:", class(data[[primary_key_col]])[1]))
+    create_log_entry(paste("  test_ID class:", class(data$test_ID)[1]))
     
     if (unique_count > 0) {
-      create_log_entry(paste("  Sample test_IDs:", paste(head(unique(data[[primary_key_col]][!is.na(data[[primary_key_col]]) & data[[primary_key_col]] != ""]), 3), collapse = ", ")))
+      create_log_entry(paste("  Sample test_IDs:", paste(head(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]), 3), collapse = ", ")))
     }
     
     if (na_count > 0 || empty_count > 0) {
@@ -1007,7 +1008,7 @@ validate_test_ids <- function(data, stage_name) {
       create_log_entry(paste("SUCCESS:", stage_name, "test_ID validation passed"), "INFO")
     }
   } else {
-    create_log_entry(paste("WARNING:", stage_name, "does not contain test_ID or test_id column"), "WARN")
+    create_log_entry(paste("WARNING:", stage_name, "does not contain test_ID column"), "WARN")
   }
 }
 
@@ -1239,6 +1240,7 @@ if (count_mismatch && date_mismatch) {
     validate_test_ids(cmj_temp, "CMJ_Temp_Before_Processing")
     
     cmj_new <- cmj_temp %>%
+      mutate(test_ID = as.character(test_ID)) %>%  # Preserve test_ID
       select(any_of(c(
         "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
         "countermovement_depth", "jump_height_inches_imp_mom", "bodymass_relative_takeoff_power",
@@ -1253,14 +1255,13 @@ if (count_mismatch && date_mismatch) {
         "takeoff_velocity", "eccentric_time", "peak_landing_acceleration", "peak_takeoff_acceleration",
         "concentric_rfd_200", "eccentric_peak_power"
       ))) %>%
-      clean_column_headers() %>%
-      mutate(test_ID = as.character(test_ID)) %>%
+      clean_column_headers() %>%  # This will preserve test_ID
       filter(!is.na(jump_height_inches_imp_mom)) %>%
       arrange(full_name, test_type, date)
     
     validate_test_ids(cmj_new, "CMJ_New_After_Processing")
     
-    cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_id", "CMJ") %>%  # Use test_id after clean_column_headers
+    cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ") %>%
       arrange(full_name, test_type, date)
     
     validate_test_ids(cmj_all, "CMJ_All_After_Append")
@@ -1653,8 +1654,7 @@ if (count_mismatch && date_mismatch) {
         "start_to_peak_force", "rfd_at_100ms", "rfd_at_200ms", "force_at_100ms", 
         "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
       ))) %>% 
-      clean_column_headers() %>% 
-      mutate(test_id = as.character(test_id)) %>%  # Use test_id after clean_column_headers
+      clean_column_headers() %>%  # This will preserve test_ID
       filter(!is.na(peak_vertical_force)) %>%
       arrange(full_name, date)
     
@@ -1686,7 +1686,7 @@ if (count_mismatch && date_mismatch) {
     forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
       filter(!is.na(peak_vertical_force))
     
-    forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_id", "IMTP")  # Use test_id after clean_column_headers
+    forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP")
     
     create_log_entry(paste("IMTP data processed:", nrow(forcedecks_IMTP_clean), "records"))
   } else {
@@ -1962,7 +1962,7 @@ if (count_mismatch && date_mismatch) {
       validate_test_ids(cmj_temp, "Partial_CMJ_Temp")
       
       cmj_new <- cmj_temp %>%
-        mutate(test_ID = as.character(test_ID)) %>%  # Convert BEFORE clean_column_headers
+        mutate(test_ID = as.character(test_ID)) %>%  # Preserve test_ID
         select(any_of(c(
           "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
           "countermovement_depth", "jump_height_inches_imp_mom", "bodymass_relative_takeoff_power",
@@ -1977,13 +1977,13 @@ if (count_mismatch && date_mismatch) {
           "takeoff_velocity", "eccentric_time", "peak_landing_acceleration", "peak_takeoff_acceleration",
           "concentric_rfd_200", "eccentric_peak_power"
         ))) %>%
-        clean_column_headers() %>%
+        clean_column_headers() %>%  # This will preserve test_ID
         filter(!is.na(jump_height_inches_imp_mom)) %>%
         arrange(full_name, test_type, date)
       
       validate_test_ids(cmj_new, "Partial_CMJ_New")
       
-      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_id", "CMJ_PARTIAL")  # Use test_id after clean_column_headers
+      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL")
       
       validate_test_ids(forcedecks_jump_clean, "Partial_CMJ_Final")
       create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
@@ -2188,12 +2188,11 @@ if (count_mismatch && date_mismatch) {
           "start_to_peak_force", "rfd_at_100ms", "rfd_at_200ms", "force_at_100ms", 
           "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
         ))) %>% 
-        clean_column_headers() %>% 
-        mutate(test_id = as.character(test_id)) %>%  # Use test_id after clean_column_headers
+        clean_column_headers() %>%  # This will preserve test_ID
         filter(!is.na(peak_vertical_force)) %>%
         arrange(full_name, date)
       
-      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_id", "IMTP_PARTIAL")  # Use test_id after clean_column_headers
+      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP_PARTIAL")
       create_log_entry(paste("Partial IMTP processing:", nrow(forcedecks_IMTP_clean), "total records"))
     } else {
       forcedecks_IMTP_clean <- existing_data$forcedecks_IMTP_clean
