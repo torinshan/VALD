@@ -961,12 +961,12 @@ if (count_mismatch && date_mismatch) {
     })
   }
   
-  # Process tests
+  # Process tests with better test_ID preservation
   tests <- tests %>% 
     mutate(
       vald_id = profileId,
       test_type = testType,
-      test_ID = testId,
+      test_ID = as.character(testId),  # Ensure test_ID is character from the start
       recordedDateUtc_parsed = ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE),
       recordedDateUtc_local = if_else(
         recordedDateTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
@@ -982,6 +982,10 @@ if (count_mismatch && date_mismatch) {
       -recordedDateUtc_local, -recordedDateUtc, -recordedDateOffset, 
       -recordedDateTimezone, -recordingId
     )
+  
+  # Verify test_ID is preserved
+  create_log_entry(paste("Tests data: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")), "INFO")
+  create_log_entry(paste("Tests data: unique test_IDs:", length(unique(tests$test_ID))), "INFO")
   
   # Process definitions
   definitions <- definitions %>% 
@@ -1029,7 +1033,7 @@ if (count_mismatch && date_mismatch) {
   }
   
   mergable_trials <- trials_wider %>% 
-    mutate(test_ID = testid) %>% 
+    mutate(test_ID = as.character(testid)) %>%  # Ensure test_ID is character
     select(-testid) %>% 
     group_by(test_ID) %>% 
     summarise(
@@ -1040,32 +1044,50 @@ if (count_mismatch && date_mismatch) {
       across(where(is.numeric), mean, na.rm = TRUE),
       .groups = "drop"
     ) %>% 
-    mutate(vald_id = athleteid) %>% 
+    mutate(vald_id = as.character(athleteid)) %>%  # Ensure vald_id is character
     select(-athleteid) 
   
+  # Verify test_ID preservation in trials
+  create_log_entry(paste("Mergable trials: test_ID sample:", paste(head(mergable_trials$test_ID, 3), collapse = ", ")), "INFO")
+  create_log_entry(paste("Mergable trials: unique test_IDs:", length(unique(mergable_trials$test_ID))), "INFO")
+  
   mergable_tests <- tests %>%
-    select(test_ID, test_type)
+    select(test_ID, test_type) %>%
+    mutate(test_ID = as.character(test_ID))  # Ensure test_ID is character
+  
+  # Verify test_ID preservation in tests
+  create_log_entry(paste("Mergable tests: test_ID sample:", paste(head(mergable_tests$test_ID, 3), collapse = ", ")), "INFO")
+  create_log_entry(paste("Mergable tests: unique test_IDs:", length(unique(mergable_tests$test_ID))), "INFO")
   
   mergable_roster <- roster %>% 
     select(-first_name, -last_name) %>% 
     left_join(Vald_roster %>% select(vald_id, position, sport), by = "vald_id")
   
-  # Mass Merge
+  # Mass Merge with test_ID preservation
   forcedecks_raw <- mergable_trials %>% 
     left_join(mergable_tests, by = "test_ID") %>% 
     left_join(mergable_roster, by = "vald_id") %>% 
     mutate(
       date = as.Date(date, origin = "1970-01-01"),
-      time = as_hms(time)
+      time = as_hms(time),
+      test_ID = as.character(test_ID)  # Ensure test_ID remains character
     )
   
+  # Verify test_ID preservation after merge
+  create_log_entry(paste("Forcedecks raw: test_ID sample:", paste(head(forcedecks_raw$test_ID, 3), collapse = ", ")), "INFO")
+  create_log_entry(paste("Forcedecks raw: unique test_IDs:", length(unique(forcedecks_raw$test_ID))), "INFO")
+  create_log_entry(paste("Forcedecks raw: test_ID NA count:", sum(is.na(forcedecks_raw$test_ID))), "WARN")
+  
   ############################################################################
-  # CMJ, LCMJ, SJ, ABCMJ processing
+  # CMJ, LCMJ, SJ, ABCMJ processing with test_ID preservation
   ############################################################################
   
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
   
   if(nrow(cmj_temp) > 0) {
+    # Verify test_ID before processing
+    create_log_entry(paste("CMJ temp: test_ID sample before processing:", paste(head(cmj_temp$test_ID, 3), collapse = ", ")), "INFO")
+    
     cmj_new <- cmj_temp %>%
       select(any_of(c(
         "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
@@ -1082,8 +1104,13 @@ if (count_mismatch && date_mismatch) {
         "concentric_rfd_200", "eccentric_peak_power"
       ))) %>%
       clean_column_headers() %>%
+      mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID stays character
       filter(!is.na(jump_height_inches_imp_mom)) %>%
       arrange(full_name, test_type, date)
+    
+    # Verify test_ID after processing
+    create_log_entry(paste("CMJ new: test_ID sample after processing:", paste(head(cmj_new$test_ID, 3), collapse = ", ")), "INFO")
+    create_log_entry(paste("CMJ new: test_ID NA count:", sum(is.na(cmj_new$test_ID))), "WARN")
     
     cmj_old <- if(nrow(forcedecks_jump_clean_imported) > 0) forcedecks_jump_clean_imported else NULL
     
@@ -1633,14 +1660,20 @@ if (count_mismatch && date_mismatch) {
     create_log_entry("No new Nordboard data found")
   }
   
-  # Update dates and tests tables
+  # Update dates and tests tables with test_ID preservation
   dates <- forcedecks_raw %>% 
     select(date) %>% 
     unique()
   
   tests <- forcedecks_raw %>% 
     select(test_ID) %>% 
+    mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID is character
     unique()
+  
+  # Verify test_ID in final tests table
+  create_log_entry(paste("Final tests table: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")), "INFO")
+  create_log_entry(paste("Final tests table: unique test_IDs:", length(unique(tests$test_ID))), "INFO")
+  create_log_entry(paste("Final tests table: test_ID NA count:", sum(is.na(tests$test_ID))), "WARN")
   
   # Final appends
   dates <- append_and_finalize(dates, dates_imported, keys = "date", table_name = "Dates")
@@ -1738,13 +1771,182 @@ if (count_mismatch && date_mismatch) {
 } else if (count_mismatch && !date_mismatch) {
   create_log_entry("Only count mismatch – running partial code.")
   
-  date_count_start_date <- paste0(as.Date(latest_date_current), "T00:00:00Z")
-  set_start_date(date_count_start_date)
+  # Set Start Date to get only new data since latest date
+  partial_start_date <- paste0(as.Date(latest_date_current), "T00:00:00Z")
+  set_start_date(partial_start_date)
+  create_log_entry(paste("Setting partial processing start date to:", partial_start_date))
   
-  # Similar logic as full processing but with different date filtering
+  # Import existing data from BigQuery
+  create_log_entry("=== IMPORTING EXISTING DATA FROM BIGQUERY (PARTIAL) ===")
+  forcedecks_jump_clean_imported <- read_bq_table("vald_fd_jumps")
+  forcedecks_SLJ_clean_imported <- read_bq_table("vald_fd_sl_jumps")
+  nordboard_clean_imported <- read_bq_table("vald_nord_all")
+  forcedecks_RSI_clean_imported <- read_bq_table("vald_fd_rsi")
+  forcedecks_jump_DJ_clean_imported <- read_bq_table("vald_fd_dj")
+  forcedecks_rebound_clean_imported <- read_bq_table("vald_fd_rebound")
+  forcedecks_IMTP_clean_imported <- read_bq_table("vald_fd_imtp")
+  dates_imported <- read_bq_table("dates")
+  tests_imported <- read_bq_table("tests")
   
-  create_log_entry("=== PARTIAL PROCESSING COMPLETED ===")
-  create_log_entry("Partial data processing completed successfully")
+  # Get new data from VALD API (incremental)
+  create_log_entry("Fetching NEW ForceDecks data from VALD API...")
+  Injest_forcedekcs_data <- get_forcedecks_data()
+  
+  if (length(Injest_forcedekcs_data$tests) > 0) {
+    profiles <- setDT(Injest_forcedekcs_data$profiles)
+    definitions <- setDT(Injest_forcedekcs_data$result_definitions)
+    tests <- setDT(Injest_forcedekcs_data$tests)
+    trials <- setDT(Injest_forcedekcs_data$trials)
+    
+    create_log_entry(paste("Partial processing: Retrieved", nrow(tests), "new tests"))
+    
+    # Same processing pipeline as full processing but with smaller dataset
+    roster <- profiles %>%
+      select(profileId, givenName, familyName) %>% 
+      mutate(
+        full_name = (paste(trimws(givenName), trimws(familyName), sep = " ")),
+        first_name = givenName,
+        last_name = familyName,
+        vald_id = profileId
+      ) %>% 
+      select(-givenName, -familyName, -profileId)
+    
+    # Read VALD Roster
+    Vald_roster_raw <- read_bq_table("vald_roster")
+    if (nrow(Vald_roster_raw) > 0) {
+      Vald_roster <- process_simple_roster(Vald_roster_raw)
+      create_log_entry(paste("Using existing roster:", nrow(Vald_roster), "athletes"))
+    } else {
+      Vald_roster <- data.frame()
+      create_log_entry("No roster data available for partial processing", "WARN")
+    }
+    
+    # Process the new data (same logic as full processing)
+    tests <- tests %>% 
+      mutate(
+        vald_id = profileId,
+        test_type = testType,
+        test_ID = as.character(testId),
+        recordedDateUtc_parsed = ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE),
+        recordedDateUtc_local = if_else(
+          recordedDateTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
+          with_tz(recordedDateUtc_parsed, "America/Los_Angeles"),
+          recordedDateUtc_parsed
+        ),
+        date = as.Date(recordedDateUtc_local),
+        time = hms::as_hms(recordedDateUtc_local)
+      ) %>% 
+      select(
+        -testId, -tenantId, -profileId, -testType, -weight, -analysedDateUtc, 
+        -analysedDateOffset, -analysedDateTimezone, -recordedDateUtc_parsed, 
+        -recordedDateUtc_local, -recordedDateUtc, -recordedDateOffset, 
+        -recordedDateTimezone, -recordingId
+      )
+    
+    create_log_entry(paste("Partial processing: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")))
+    
+    # Process trials and create forcedecks_raw (abbreviated version)
+    if (nrow(trials) > 0) {
+      trials_wider <- trials %>% 
+        pivot_wider(
+          id_cols = c(testId, trialId, athleteId, recordedUTC, recordedTimezone, trialLimb),
+          names_from = definition_result,
+          values_from = value,
+          values_fn = dplyr::first
+        ) %>% 
+        mutate(
+          recordedUTC_parsed = ymd_hms(recordedUTC, tz = "UTC", quiet = TRUE),
+          recordedUTC_local  = if_else(
+            recordedTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
+            with_tz(recordedUTC_parsed, "America/Los_Angeles"),
+            recordedUTC_parsed
+          ),
+          date = as.Date(recordedUTC_local),
+          time = hms::as_hms(recordedUTC_local)
+        ) %>% 
+        select(-recordedUTC_parsed, -recordedUTC_local) %>% 
+        rename_with(tolower)
+      
+      # Find numeric columns and convert
+      start_col <- which(names(trials_wider) == "start_of_movement")
+      if (length(start_col) > 0) {
+        trials_wider <- trials_wider %>% 
+          mutate(across(all_of(start_col:ncol(.)), as.numeric))
+      }
+      
+      mergable_trials <- trials_wider %>% 
+        mutate(test_ID = as.character(testid)) %>%
+        select(-testid) %>% 
+        group_by(test_ID) %>% 
+        summarise(
+          athleteid = first(athleteid),
+          triallimb = first(triallimb),
+          date = first(date),
+          time = first(time),
+          across(where(is.numeric), mean, na.rm = TRUE),
+          .groups = "drop"
+        ) %>% 
+        mutate(vald_id = as.character(athleteid)) %>%
+        select(-athleteid)
+      
+      mergable_tests <- tests %>% select(test_ID, test_type) %>% mutate(test_ID = as.character(test_ID))
+      mergable_roster <- roster %>% select(-first_name, -last_name) %>% 
+        left_join(Vald_roster %>% select(vald_id, position, sport), by = "vald_id")
+      
+      forcedecks_raw <- mergable_trials %>% 
+        left_join(mergable_tests, by = "test_ID") %>% 
+        left_join(mergable_roster, by = "vald_id") %>% 
+        mutate(
+          date = as.Date(date, origin = "1970-01-01"),
+          time = as_hms(time),
+          test_ID = as.character(test_ID)
+        )
+      
+      create_log_entry(paste("Partial processing forcedecks_raw:", nrow(forcedecks_raw), "rows"))
+      create_log_entry(paste("Partial test_ID sample:", paste(head(forcedecks_raw$test_ID, 3), collapse = ", ")))
+      
+      # Process and append only CMJ data for partial processing (to keep it fast)
+      cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
+      
+      if(nrow(cmj_temp) > 0) {
+        cmj_new <- cmj_temp %>%
+          select(any_of(c(
+            "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
+            "jump_height_inches_imp_mom", "relative_peak_eccentric_force", "rsi_modified_imp_mom"
+          ))) %>%
+          mutate(test_ID = as.character(test_ID)) %>%
+          filter(!is.na(jump_height_inches_imp_mom))
+        
+        forcedecks_jump_clean <- append_and_finalize(cmj_new, forcedecks_jump_clean_imported, keys = "test_ID", table_name = "CMJ_PARTIAL")
+        create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
+        
+        # Upload updated CMJ data
+        enhanced_upload_to_bq(forcedecks_jump_clean, "vald_fd_jumps", "WRITE_TRUNCATE")
+      }
+      
+      # Update dates and tests tables
+      new_dates <- forcedecks_raw %>% select(date) %>% unique()
+      new_tests <- forcedecks_raw %>% select(test_ID) %>% mutate(test_ID = as.character(test_ID)) %>% unique()
+      
+      dates_final <- append_and_finalize(new_dates, dates_imported, keys = "date", table_name = "Dates_PARTIAL")
+      tests_final <- append_and_finalize(new_tests, tests_imported, keys = "test_ID", table_name = "Tests_PARTIAL")
+      
+      enhanced_upload_to_bq(dates_final, "dates", "WRITE_TRUNCATE")
+      enhanced_upload_to_bq(tests_final, "tests", "WRITE_TRUNCATE")
+      
+      create_log_entry("=== PARTIAL PROCESSING COMPLETED ===")
+      create_log_entry(paste("Processed", nrow(new_tests), "new tests"))
+      create_log_entry(paste("Updated dates table with", nrow(dates_final), "total dates"))
+      create_log_entry(paste("Updated tests table with", nrow(tests_final), "total tests"))
+      
+    } else {
+      create_log_entry("No trials data for partial processing", "WARN")
+    }
+    
+  } else {
+    create_log_entry("No new tests found for partial processing", "INFO")
+  }
+  
   create_log_entry("PARTIAL PROCESSING branch completed successfully")
   
 } else {
