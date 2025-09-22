@@ -937,22 +937,31 @@ safe_append_with_primary_key <- function(new_data, old_data, primary_key = "test
   }
 }
 
-# Test ID validation function
+# Test ID validation function - updated to handle both test_ID and test_id
 validate_test_ids <- function(data, stage_name) {
+  # Check for both test_ID (before cleaning) and test_id (after cleaning)
+  primary_key_col <- NULL
   if ("test_ID" %in% names(data)) {
-    na_count <- sum(is.na(data$test_ID))
-    empty_count <- sum(data$test_ID == "" | is.null(data$test_ID), na.rm = TRUE)
-    unique_count <- length(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]))
+    primary_key_col <- "test_ID"
+  } else if ("test_id" %in% names(data)) {
+    primary_key_col <- "test_id"
+  }
+  
+  if (!is.null(primary_key_col)) {
+    na_count <- sum(is.na(data[[primary_key_col]]))
+    empty_count <- sum(data[[primary_key_col]] == "" | is.null(data[[primary_key_col]]), na.rm = TRUE)
+    unique_count <- length(unique(data[[primary_key_col]][!is.na(data[[primary_key_col]]) & data[[primary_key_col]] != ""]))
     
     create_log_entry(paste("=== TEST_ID VALIDATION:", stage_name, "==="), "INFO")
+    create_log_entry(paste("  Primary key column:", primary_key_col))
     create_log_entry(paste("  Total rows:", nrow(data)))
     create_log_entry(paste("  NA test_IDs:", na_count))
     create_log_entry(paste("  Empty test_IDs:", empty_count))
     create_log_entry(paste("  Unique valid test_IDs:", unique_count))
-    create_log_entry(paste("  test_ID class:", class(data$test_ID)[1]))
+    create_log_entry(paste("  test_ID class:", class(data[[primary_key_col]])[1]))
     
     if (unique_count > 0) {
-      create_log_entry(paste("  Sample test_IDs:", paste(head(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]), 3), collapse = ", ")))
+      create_log_entry(paste("  Sample test_IDs:", paste(head(unique(data[[primary_key_col]][!is.na(data[[primary_key_col]]) & data[[primary_key_col]] != ""]), 3), collapse = ", ")))
     }
     
     if (na_count > 0 || empty_count > 0) {
@@ -961,7 +970,7 @@ validate_test_ids <- function(data, stage_name) {
       create_log_entry(paste("SUCCESS:", stage_name, "test_ID validation passed"), "INFO")
     }
   } else {
-    create_log_entry(paste("WARNING:", stage_name, "does not contain test_ID column"), "WARN")
+    create_log_entry(paste("WARNING:", stage_name, "does not contain test_ID or test_id column"), "WARN")
   }
 }
 
@@ -1214,7 +1223,7 @@ if (count_mismatch && date_mismatch) {
     
     validate_test_ids(cmj_new, "CMJ_New_After_Processing")
     
-    cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ") %>%
+    cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_id", "CMJ") %>%  # Use test_id after clean_column_headers
       arrange(full_name, test_type, date)
     
     validate_test_ids(cmj_all, "CMJ_All_After_Append")
@@ -1608,7 +1617,7 @@ if (count_mismatch && date_mismatch) {
         "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
       ))) %>% 
       clean_column_headers() %>% 
-      mutate(test_ID = as.character(test_ID)) %>%  # Preserve test_ID
+      mutate(test_id = as.character(test_id)) %>%  # Use test_id after clean_column_headers
       filter(!is.na(peak_vertical_force)) %>%
       arrange(full_name, date)
     
@@ -1640,7 +1649,7 @@ if (count_mismatch && date_mismatch) {
     forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
       filter(!is.na(peak_vertical_force))
     
-    forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP")
+    forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_id", "IMTP")  # Use test_id after clean_column_headers
     
     create_log_entry(paste("IMTP data processed:", nrow(forcedecks_IMTP_clean), "records"))
   } else {
@@ -1937,7 +1946,7 @@ if (count_mismatch && date_mismatch) {
       
       validate_test_ids(cmj_new, "Partial_CMJ_New")
       
-      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL")
+      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_id", "CMJ_PARTIAL")  # Use test_id after clean_column_headers
       
       validate_test_ids(forcedecks_jump_clean, "Partial_CMJ_Final")
       create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
@@ -2143,11 +2152,11 @@ if (count_mismatch && date_mismatch) {
           "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
         ))) %>% 
         clean_column_headers() %>% 
-        mutate(test_ID = as.character(test_ID)) %>%
+        mutate(test_id = as.character(test_id)) %>%  # Use test_id after clean_column_headers
         filter(!is.na(peak_vertical_force)) %>%
         arrange(full_name, date)
       
-      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP_PARTIAL")
+      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_id", "IMTP_PARTIAL")  # Use test_id after clean_column_headers
       create_log_entry(paste("Partial IMTP processing:", nrow(forcedecks_IMTP_clean), "total records"))
     } else {
       forcedecks_IMTP_clean <- existing_data$forcedecks_IMTP_clean
