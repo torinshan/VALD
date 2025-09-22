@@ -848,69 +848,139 @@ process_simple_roster <- function(roster_data) {
   return(roster_clean)
 }
 
-append_and_finalize <- function(new_df, old_df, keys = NULL, table_name = "Unknown") {
-  if (is.null(old_df) && is.null(new_df)) return(data.frame())
-  if (is.null(old_df)) return(new_df)
-  if (is.null(new_df)) return(old_df)
+# CRITICAL: New safe append function that preserves test_ID primary key
+safe_append_with_primary_key <- function(new_data, old_data, primary_key = "test_ID", table_name = "Unknown") {
+  create_log_entry(paste("=== SAFE APPEND PROCESS FOR", table_name, "==="), "INFO")
   
-  if (nrow(old_df) == 0 && nrow(new_df) == 0) return(data.frame())
-  if (nrow(old_df) == 0) return(new_df)
-  if (nrow(new_df) == 0) return(old_df)
+  # Handle empty cases
+  if (is.null(old_data) || nrow(old_data) == 0) {
+    if (is.null(new_data) || nrow(new_data) == 0) {
+      create_log_entry(paste(table_name, "- Both old and new data are empty"), "WARN")
+      return(data.frame())
+    }
+    create_log_entry(paste(table_name, "- No existing data, returning new data only:", nrow(new_data), "rows"))
+    return(new_data)
+  }
   
-  rows_before <- nrow(old_df) + nrow(new_df)
-  combined <- bind_rows(old_df, new_df)
+  if (is.null(new_data) || nrow(new_data) == 0) {
+    create_log_entry(paste(table_name, "- No new data, keeping existing data:", nrow(old_data), "rows"))
+    return(old_data)
+  }
   
-  if (is.null(keys) || !all(keys %in% names(combined))) {
-    create_log_entry(paste("INFO:", table_name, "- Using exact row deduplication (no valid keys)"))
-    result <- distinct(combined)
+  # Ensure primary key exists and is character in both datasets
+  if (!primary_key %in% names(old_data)) {
+    create_log_entry(paste("ERROR:", table_name, "- Primary key", primary_key, "missing from existing data"), "ERROR")
+    return(old_data)
+  }
+  
+  if (!primary_key %in% names(new_data)) {
+    create_log_entry(paste("ERROR:", table_name, "- Primary key", primary_key, "missing from new data"), "ERROR")
+    return(old_data)
+  }
+  
+  # Convert primary key to character and remove NAs
+  old_data[[primary_key]] <- as.character(old_data[[primary_key]])
+  new_data[[primary_key]] <- as.character(new_data[[primary_key]])
+  
+  # Remove records with NA primary keys
+  old_data_clean <- old_data[!is.na(old_data[[primary_key]]) & old_data[[primary_key]] != "", ]
+  new_data_clean <- new_data[!is.na(new_data[[primary_key]]) & new_data[[primary_key]] != "", ]
+  
+  create_log_entry(paste(table_name, "- Existing data after cleaning:", nrow(old_data_clean), "rows"))
+  create_log_entry(paste(table_name, "- New data after cleaning:", nrow(new_data_clean), "rows"))
+  
+  if (nrow(new_data_clean) == 0) {
+    create_log_entry(paste(table_name, "- No valid new data after cleaning"), "WARN")
+    return(old_data_clean)
+  }
+  
+  # Find existing and new primary keys
+  existing_keys <- unique(old_data_clean[[primary_key]])
+  new_keys <- unique(new_data_clean[[primary_key]])
+  truly_new_keys <- setdiff(new_keys, existing_keys)
+  duplicate_keys <- intersect(new_keys, existing_keys)
+  
+  create_log_entry(paste(table_name, "- Existing unique keys:", length(existing_keys)))
+  create_log_entry(paste(table_name, "- New unique keys:", length(new_keys)))
+  create_log_entry(paste(table_name, "- Truly new keys:", length(truly_new_keys)))
+  create_log_entry(paste(table_name, "- Duplicate keys:", length(duplicate_keys)))
+  
+  # Get truly new records
+  if (length(truly_new_keys) > 0) {
+    truly_new_records <- new_data_clean[new_data_clean[[primary_key]] %in% truly_new_keys, ]
+    
+    # Combine old and new data
+    combined_data <- bind_rows(old_data_clean, truly_new_records)
+    
+    create_log_entry(paste(table_name, "- Final combined data:", nrow(combined_data), "rows"))
+    create_log_entry(paste(table_name, "- Added", nrow(truly_new_records), "new records"))
+    
+    # Validate no duplicate primary keys in final result
+    final_key_count <- length(unique(combined_data[[primary_key]]))
+    if (final_key_count != nrow(combined_data)) {
+      create_log_entry(paste("WARNING:", table_name, "- Final data has duplicate primary keys"), "WARN")
+      # Remove duplicates, keeping first occurrence
+      combined_data <- combined_data[!duplicated(combined_data[[primary_key]]), ]
+      create_log_entry(paste(table_name, "- After deduplication:", nrow(combined_data), "rows"))
+    }
+    
+    return(combined_data)
+    
   } else {
-    result <- distinct(combined, across(all_of(keys)), .keep_all = TRUE)
+    create_log_entry(paste(table_name, "- No truly new records to add"))
+    
+    if (length(duplicate_keys) > 0) {
+      create_log_entry(paste(table_name, "- All new records already exist (", length(duplicate_keys), "duplicates)"))
+    }
+    
+    return(old_data_clean)
   }
-  
-  rows_after <- nrow(result)
-  rows_removed <- rows_before - rows_after
-  
-  if (rows_removed > 0) {
-    create_log_entry(paste("INFO:", table_name, "- Removed", rows_removed, "duplicate rows during append"))
+}
+
+# Test ID validation function
+validate_test_ids <- function(data, stage_name) {
+  if ("test_ID" %in% names(data)) {
+    na_count <- sum(is.na(data$test_ID))
+    empty_count <- sum(data$test_ID == "" | is.null(data$test_ID), na.rm = TRUE)
+    unique_count <- length(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]))
+    
+    create_log_entry(paste("=== TEST_ID VALIDATION:", stage_name, "==="), "INFO")
+    create_log_entry(paste("  Total rows:", nrow(data)))
+    create_log_entry(paste("  NA test_IDs:", na_count))
+    create_log_entry(paste("  Empty test_IDs:", empty_count))
+    create_log_entry(paste("  Unique valid test_IDs:", unique_count))
+    create_log_entry(paste("  test_ID class:", class(data$test_ID)[1]))
+    
+    if (unique_count > 0) {
+      create_log_entry(paste("  Sample test_IDs:", paste(head(unique(data$test_ID[!is.na(data$test_ID) & data$test_ID != ""]), 3), collapse = ", ")))
+    }
+    
+    if (na_count > 0 || empty_count > 0) {
+      create_log_entry(paste("WARNING:", stage_name, "has", na_count + empty_count, "invalid test_IDs"), "WARN")
+    } else {
+      create_log_entry(paste("SUCCESS:", stage_name, "test_ID validation passed"), "INFO")
+    }
+  } else {
+    create_log_entry(paste("WARNING:", stage_name, "does not contain test_ID column"), "WARN")
   }
-  
-  return(result)
 }
 
 ################################################################################
-# Main Processing Logic
+# SHARED PROCESSING FUNCTIONS (Used by both Full and Partial)
 ################################################################################
 
-tryCatch({
-
-if (count_mismatch && date_mismatch) {
-  create_log_entry("Both mismatches found – running full code.")
+# Create shared data processing pipeline function
+process_vald_data <- function(injest_data, existing_data, processing_type = "FULL") {
+  create_log_entry(paste("=== STARTING", processing_type, "DATA PROCESSING PIPELINE ==="), "INFO")
   
-  # Set Start Date
-  date_count_start_date <- paste0(latest_date_current + days(1), "T00:00:00Z")
-  set_start_date(date_count_start_date)
+  profiles <- setDT(injest_data$profiles)
+  definitions <- setDT(injest_data$result_definitions)
+  tests <- setDT(injest_data$tests)
+  trials <- setDT(injest_data$trials)
   
-  # Import existing data from BigQuery
-  create_log_entry("=== IMPORTING EXISTING DATA FROM BIGQUERY ===")
-  forcedecks_jump_clean_imported <- read_bq_table("vald_fd_jumps")
-  forcedecks_SLJ_clean_imported <- read_bq_table("vald_fd_sl_jumps")
-  nordboard_clean_imported <- read_bq_table("vald_nord_all")
-  forcedecks_RSI_clean_imported <- read_bq_table("vald_fd_rsi")
-  forcedecks_jump_DJ_clean_imported <- read_bq_table("vald_fd_dj")
-  forcedecks_rebound_clean_imported <- read_bq_table("vald_fd_rebound")
-  forcedecks_IMTP_clean_imported <- read_bq_table("vald_fd_imtp")
-  dates_imported <- read_bq_table("dates")
-  tests_imported <- read_bq_table("tests")
+  create_log_entry(paste("Raw data counts - Profiles:", nrow(profiles), "Tests:", nrow(tests), "Trials:", nrow(trials)))
   
-  # Get new data from VALD API
-  create_log_entry("Fetching ForceDecks data from VALD API...")
-  Injest_forcedekcs_data <- get_forcedecks_data()
-  
-  profiles <- setDT(Injest_forcedekcs_data$profiles)
-  definitions <- setDT(Injest_forcedekcs_data$result_definitions)
-  tests <- setDT(Injest_forcedekcs_data$tests)
-  trials <- setDT(Injest_forcedekcs_data$trials)
-  
+  # Process profiles for roster
   roster <- profiles %>%
     select(profileId, givenName, familyName) %>% 
     mutate(
@@ -921,52 +991,12 @@ if (count_mismatch && date_mismatch) {
     ) %>% 
     select(-givenName, -familyName, -profileId)
   
-  # Read VALD Roster from BigQuery or GitHub fallback
-  Vald_roster_raw <- read_bq_table("vald_roster")
-  
-  if (nrow(Vald_roster_raw) > 0) {
-    create_log_entry("Reading roster data from BigQuery")
-    
-    Vald_roster <- process_simple_roster(Vald_roster_raw)
-    create_log_entry(paste("Processed", nrow(Vald_roster), "athletes from BigQuery roster"))
-    
-  } else {
-    create_log_entry("Roster not found in BigQuery, trying GitHub fallback", "WARN")
-    
-    tryCatch({
-      roster_url <- "https://raw.githubusercontent.com/torinshan/VALD/main/.github/vald_roster.csv"
-      Vald_roster_raw <- read_csv(roster_url, show_col_types = FALSE)
-      
-      if (nrow(Vald_roster_raw) > 0) {
-        create_log_entry("Successfully read roster from GitHub")
-        Vald_roster <- process_simple_roster(Vald_roster_raw)
-        create_log_entry(paste("Processed", nrow(Vald_roster), "athletes from GitHub roster"))
-      } else {
-        Vald_roster <- data.frame(
-          external_id = character(0), position = character(0), sport = character(0), 
-          height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
-          email = character(0), vald_id = character(0), family_name = character(0), 
-          weight = numeric(0), given_name = character(0)
-        )
-        create_log_entry("GitHub roster file was empty", "WARN")
-      }
-    }, error = function(e) {
-      create_log_entry(paste("Failed to read roster from GitHub:", e$message), "WARN")
-      Vald_roster <- data.frame(
-        external_id = character(0), position = character(0), sport = character(0), 
-        height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
-        email = character(0), vald_id = character(0), family_name = character(0), 
-        weight = numeric(0), given_name = character(0)
-      )
-    })
-  }
-  
-  # Process tests with better test_ID preservation
-  tests <- tests %>% 
+  # Process tests with test_ID preservation
+  tests_processed <- tests %>% 
     mutate(
-      vald_id = profileId,
+      vald_id = as.character(profileId),
       test_type = testType,
-      test_ID = as.character(testId),  # Ensure test_ID is character from the start
+      test_ID = as.character(testId),  # CRITICAL: Ensure test_ID is character from start
       recordedDateUtc_parsed = ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE),
       recordedDateUtc_local = if_else(
         recordedDateTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
@@ -983,12 +1013,10 @@ if (count_mismatch && date_mismatch) {
       -recordedDateTimezone, -recordingId
     )
   
-  # Verify test_ID is preserved
-  create_log_entry(paste("Tests data: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")), "INFO")
-  create_log_entry(paste("Tests data: unique test_IDs:", length(unique(tests$test_ID))), "INFO")
+  validate_test_ids(tests_processed, "Tests_Processed")
   
   # Process definitions
-  definitions <- definitions %>% 
+  definitions_processed <- definitions %>% 
     select(
       resultId,
       r_name = resultIdString,
@@ -1004,6 +1032,7 @@ if (count_mismatch && date_mismatch) {
       good_trend_direction = trendDirection
     )
   
+  # Process trials with test_ID preservation
   trials_wider <- trials %>% 
     pivot_wider(
       id_cols = c(testId, trialId, athleteId, recordedUTC, recordedTimezone, trialLimb),
@@ -1022,18 +1051,18 @@ if (count_mismatch && date_mismatch) {
       time = hms::as_hms(recordedUTC_local)
     ) %>% 
     select(-recordedUTC_parsed, -recordedUTC_local) %>% 
-    rename_with(tolower)  
+    rename_with(tolower)
   
-  # Find the position of the start_of_movement column
+  # Convert numeric columns
   start_col <- which(names(trials_wider) == "start_of_movement")
-  
   if (length(start_col) > 0) {
     trials_wider <- trials_wider %>% 
       mutate(across(all_of(start_col:ncol(.)), as.numeric))
   }
   
+  # Create mergable trials with test_ID preservation
   mergable_trials <- trials_wider %>% 
-    mutate(test_ID = as.character(testid)) %>%  # Ensure test_ID is character
+    mutate(test_ID = as.character(testid)) %>%  # CRITICAL: Ensure test_ID is character
     select(-testid) %>% 
     group_by(test_ID) %>% 
     summarise(
@@ -1044,39 +1073,115 @@ if (count_mismatch && date_mismatch) {
       across(where(is.numeric), mean, na.rm = TRUE),
       .groups = "drop"
     ) %>% 
-    mutate(vald_id = as.character(athleteid)) %>%  # Ensure vald_id is character
-    select(-athleteid) 
+    mutate(vald_id = as.character(athleteid)) %>%
+    select(-athleteid)
   
-  # Verify test_ID preservation in trials
-  create_log_entry(paste("Mergable trials: test_ID sample:", paste(head(mergable_trials$test_ID, 3), collapse = ", ")), "INFO")
-  create_log_entry(paste("Mergable trials: unique test_IDs:", length(unique(mergable_trials$test_ID))), "INFO")
+  validate_test_ids(mergable_trials, "Mergable_Trials")
   
-  mergable_tests <- tests %>%
+  # Create mergable tests
+  mergable_tests <- tests_processed %>% 
     select(test_ID, test_type) %>%
-    mutate(test_ID = as.character(test_ID))  # Ensure test_ID is character
+    mutate(test_ID = as.character(test_ID))  # CRITICAL: Ensure test_ID is character
   
-  # Verify test_ID preservation in tests
-  create_log_entry(paste("Mergable tests: test_ID sample:", paste(head(mergable_tests$test_ID, 3), collapse = ", ")), "INFO")
-  create_log_entry(paste("Mergable tests: unique test_IDs:", length(unique(mergable_tests$test_ID))), "INFO")
+  validate_test_ids(mergable_tests, "Mergable_Tests")
   
+  # Get roster data
+  Vald_roster_raw <- existing_data$roster
+  if (nrow(Vald_roster_raw) > 0) {
+    Vald_roster <- process_simple_roster(Vald_roster_raw)
+    create_log_entry(paste("Using existing roster:", nrow(Vald_roster), "athletes"))
+  } else {
+    create_log_entry("Attempting to read roster from GitHub fallback", "WARN")
+    tryCatch({
+      roster_url <- "https://raw.githubusercontent.com/torinshan/VALD/main/.github/vald_roster.csv"
+      Vald_roster_raw_github <- read_csv(roster_url, show_col_types = FALSE)
+      
+      if (nrow(Vald_roster_raw_github) > 0) {
+        Vald_roster <- process_simple_roster(Vald_roster_raw_github)
+        create_log_entry(paste("Using GitHub roster:", nrow(Vald_roster), "athletes"))
+      } else {
+        Vald_roster <- data.frame(
+          external_id = character(0), position = character(0), sport = character(0), 
+          height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+          email = character(0), vald_id = character(0), family_name = character(0), 
+          weight = numeric(0), given_name = character(0)
+        )
+        create_log_entry("GitHub roster was empty, using empty roster", "WARN")
+      }
+    }, error = function(e) {
+      create_log_entry(paste("Failed to read roster from GitHub:", e$message), "WARN")
+      Vald_roster <- data.frame(
+        external_id = character(0), position = character(0), sport = character(0), 
+        height = integer(0), sex = character(0), date_of_birth = as.Date(character(0)), 
+        email = character(0), vald_id = character(0), family_name = character(0), 
+        weight = numeric(0), given_name = character(0)
+      )
+    })
+  }
+  
+  # Create mergable roster
   mergable_roster <- roster %>% 
     select(-first_name, -last_name) %>% 
     left_join(Vald_roster %>% select(vald_id, position, sport), by = "vald_id")
   
-  # Mass Merge with test_ID preservation
+  # CRITICAL: Master merge with test_ID preservation
   forcedecks_raw <- mergable_trials %>% 
     left_join(mergable_tests, by = "test_ID") %>% 
     left_join(mergable_roster, by = "vald_id") %>% 
     mutate(
       date = as.Date(date, origin = "1970-01-01"),
       time = as_hms(time),
-      test_ID = as.character(test_ID)  # Ensure test_ID remains character
+      test_ID = as.character(test_ID)  # CRITICAL: Final test_ID preservation
     )
   
-  # Verify test_ID preservation after merge
-  create_log_entry(paste("Forcedecks raw: test_ID sample:", paste(head(forcedecks_raw$test_ID, 3), collapse = ", ")), "INFO")
-  create_log_entry(paste("Forcedecks raw: unique test_IDs:", length(unique(forcedecks_raw$test_ID))), "INFO")
-  create_log_entry(paste("Forcedecks raw: test_ID NA count:", sum(is.na(forcedecks_raw$test_ID))), "WARN")
+  validate_test_ids(forcedecks_raw, "ForceDecks_Raw_Final")
+  
+  create_log_entry(paste("ForceDecks raw data created:", nrow(forcedecks_raw), "rows"))
+  
+  return(list(
+    forcedecks_raw = forcedecks_raw,
+    tests_processed = tests_processed,
+    roster = Vald_roster,
+    trials_wider = trials_wider,
+    mergable_roster = mergable_roster
+  ))
+}
+
+################################################################################
+# Main Processing Logic
+################################################################################
+
+tryCatch({
+
+if (count_mismatch && date_mismatch) {
+  create_log_entry("Both mismatches found – running full code.")
+  
+  # Set Start Date
+  date_count_start_date <- paste0(latest_date_current + days(1), "T00:00:00Z")
+  set_start_date(date_count_start_date)
+  
+  # Import existing data from BigQuery
+  create_log_entry("=== IMPORTING EXISTING DATA FROM BIGQUERY ===")
+  existing_data <- list(
+    forcedecks_jump_clean = read_bq_table("vald_fd_jumps"),
+    forcedecks_SLJ_clean = read_bq_table("vald_fd_sl_jumps"),
+    nordboard_clean = read_bq_table("vald_nord_all"),
+    forcedecks_RSI_clean = read_bq_table("vald_fd_rsi"),
+    forcedecks_jump_DJ_clean = read_bq_table("vald_fd_dj"),
+    forcedecks_rebound_clean = read_bq_table("vald_fd_rebound"),
+    forcedecks_IMTP_clean = read_bq_table("vald_fd_imtp"),
+    dates = read_bq_table("dates"),
+    tests = read_bq_table("tests"),
+    roster = read_bq_table("vald_roster")
+  )
+  
+  # Get new data from VALD API
+  create_log_entry("Fetching ForceDecks data from VALD API...")
+  injest_forcedecks_data <- get_forcedecks_data()
+  
+  # Process using shared pipeline
+  processed_data <- process_vald_data(injest_forcedecks_data, existing_data, "FULL")
+  forcedecks_raw <- processed_data$forcedecks_raw
   
   ############################################################################
   # CMJ, LCMJ, SJ, ABCMJ processing with test_ID preservation
@@ -1085,8 +1190,7 @@ if (count_mismatch && date_mismatch) {
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
   
   if(nrow(cmj_temp) > 0) {
-    # Verify test_ID before processing
-    create_log_entry(paste("CMJ temp: test_ID sample before processing:", paste(head(cmj_temp$test_ID, 3), collapse = ", ")), "INFO")
+    validate_test_ids(cmj_temp, "CMJ_Temp_Before_Processing")
     
     cmj_new <- cmj_temp %>%
       select(any_of(c(
@@ -1104,18 +1208,16 @@ if (count_mismatch && date_mismatch) {
         "concentric_rfd_200", "eccentric_peak_power"
       ))) %>%
       clean_column_headers() %>%
-      mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID stays character
+      mutate(test_ID = as.character(test_ID)) %>%
       filter(!is.na(jump_height_inches_imp_mom)) %>%
       arrange(full_name, test_type, date)
     
-    # Verify test_ID after processing
-    create_log_entry(paste("CMJ new: test_ID sample after processing:", paste(head(cmj_new$test_ID, 3), collapse = ", ")), "INFO")
-    create_log_entry(paste("CMJ new: test_ID NA count:", sum(is.na(cmj_new$test_ID))), "WARN")
+    validate_test_ids(cmj_new, "CMJ_New_After_Processing")
     
-    cmj_old <- if(nrow(forcedecks_jump_clean_imported) > 0) forcedecks_jump_clean_imported else NULL
-    
-    cmj_all <- append_and_finalize(cmj_new, cmj_old, keys = "test_ID", table_name = "CMJ") %>%
+    cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ") %>%
       arrange(full_name, test_type, date)
+    
+    validate_test_ids(cmj_all, "CMJ_All_After_Append")
     
     # Scores on the combined data (30-day lookback windows)
     forcedecks_jump_clean <- cmj_all %>%
@@ -1231,9 +1333,10 @@ if (count_mismatch && date_mismatch) {
         select(-calc_performance_score)
     }
     
+    validate_test_ids(forcedecks_jump_clean, "CMJ_Final")
     create_log_entry(paste("CMJ data processed:", nrow(forcedecks_jump_clean), "records"))
   } else {
-    forcedecks_jump_clean <- if(nrow(forcedecks_jump_clean_imported) > 0) forcedecks_jump_clean_imported else data.frame()
+    forcedecks_jump_clean <- existing_data$forcedecks_jump_clean
     create_log_entry("No new CMJ data found")
   }
   
@@ -1254,6 +1357,7 @@ if (count_mismatch && date_mismatch) {
         "passive_stiffness_index", "peak_impact_force", "peak_driveoff_force"
       ))) %>% 
       mutate(
+        test_ID = as.character(test_ID),  # Preserve test_ID
         velocity_ratio = if_else(!is.na(peak_takeoff_velocity) & !is.na(peak_landing_velocity) & peak_landing_velocity != 0,
                                 peak_takeoff_velocity / peak_landing_velocity, NA_real_),
         force_ratio = if_else(!is.na(peak_impact_force) & !is.na(peak_driveoff_force) & peak_driveoff_force != 0,
@@ -1264,12 +1368,11 @@ if (count_mismatch && date_mismatch) {
       filter(!is.na(jump_height_inches_imp_mom)) %>% 
       filter(jump_height_inches_imp_mom < 30 & jump_height_inches_imp_mom > 2)
     
-    dj_old <- if(nrow(forcedecks_jump_DJ_clean_imported) > 0) forcedecks_jump_DJ_clean_imported else NULL
-    forcedecks_jump_DJ_clean <- append_and_finalize(forcedecks_jump_DJ_clean, dj_old, keys = "test_ID", table_name = "DJ")
+    forcedecks_jump_DJ_clean <- safe_append_with_primary_key(forcedecks_jump_DJ_clean, existing_data$forcedecks_jump_DJ_clean, "test_ID", "DJ")
     
     create_log_entry(paste("DJ data processed:", nrow(forcedecks_jump_DJ_clean), "records"))
   } else {
-    forcedecks_jump_DJ_clean <- if(nrow(forcedecks_jump_DJ_clean_imported) > 0) forcedecks_jump_DJ_clean_imported else data.frame()
+    forcedecks_jump_DJ_clean <- existing_data$forcedecks_jump_DJ_clean
     create_log_entry("No new DJ data found")
   }
   
@@ -1277,16 +1380,17 @@ if (count_mismatch && date_mismatch) {
   # RSI processing
   ############################################################################
   
-  rsi_temp <- trials_wider %>%
-    mutate(test_ID = testid, vald_id = athleteid) %>% 
-    left_join(mergable_tests, by = "test_ID") %>% 
+  rsi_temp <- processed_data$trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+    left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
     filter(test_type %in% c("RSAIP", "RSHIP", "RSKIP"))
   
   if(nrow(rsi_temp) > 0) {
     forcedecks_RSI_clean <- rsi_temp %>%
       select(-testid, -athleteid) %>% 
-      left_join(mergable_roster, by = "vald_id") %>% 
+      left_join(processed_data$mergable_roster, by = "vald_id") %>% 
       mutate(
+        test_ID = as.character(test_ID),  # Preserve test_ID
         date = as.Date(date, origin = "1970-01-01"),
         time = as_hms(time)
       ) %>% 
@@ -1304,6 +1408,7 @@ if (count_mismatch && date_mismatch) {
                ~mean(.x, na.rm = TRUE)),
         .groups = "drop"
       ) %>%
+      mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID stays character
       pivot_wider(
         id_cols = any_of(c("test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs")),
         names_from = triallimb,
@@ -1331,12 +1436,11 @@ if (count_mismatch && date_mismatch) {
       rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
       rename_with(~str_replace(.x, "_Right$", "_right"), everything())
     
-    rsi_old <- if(nrow(forcedecks_RSI_clean_imported) > 0) forcedecks_RSI_clean_imported else NULL
-    forcedecks_RSI_clean <- append_and_finalize(forcedecks_RSI_clean, rsi_old, keys = "test_ID", table_name = "RSI")
+    forcedecks_RSI_clean <- safe_append_with_primary_key(forcedecks_RSI_clean, existing_data$forcedecks_RSI_clean, "test_ID", "RSI")
     
     create_log_entry(paste("RSI data processed:", nrow(forcedecks_RSI_clean), "records"))
   } else {
-    forcedecks_RSI_clean <- if(nrow(forcedecks_RSI_clean_imported) > 0) forcedecks_RSI_clean_imported else data.frame()
+    forcedecks_RSI_clean <- existing_data$forcedecks_RSI_clean
     create_log_entry("No new RSI data found")
   }
   
@@ -1344,16 +1448,17 @@ if (count_mismatch && date_mismatch) {
   # Rebound processing
   ############################################################################
   
-  rebound_temp <- trials_wider %>%
-    mutate(test_ID = testid, vald_id = athleteid) %>% 
-    left_join(mergable_tests, by = "test_ID") %>% 
+  rebound_temp <- processed_data$trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+    left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
     filter(test_type %in% c("CMRJ", "SLCMRJ"))
   
   if(nrow(rebound_temp) > 0) {
     forcedecks_rebound_clean <- rebound_temp %>%
       select(-testid, -athleteid) %>% 
-      left_join(mergable_roster, by = "vald_id") %>% 
+      left_join(processed_data$mergable_roster, by = "vald_id") %>% 
       mutate(
+        test_ID = as.character(test_ID),  # Preserve test_ID
         date = as.Date(date, origin = "1970-01-01"),
         time = as_hms(time)
       ) %>% 
@@ -1374,6 +1479,7 @@ if (count_mismatch && date_mismatch) {
         .groups = "drop"
       ) %>%
       mutate(
+        test_ID = as.character(test_ID),  # Ensure test_ID stays character
         limb_suffix = case_when(
           test_type == "CMRJ" ~ "bilateral",
           test_type == "SLCMRJ" & triallimb == "Left" ~ "left", 
@@ -1409,12 +1515,11 @@ if (count_mismatch && date_mismatch) {
       }
     }
     
-    rebound_old <- if(nrow(forcedecks_rebound_clean_imported) > 0) forcedecks_rebound_clean_imported else NULL
-    forcedecks_rebound_clean <- append_and_finalize(forcedecks_rebound_clean, rebound_old, keys = "test_ID", table_name = "Rebound")
+    forcedecks_rebound_clean <- safe_append_with_primary_key(forcedecks_rebound_clean, existing_data$forcedecks_rebound_clean, "test_ID", "Rebound")
     
     create_log_entry(paste("Rebound data processed:", nrow(forcedecks_rebound_clean), "records"))
   } else {
-    forcedecks_rebound_clean <- if(nrow(forcedecks_rebound_clean_imported) > 0) forcedecks_rebound_clean_imported else data.frame()
+    forcedecks_rebound_clean <- existing_data$forcedecks_rebound_clean
     create_log_entry("No new Rebound data found")
   }
   
@@ -1422,16 +1527,17 @@ if (count_mismatch && date_mismatch) {
   # Single Leg Jump processing
   ############################################################################
   
-  slj_temp <- trials_wider %>%
-    mutate(test_ID = testid, vald_id = athleteid) %>% 
-    left_join(mergable_tests, by = "test_ID") %>% 
+  slj_temp <- processed_data$trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+    left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
     filter(test_type == "SLJ")
   
   if(nrow(slj_temp) > 0) {
     forcedecks_SLJ_clean <- slj_temp %>%
       select(-testid, -athleteid) %>% 
-      left_join(mergable_roster, by = "vald_id") %>% 
+      left_join(processed_data$mergable_roster, by = "vald_id") %>% 
       mutate(
+        test_ID = as.character(test_ID),  # Preserve test_ID
         date = as.Date(date, origin = "1970-01-01"),
         time = as_hms(time)
       ) %>% 
@@ -1449,6 +1555,7 @@ if (count_mismatch && date_mismatch) {
         across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
         .groups = "drop"
       ) %>%
+      mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID stays character
       pivot_wider(
         id_cols = any_of(c("test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs")),
         names_from = triallimb,
@@ -1479,12 +1586,11 @@ if (count_mismatch && date_mismatch) {
       rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
       rename_with(~str_replace(.x, "_Right$", "_right"), everything())
     
-    slj_old <- if(nrow(forcedecks_SLJ_clean_imported) > 0) forcedecks_SLJ_clean_imported else NULL
-    forcedecks_SLJ_clean <- append_and_finalize(forcedecks_SLJ_clean, slj_old, keys = "test_ID", table_name = "SLJ")
+    forcedecks_SLJ_clean <- safe_append_with_primary_key(forcedecks_SLJ_clean, existing_data$forcedecks_SLJ_clean, "test_ID", "SLJ")
     
     create_log_entry(paste("SLJ data processed:", nrow(forcedecks_SLJ_clean), "records"))
   } else {
-    forcedecks_SLJ_clean <- if(nrow(forcedecks_SLJ_clean_imported) > 0) forcedecks_SLJ_clean_imported else data.frame()
+    forcedecks_SLJ_clean <- existing_data$forcedecks_SLJ_clean
     create_log_entry("No new SLJ data found")
   }
   
@@ -1502,6 +1608,7 @@ if (count_mismatch && date_mismatch) {
         "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
       ))) %>% 
       clean_column_headers() %>% 
+      mutate(test_ID = as.character(test_ID)) %>%  # Preserve test_ID
       filter(!is.na(peak_vertical_force)) %>%
       arrange(full_name, date)
     
@@ -1533,12 +1640,11 @@ if (count_mismatch && date_mismatch) {
     forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
       filter(!is.na(peak_vertical_force))
     
-    imtp_old <- if(nrow(forcedecks_IMTP_clean_imported) > 0) forcedecks_IMTP_clean_imported else NULL
-    forcedecks_IMTP_clean <- append_and_finalize(forcedecks_IMTP_clean, imtp_old, keys = "test_ID", table_name = "IMTP")
+    forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP")
     
     create_log_entry(paste("IMTP data processed:", nrow(forcedecks_IMTP_clean), "records"))
   } else {
-    forcedecks_IMTP_clean <- if(nrow(forcedecks_IMTP_clean_imported) > 0) forcedecks_IMTP_clean_imported else data.frame()
+    forcedecks_IMTP_clean <- existing_data$forcedecks_IMTP_clean
     create_log_entry("No new IMTP data found")
   }
   
@@ -1592,7 +1698,7 @@ if (count_mismatch && date_mismatch) {
       select(-any_of(c("modifiedDateUtc_chr", "modifiedDateUtc_parsed", "modifiedDateUtc_local", "modifiedDateUtc", "testDateUtc"))) %>% 
       mutate(
         vald_id = athleteId,
-        test_ID = testId,
+        test_ID = as.character(testId),  # CRITICAL: Preserve test_ID as character
         test_type = testTypeName,
         impulse_left = if_else(leftRepetitions == 0, NA_integer_, if_else(leftCalibration == 0, leftImpulse, NA_integer_)),
         avg_force_left = if_else(leftRepetitions == 0, NA_integer_, leftAvgForce - leftCalibration),
@@ -1625,7 +1731,7 @@ if (count_mismatch && date_mismatch) {
       ) %>% 
       select(-any_of(c("testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
                 "rightMaxForce", "leftRepetitions", "rightRepetitions"))) %>%
-      left_join(mergable_roster, by = "vald_id")
+      left_join(processed_data$mergable_roster, by = "vald_id")
     
     # Join with body weight data
     if (nrow(bw) > 0) {
@@ -1651,12 +1757,11 @@ if (count_mismatch && date_mismatch) {
         select(-any_of(c("bw_date", "body_weight_lbs")))
     }
     
-    nord_old <- if(nrow(nordboard_clean_imported) > 0) nordboard_clean_imported else NULL
-    nordboard_clean <- append_and_finalize(nordboard_clean, nord_old, keys = "test_ID", table_name = "Nordboard")
+    nordboard_clean <- safe_append_with_primary_key(nordboard_clean, existing_data$nordboard_clean, "test_ID", "Nordboard")
     
     create_log_entry(paste("Nordboard data processed:", nrow(nordboard_clean), "records"))
   } else {
-    nordboard_clean <- if(nrow(nordboard_clean_imported) > 0) nordboard_clean_imported else data.frame()
+    nordboard_clean <- existing_data$nordboard_clean
     create_log_entry("No new Nordboard data found")
   }
   
@@ -1667,20 +1772,19 @@ if (count_mismatch && date_mismatch) {
   
   tests <- forcedecks_raw %>% 
     select(test_ID) %>% 
-    mutate(test_ID = as.character(test_ID)) %>%  # Ensure test_ID is character
+    mutate(test_ID = as.character(test_ID)) %>%
     unique()
   
-  # Verify test_ID in final tests table
-  create_log_entry(paste("Final tests table: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")), "INFO")
-  create_log_entry(paste("Final tests table: unique test_IDs:", length(unique(tests$test_ID))), "INFO")
-  create_log_entry(paste("Final tests table: test_ID NA count:", sum(is.na(tests$test_ID))), "WARN")
+  validate_test_ids(tests, "Tests_Final_Full_Processing")
   
-  # Final appends
-  dates <- append_and_finalize(dates, dates_imported, keys = "date", table_name = "Dates")
-  tests <- append_and_finalize(tests, tests_imported, keys = "test_ID", table_name = "Tests")
+  # Final appends with proper primary key handling
+  dates_final <- safe_append_with_primary_key(dates, existing_data$dates, "date", "Dates_Full")
+  tests_final <- safe_append_with_primary_key(tests, existing_data$tests, "test_ID", "Tests_Full")
+  
+  validate_test_ids(tests_final, "Tests_Final_After_Append")
   
   # Upload all processed data to BigQuery with enhanced error handling
-  create_log_entry("=== STARTING BIGQUERY UPLOADS ===", "INFO")
+  create_log_entry("=== STARTING BIGQUERY UPLOADS (FULL PROCESSING) ===", "INFO")
   
   upload_results <- list()
   
@@ -1693,9 +1797,9 @@ if (count_mismatch && date_mismatch) {
     "vald_fd_dj" = forcedecks_jump_DJ_clean,
     "vald_fd_rebound" = forcedecks_rebound_clean,
     "vald_fd_imtp" = forcedecks_IMTP_clean,
-    "dates" = dates,
-    "tests" = tests,
-    "vald_roster" = Vald_roster
+    "dates" = dates_final,
+    "tests" = tests_final,
+    "vald_roster" = processed_data$roster
   )
   
   for (table_name in names(datasets_to_upload)) {
@@ -1708,13 +1812,10 @@ if (count_mismatch && date_mismatch) {
       if (nrow(dataset) > 0) {
         create_log_entry(paste(table_name, "pre-upload summary: ", nrow(dataset), "rows,", ncol(dataset), "columns"), "INFO")
         
-        # Log column names for debugging
-        col_preview <- if(ncol(dataset) > 10) {
-          paste(paste(names(dataset)[1:10], collapse = ", "), "... (", ncol(dataset) - 10, "more)")
-        } else {
-          paste(names(dataset), collapse = ", ")
+        # Validate test_ID for tables that should have it
+        if ("test_ID" %in% names(dataset)) {
+          validate_test_ids(dataset, paste("Pre_Upload", table_name, sep = "_"))
         }
-        create_log_entry(paste(table_name, "columns:", col_preview), "INFO")
         
         upload_results[[table_name]] <- enhanced_upload_to_bq(dataset, table_name, "WRITE_TRUNCATE")
         
@@ -1738,7 +1839,7 @@ if (count_mismatch && date_mismatch) {
   }
   
   # Summary of upload results
-  create_log_entry("=== UPLOAD SUMMARY ===", "INFO")
+  create_log_entry("=== UPLOAD SUMMARY (FULL PROCESSING) ===", "INFO")
   successful_uploads <- sum(unlist(upload_results), na.rm = TRUE)
   total_uploads <- length(upload_results)
   
@@ -1771,6 +1872,7 @@ if (count_mismatch && date_mismatch) {
 } else if (count_mismatch && !date_mismatch) {
   create_log_entry("Only count mismatch – running partial code.")
   
+  # CRITICAL: Use IDENTICAL pipeline as full processing but with incremental data
   # Set Start Date to get only new data since latest date
   partial_start_date <- paste0(as.Date(latest_date_current), "T00:00:00Z")
   set_start_date(partial_start_date)
@@ -1778,170 +1880,380 @@ if (count_mismatch && date_mismatch) {
   
   # Import existing data from BigQuery
   create_log_entry("=== IMPORTING EXISTING DATA FROM BIGQUERY (PARTIAL) ===")
-  forcedecks_jump_clean_imported <- read_bq_table("vald_fd_jumps")
-  forcedecks_SLJ_clean_imported <- read_bq_table("vald_fd_sl_jumps")
-  nordboard_clean_imported <- read_bq_table("vald_nord_all")
-  forcedecks_RSI_clean_imported <- read_bq_table("vald_fd_rsi")
-  forcedecks_jump_DJ_clean_imported <- read_bq_table("vald_fd_dj")
-  forcedecks_rebound_clean_imported <- read_bq_table("vald_fd_rebound")
-  forcedecks_IMTP_clean_imported <- read_bq_table("vald_fd_imtp")
-  dates_imported <- read_bq_table("dates")
-  tests_imported <- read_bq_table("tests")
+  existing_data <- list(
+    forcedecks_jump_clean = read_bq_table("vald_fd_jumps"),
+    forcedecks_SLJ_clean = read_bq_table("vald_fd_sl_jumps"),
+    nordboard_clean = read_bq_table("vald_nord_all"),
+    forcedecks_RSI_clean = read_bq_table("vald_fd_rsi"),
+    forcedecks_jump_DJ_clean = read_bq_table("vald_fd_dj"),
+    forcedecks_rebound_clean = read_bq_table("vald_fd_rebound"),
+    forcedecks_IMTP_clean = read_bq_table("vald_fd_imtp"),
+    dates = read_bq_table("dates"),
+    tests = read_bq_table("tests"),
+    roster = read_bq_table("vald_roster")
+  )
   
   # Get new data from VALD API (incremental)
   create_log_entry("Fetching NEW ForceDecks data from VALD API...")
-  Injest_forcedekcs_data <- get_forcedecks_data()
+  injest_forcedecks_data <- get_forcedecks_data()
   
-  if (length(Injest_forcedekcs_data$tests) > 0) {
-    profiles <- setDT(Injest_forcedekcs_data$profiles)
-    definitions <- setDT(Injest_forcedekcs_data$result_definitions)
-    tests <- setDT(Injest_forcedekcs_data$tests)
-    trials <- setDT(Injest_forcedekcs_data$trials)
+  if (length(injest_forcedecks_data$tests) > 0) {
+    create_log_entry(paste("Partial processing: Retrieved", nrow(injest_forcedecks_data$tests), "new tests"))
     
-    create_log_entry(paste("Partial processing: Retrieved", nrow(tests), "new tests"))
+    # CRITICAL: Use IDENTICAL processing pipeline as full processing
+    processed_data <- process_vald_data(injest_forcedecks_data, existing_data, "PARTIAL")
+    forcedecks_raw <- processed_data$forcedecks_raw
     
-    # Same processing pipeline as full processing but with smaller dataset
-    roster <- profiles %>%
-      select(profileId, givenName, familyName) %>% 
-      mutate(
-        full_name = (paste(trimws(givenName), trimws(familyName), sep = " ")),
-        first_name = givenName,
-        last_name = familyName,
-        vald_id = profileId
-      ) %>% 
-      select(-givenName, -familyName, -profileId)
+    validate_test_ids(forcedecks_raw, "Partial_ForceDecks_Raw")
     
-    # Read VALD Roster
-    Vald_roster_raw <- read_bq_table("vald_roster")
-    if (nrow(Vald_roster_raw) > 0) {
-      Vald_roster <- process_simple_roster(Vald_roster_raw)
-      create_log_entry(paste("Using existing roster:", nrow(Vald_roster), "athletes"))
+    ############################################################################
+    # IDENTICAL CMJ processing as full processing
+    ############################################################################
+    
+    cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
+    
+    if(nrow(cmj_temp) > 0) {
+      validate_test_ids(cmj_temp, "Partial_CMJ_Temp")
+      
+      cmj_new <- cmj_temp %>%
+        select(any_of(c(
+          "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
+          "countermovement_depth", "jump_height_inches_imp_mom", "bodymass_relative_takeoff_power",
+          "mean_landing_power", "mean_eccentric_force", "mean_takeoff_acceleration", "mean_ecc_con_ratio",
+          "mean_takeoff_velocity", "peak_landing_velocity", "peak_takeoff_force", "peak_takeoff_velocity",
+          "concentric_rfd_100", "start_to_peak_force_time", "contraction_time", "concentric_duration",
+          "eccentric_concentric_duration_ratio", "flight_eccentric_time_ratio", "displacement_at_takeoff",
+          "rsi_modified_imp_mom", "positive_takeoff_impulse", "positive_impulse", "concentric_impulse",
+          "eccentric_braking_impulse", "total_work", "relative_peak_landing_force",
+          "relative_peak_concentric_force", "relative_peak_eccentric_force", "bm_rel_force_at_zero_velocity",
+          "landing_impulse", "force_at_zero_velocity", "cmj_stiffness", "braking_phase_duration",
+          "takeoff_velocity", "eccentric_time", "peak_landing_acceleration", "peak_takeoff_acceleration",
+          "concentric_rfd_200", "eccentric_peak_power"
+        ))) %>%
+        clean_column_headers() %>%
+        mutate(test_ID = as.character(test_ID)) %>%
+        filter(!is.na(jump_height_inches_imp_mom)) %>%
+        arrange(full_name, test_type, date)
+      
+      validate_test_ids(cmj_new, "Partial_CMJ_New")
+      
+      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL")
+      
+      validate_test_ids(forcedecks_jump_clean, "Partial_CMJ_Final")
+      create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
+      
     } else {
-      Vald_roster <- data.frame()
-      create_log_entry("No roster data available for partial processing", "WARN")
+      forcedecks_jump_clean <- existing_data$forcedecks_jump_clean
+      create_log_entry("No new CMJ data in partial processing")
     }
     
-    # Process the new data (same logic as full processing)
-    tests <- tests %>% 
-      mutate(
-        vald_id = profileId,
-        test_type = testType,
-        test_ID = as.character(testId),
-        recordedDateUtc_parsed = ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE),
-        recordedDateUtc_local = if_else(
-          recordedDateTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
-          with_tz(recordedDateUtc_parsed, "America/Los_Angeles"),
-          recordedDateUtc_parsed
-        ),
-        date = as.Date(recordedDateUtc_local),
-        time = hms::as_hms(recordedDateUtc_local)
-      ) %>% 
-      select(
-        -testId, -tenantId, -profileId, -testType, -weight, -analysedDateUtc, 
-        -analysedDateOffset, -analysedDateTimezone, -recordedDateUtc_parsed, 
-        -recordedDateUtc_local, -recordedDateUtc, -recordedDateOffset, 
-        -recordedDateTimezone, -recordingId
-      )
+    ############################################################################
+    # IDENTICAL processing for other test types (abbreviated for partial)
+    ############################################################################
     
-    create_log_entry(paste("Partial processing: test_ID sample:", paste(head(tests$test_ID, 3), collapse = ", ")))
+    # DJ processing
+    dj_temp <- forcedecks_raw %>% filter(test_type %in% c("DJ"))
+    if(nrow(dj_temp) > 0) {
+      forcedecks_jump_DJ_clean <- dj_temp %>%
+        select(any_of(c(
+          "test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs", 
+          "peak_takeoff_velocity", "peak_landing_velocity", "countermovement_depth", "peak_landing_force", 
+          "eccentric_time", "jump_height_inches_imp_mom", "bm_rel_force_at_zero_velocity", "contact_time", 
+          "contact_velocity", "active_stiffness", "passive_stiffness", "reactive_strength_index", 
+          "positive_takeoff_impulse", "coefficient_of_restitution", "active_stiffness_index", 
+          "passive_stiffness_index", "peak_impact_force", "peak_driveoff_force"
+        ))) %>% 
+        mutate(
+          test_ID = as.character(test_ID),
+          velocity_ratio = if_else(!is.na(peak_takeoff_velocity) & !is.na(peak_landing_velocity) & peak_landing_velocity != 0,
+                                  peak_takeoff_velocity / peak_landing_velocity, NA_real_),
+          force_ratio = if_else(!is.na(peak_impact_force) & !is.na(peak_driveoff_force) & peak_driveoff_force != 0,
+                               peak_impact_force / peak_driveoff_force, NA_real_),
+          stiffness_ratio = if_else(!is.na(active_stiffness) & !is.na(passive_stiffness) & passive_stiffness != 0,
+                                   active_stiffness / passive_stiffness, NA_real_)
+        ) %>% 
+        filter(!is.na(jump_height_inches_imp_mom)) %>% 
+        filter(jump_height_inches_imp_mom < 30 & jump_height_inches_imp_mom > 2)
+      
+      forcedecks_jump_DJ_clean <- safe_append_with_primary_key(forcedecks_jump_DJ_clean, existing_data$forcedecks_jump_DJ_clean, "test_ID", "DJ_PARTIAL")
+      create_log_entry(paste("Partial DJ processing:", nrow(forcedecks_jump_DJ_clean), "total records"))
+    } else {
+      forcedecks_jump_DJ_clean <- existing_data$forcedecks_jump_DJ_clean
+    }
     
-    # Process trials and create forcedecks_raw (abbreviated version)
-    if (nrow(trials) > 0) {
-      trials_wider <- trials %>% 
-        pivot_wider(
-          id_cols = c(testId, trialId, athleteId, recordedUTC, recordedTimezone, trialLimb),
-          names_from = definition_result,
-          values_from = value,
-          values_fn = dplyr::first
-        ) %>% 
+    # SLJ processing
+    slj_temp <- processed_data$trials_wider %>%
+      mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+      left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
+      filter(test_type == "SLJ")
+    
+    if(nrow(slj_temp) > 0) {
+      forcedecks_SLJ_clean <- slj_temp %>%
+        select(-testid, -athleteid) %>% 
+        left_join(processed_data$mergable_roster, by = "vald_id") %>% 
         mutate(
-          recordedUTC_parsed = ymd_hms(recordedUTC, tz = "UTC", quiet = TRUE),
-          recordedUTC_local  = if_else(
-            recordedTimezone %in% c("Pacific Standard Time", "Pacific Daylight Time", "Pacific Time"),
-            with_tz(recordedUTC_parsed, "America/Los_Angeles"),
-            recordedUTC_parsed
-          ),
-          date = as.Date(recordedUTC_local),
-          time = hms::as_hms(recordedUTC_local)
-        ) %>% 
-        select(-recordedUTC_parsed, -recordedUTC_local) %>% 
-        rename_with(tolower)
-      
-      # Find numeric columns and convert
-      start_col <- which(names(trials_wider) == "start_of_movement")
-      if (length(start_col) > 0) {
-        trials_wider <- trials_wider %>% 
-          mutate(across(all_of(start_col:ncol(.)), as.numeric))
-      }
-      
-      mergable_trials <- trials_wider %>% 
-        mutate(test_ID = as.character(testid)) %>%
-        select(-testid) %>% 
-        group_by(test_ID) %>% 
-        summarise(
-          athleteid = first(athleteid),
-          triallimb = first(triallimb),
-          date = first(date),
-          time = first(time),
-          across(where(is.numeric), mean, na.rm = TRUE),
-          .groups = "drop"
-        ) %>% 
-        mutate(vald_id = as.character(athleteid)) %>%
-        select(-athleteid)
-      
-      mergable_tests <- tests %>% select(test_ID, test_type) %>% mutate(test_ID = as.character(test_ID))
-      mergable_roster <- roster %>% select(-first_name, -last_name) %>% 
-        left_join(Vald_roster %>% select(vald_id, position, sport), by = "vald_id")
-      
-      forcedecks_raw <- mergable_trials %>% 
-        left_join(mergable_tests, by = "test_ID") %>% 
-        left_join(mergable_roster, by = "vald_id") %>% 
-        mutate(
+          test_ID = as.character(test_ID),
           date = as.Date(date, origin = "1970-01-01"),
-          time = as_hms(time),
-          test_ID = as.character(test_ID)
+          time = as_hms(time)
+        ) %>% 
+        select(any_of(c(
+          "triallimb", "test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs",
+          "peak_landing_force", "peak_landing_velocity", "peak_takeoff_velocity", "time_to_peak_force",
+          "weight_relative_peak_takeoff_force", "weight_relative_peak_landing_force", 
+          "relative_peak_concentric_force", "relative_peak_eccentric_force", "lower_limb_stiffness", 
+          "rsi_modified_imp_mom"
+        ))) %>% 
+        group_by(test_ID, vald_id, triallimb) %>%
+        summarise(
+          across(any_of(c("full_name", "position", "team")), first),
+          across(any_of(c("date", "time", "body_weight_lbs")), first), 
+          across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+          .groups = "drop"
+        ) %>%
+        mutate(test_ID = as.character(test_ID)) %>%
+        pivot_wider(
+          id_cols = any_of(c("test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs")),
+          names_from = triallimb,
+          values_from = any_of(c("peak_landing_force", "peak_landing_velocity", "peak_takeoff_velocity", "time_to_peak_force",
+                          "weight_relative_peak_takeoff_force", "weight_relative_peak_landing_force", 
+                          "relative_peak_concentric_force", "relative_peak_eccentric_force", "lower_limb_stiffness", 
+                          "rsi_modified_imp_mom")),
+          names_sep = "_"
+        ) %>%
+        rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
+        rename_with(~str_replace(.x, "_Right$", "_right"), everything())
+      
+      forcedecks_SLJ_clean <- safe_append_with_primary_key(forcedecks_SLJ_clean, existing_data$forcedecks_SLJ_clean, "test_ID", "SLJ_PARTIAL")
+      create_log_entry(paste("Partial SLJ processing:", nrow(forcedecks_SLJ_clean), "total records"))
+    } else {
+      forcedecks_SLJ_clean <- existing_data$forcedecks_SLJ_clean
+    }
+    
+    # RSI processing
+    rsi_temp <- processed_data$trials_wider %>%
+      mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+      left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
+      filter(test_type %in% c("RSAIP", "RSHIP", "RSKIP"))
+    
+    if(nrow(rsi_temp) > 0) {
+      forcedecks_RSI_clean <- rsi_temp %>%
+        select(-testid, -athleteid) %>% 
+        left_join(processed_data$mergable_roster, by = "vald_id") %>% 
+        mutate(
+          test_ID = as.character(test_ID),
+          date = as.Date(date, origin = "1970-01-01"),
+          time = as_hms(time)
+        ) %>% 
+        select(any_of(c(
+          "triallimb", "test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs",
+          "start_to_peak_force", "peak_vertical_force", "rfd_at_100ms", "rfd_at_250ms",
+          "iso_bm_rel_force_peak", "iso_bm_rel_force_100", "iso_bm_rel_force_200", "iso_abs_impulse_100"
+        ))) %>% 
+        group_by(test_ID, vald_id, triallimb) %>%
+        summarise(
+          across(any_of(c("full_name", "position", "team")), first),
+          across(any_of(c("date", "time", "body_weight_lbs")), first), 
+          across(any_of(c("start_to_peak_force", "peak_vertical_force", "rfd_at_100ms", "rfd_at_250ms",
+                   "iso_bm_rel_force_peak", "iso_bm_rel_force_100", "iso_bm_rel_force_200", "iso_abs_impulse_100")), 
+                 ~mean(.x, na.rm = TRUE)),
+          .groups = "drop"
+        ) %>%
+        mutate(test_ID = as.character(test_ID)) %>%
+        pivot_wider(
+          id_cols = any_of(c("test_ID", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs")),
+          names_from = triallimb,
+          values_from = any_of(c("start_to_peak_force", "peak_vertical_force", "rfd_at_100ms", "rfd_at_250ms",
+                          "iso_bm_rel_force_peak", "iso_bm_rel_force_100", "iso_bm_rel_force_200", "iso_abs_impulse_100")),
+          names_sep = "_"
+        ) %>%
+        rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
+        rename_with(~str_replace(.x, "_Right$", "_right"), everything())
+      
+      forcedecks_RSI_clean <- safe_append_with_primary_key(forcedecks_RSI_clean, existing_data$forcedecks_RSI_clean, "test_ID", "RSI_PARTIAL")
+      create_log_entry(paste("Partial RSI processing:", nrow(forcedecks_RSI_clean), "total records"))
+    } else {
+      forcedecks_RSI_clean <- existing_data$forcedecks_RSI_clean
+    }
+    
+    # Rebound processing
+    rebound_temp <- processed_data$trials_wider %>%
+      mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
+      left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
+      filter(test_type %in% c("CMRJ", "SLCMRJ"))
+    
+    if(nrow(rebound_temp) > 0) {
+      forcedecks_rebound_clean <- rebound_temp %>%
+        select(-testid, -athleteid) %>% 
+        left_join(processed_data$mergable_roster, by = "vald_id") %>% 
+        mutate(
+          test_ID = as.character(test_ID),
+          date = as.Date(date, origin = "1970-01-01"),
+          time = as_hms(time)
+        ) %>% 
+        select(any_of(c(
+          "triallimb", "test_ID", "test_type", "vald_id", "full_name", "position", "team", "date", "time", "body_weight_lbs",
+          "cmrj_takeoff_bm_rel_peak_force", "cmrj_takeoff_countermovement_depth", 
+          "cmrj_takeoff_concentric_peak_force", "cmrj_takeoff_contraction_time", "cmrj_takeoff_ecc_decel_impulse",
+          "cmrj_takeoff_ecc_duration", "cmrj_takeoff_bm_rel_ecc_peak_force", "cmrj_takeoff_jump_height_imp_mom_inches",
+          "cmrj_takeoff_rsi_modified_imp_mom", "cmrj_rebound_active_stiffness", "cmrj_rebound_active_stiffness_index",
+          "cmrj_rebound_contact_time", "cmrj_rebound_countermovement_depth", "cmrj_rebound_passive_stiffness",
+          "cmrj_rebound_passive_stiffness_index", "cmrj_rebound_jump_height_imp_mom_inches"
+        ))) %>% 
+        group_by(test_ID, vald_id, test_type, triallimb) %>%
+        summarise(
+          across(any_of(c("full_name", "position", "team")), first),
+          across(any_of(c("date", "time", "body_weight_lbs")), first), 
+          across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          test_ID = as.character(test_ID),
+          limb_suffix = case_when(
+            test_type == "CMRJ" ~ "bilateral",
+            test_type == "SLCMRJ" & triallimb == "Left" ~ "left", 
+            test_type == "SLCMRJ" & triallimb == "Right" ~ "right",
+            TRUE ~ "bilateral"
+          )
+        ) %>%
+        pivot_wider(
+          id_cols = any_of(c("test_ID", "vald_id", "test_type", "full_name", "position", "team", "date", "time", "body_weight_lbs")),
+          names_from = limb_suffix,
+          values_from = any_of(c("cmrj_takeoff_bm_rel_peak_force", "cmrj_takeoff_countermovement_depth", 
+                          "cmrj_takeoff_concentric_peak_force", "cmrj_takeoff_contraction_time", "cmrj_takeoff_ecc_decel_impulse",
+                          "cmrj_takeoff_ecc_duration", "cmrj_takeoff_bm_rel_ecc_peak_force", "cmrj_takeoff_jump_height_imp_mom_inches",
+                          "cmrj_takeoff_rsi_modified_imp_mom", "cmrj_rebound_active_stiffness", "cmrj_rebound_active_stiffness_index",
+                          "cmrj_rebound_contact_time", "cmrj_rebound_countermovement_depth", "cmrj_rebound_passive_stiffness",
+                          "cmrj_rebound_passive_stiffness_index", "cmrj_rebound_jump_height_imp_mom_inches")),
+          names_sep = "_"
         )
       
-      create_log_entry(paste("Partial processing forcedecks_raw:", nrow(forcedecks_raw), "rows"))
-      create_log_entry(paste("Partial test_ID sample:", paste(head(forcedecks_raw$test_ID, 3), collapse = ", ")))
-      
-      # Process and append only CMJ data for partial processing (to keep it fast)
-      cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
-      
-      if(nrow(cmj_temp) > 0) {
-        cmj_new <- cmj_temp %>%
-          select(any_of(c(
-            "test_ID", "vald_id", "full_name", "position", "team", "test_type", "date", "time", "body_weight_lbs",
-            "jump_height_inches_imp_mom", "relative_peak_eccentric_force", "rsi_modified_imp_mom"
-          ))) %>%
-          mutate(test_ID = as.character(test_ID)) %>%
-          filter(!is.na(jump_height_inches_imp_mom))
-        
-        forcedecks_jump_clean <- append_and_finalize(cmj_new, forcedecks_jump_clean_imported, keys = "test_ID", table_name = "CMJ_PARTIAL")
-        create_log_entry(paste("Partial CMJ processing:", nrow(forcedecks_jump_clean), "total records"))
-        
-        # Upload updated CMJ data
-        enhanced_upload_to_bq(forcedecks_jump_clean, "vald_fd_jumps", "WRITE_TRUNCATE")
-      }
-      
-      # Update dates and tests tables
-      new_dates <- forcedecks_raw %>% select(date) %>% unique()
-      new_tests <- forcedecks_raw %>% select(test_ID) %>% mutate(test_ID = as.character(test_ID)) %>% unique()
-      
-      dates_final <- append_and_finalize(new_dates, dates_imported, keys = "date", table_name = "Dates_PARTIAL")
-      tests_final <- append_and_finalize(new_tests, tests_imported, keys = "test_ID", table_name = "Tests_PARTIAL")
-      
-      enhanced_upload_to_bq(dates_final, "dates", "WRITE_TRUNCATE")
-      enhanced_upload_to_bq(tests_final, "tests", "WRITE_TRUNCATE")
-      
-      create_log_entry("=== PARTIAL PROCESSING COMPLETED ===")
-      create_log_entry(paste("Processed", nrow(new_tests), "new tests"))
-      create_log_entry(paste("Updated dates table with", nrow(dates_final), "total dates"))
-      create_log_entry(paste("Updated tests table with", nrow(tests_final), "total tests"))
-      
+      forcedecks_rebound_clean <- safe_append_with_primary_key(forcedecks_rebound_clean, existing_data$forcedecks_rebound_clean, "test_ID", "Rebound_PARTIAL")
+      create_log_entry(paste("Partial Rebound processing:", nrow(forcedecks_rebound_clean), "total records"))
     } else {
-      create_log_entry("No trials data for partial processing", "WARN")
+      forcedecks_rebound_clean <- existing_data$forcedecks_rebound_clean
     }
+    
+    # IMTP processing
+    imtp_temp <- forcedecks_raw %>% filter(test_type == "IMTP")
+    if(nrow(imtp_temp) > 0) {
+      forcedecks_IMTP_clean <- imtp_temp %>%
+        select(any_of(c(
+          "test_ID", "vald_id", "full_name", "position", "team", "date", "time",
+          "start_to_peak_force", "rfd_at_100ms", "rfd_at_200ms", "force_at_100ms", 
+          "iso_bm_rel_force_peak", "peak_vertical_force", "force_at_200ms"
+        ))) %>% 
+        clean_column_headers() %>% 
+        mutate(test_ID = as.character(test_ID)) %>%
+        filter(!is.na(peak_vertical_force)) %>%
+        arrange(full_name, date)
+      
+      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP_PARTIAL")
+      create_log_entry(paste("Partial IMTP processing:", nrow(forcedecks_IMTP_clean), "total records"))
+    } else {
+      forcedecks_IMTP_clean <- existing_data$forcedecks_IMTP_clean
+    }
+    
+    # Nordboard processing (abbreviated)
+    set_start_date(partial_start_date)
+    injest_nordboard_tests <- get_nordbord_data()
+    nordboard_temp <- injest_nordboard_tests$tests
+    
+    if(nrow(nordboard_temp) > 0) {
+      nordboard_clean <- nordboard_temp %>% 
+        select(-any_of(c("device", "notes", "testTypeId"))) %>% 
+        mutate(
+          test_ID = as.character(testId),  # Preserve test_ID
+          vald_id = athleteId,
+          test_type = testTypeName,
+          modifiedDateUtc_parsed = ymd_hms(modifiedDateUtc, tz = "UTC", quiet = TRUE),
+          modifiedDateUtc_local = with_tz(modifiedDateUtc_parsed, "America/Los_Angeles"),
+          date = as.Date(modifiedDateUtc_local),
+          time = hms::as_hms(modifiedDateUtc_local),
+          avg_force_left = leftAvgForce - leftCalibration,
+          max_force_left = leftMaxForce - leftCalibration,
+          avg_force_right = rightAvgForce - rightCalibration,
+          max_force_right = rightMaxForce - rightCalibration,
+          reps_left = leftRepetitions,
+          reps_right = rightRepetitions,
+          avg_force_bilateral = rowMeans(cbind(avg_force_left, avg_force_right), na.rm = TRUE),
+          max_force_bilateral = rowMeans(cbind(max_force_left, max_force_right), na.rm = TRUE)
+        ) %>%
+        select(-any_of(c("testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
+                  "rightMaxForce", "leftRepetitions", "rightRepetitions", "modifiedDateUtc_parsed", "modifiedDateUtc_local", "modifiedDateUtc"))) %>%
+        left_join(processed_data$mergable_roster, by = "vald_id")
+      
+      nordboard_clean <- safe_append_with_primary_key(nordboard_clean, existing_data$nordboard_clean, "test_ID", "Nordboard_PARTIAL")
+      create_log_entry(paste("Partial Nordboard processing:", nrow(nordboard_clean), "total records"))
+    } else {
+      nordboard_clean <- existing_data$nordboard_clean
+    }
+    
+    # Update dates and tests tables with PROPER test_ID preservation
+    new_dates <- forcedecks_raw %>% select(date) %>% unique()
+    new_tests <- forcedecks_raw %>% select(test_ID) %>% mutate(test_ID = as.character(test_ID)) %>% unique()
+    
+    validate_test_ids(new_tests, "New_Tests_Partial")
+    
+    dates_final <- safe_append_with_primary_key(new_dates, existing_data$dates, "date", "Dates_PARTIAL")
+    tests_final <- safe_append_with_primary_key(new_tests, existing_data$tests, "test_ID", "Tests_PARTIAL")
+    
+    validate_test_ids(tests_final, "Tests_Final_Partial")
+    
+    # Upload all datasets with enhanced error handling
+    create_log_entry("=== STARTING BIGQUERY UPLOADS (PARTIAL PROCESSING) ===", "INFO")
+    
+    datasets_to_upload <- list(
+      "vald_fd_jumps" = forcedecks_jump_clean,
+      "vald_fd_sl_jumps" = forcedecks_SLJ_clean,
+      "vald_nord_all" = nordboard_clean,
+      "vald_fd_rsi" = forcedecks_RSI_clean,
+      "vald_fd_dj" = forcedecks_jump_DJ_clean,
+      "vald_fd_rebound" = forcedecks_rebound_clean,
+      "vald_fd_imtp" = forcedecks_IMTP_clean,
+      "dates" = dates_final,
+      "tests" = tests_final
+    )
+    
+    upload_results <- list()
+    
+    for (table_name in names(datasets_to_upload)) {
+      dataset <- datasets_to_upload[[table_name]]
+      
+      tryCatch({
+        if (nrow(dataset) > 0) {
+          # Validate test_ID for tables that should have it
+          if ("test_ID" %in% names(dataset)) {
+            validate_test_ids(dataset, paste("Partial_Pre_Upload", table_name, sep = "_"))
+          }
+          
+          upload_results[[table_name]] <- enhanced_upload_to_bq(dataset, table_name, "WRITE_TRUNCATE")
+          
+          if (upload_results[[table_name]]) {
+            create_log_entry(paste("SUCCESS: Uploaded", table_name), "INFO")
+          } else {
+            create_log_entry(paste("FAILED: Upload failed for", table_name), "ERROR")
+          }
+        } else {
+          create_log_entry(paste("SKIPPED:", table_name, "- no data"), "WARN")
+          upload_results[[table_name]] <- TRUE
+        }
+        
+      }, error = function(e) {
+        create_log_entry(paste("CRITICAL ERROR uploading", table_name, ":", e$message), "ERROR")
+        upload_results[[table_name]] <- FALSE
+      })
+    }
+    
+    # Summary of upload results
+    create_log_entry("=== UPLOAD SUMMARY (PARTIAL PROCESSING) ===", "INFO")
+    successful_uploads <- sum(unlist(upload_results), na.rm = TRUE)
+    total_uploads <- length(upload_results)
+    create_log_entry(paste("Upload summary:", successful_uploads, "of", total_uploads, "tables uploaded successfully"), "INFO")
+    
+    create_log_entry("=== PARTIAL PROCESSING COMPLETED ===")
+    create_log_entry(paste("Processed", nrow(new_tests), "new tests"))
+    create_log_entry(paste("Updated dates table with", nrow(dates_final), "total dates"))
+    create_log_entry(paste("Updated tests table with", nrow(tests_final), "total tests"))
     
   } else {
     create_log_entry("No new tests found for partial processing", "INFO")
