@@ -95,13 +95,28 @@ if (!bq_dataset_exists(ds)) {
 # Logging Functions
 ################################################################################
 
+# Initialize log storage
+log_entries <- data.frame(
+  timestamp = as.POSIXct(character(0)),
+  level = character(0),
+  message = character(0),
+  run_id = character(0),
+  repository = character(0),
+  stringsAsFactors = FALSE
+)
+
 create_log_entry <- function(message, level = "INFO") {
-  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  log_message <- paste0("[", timestamp, "] [", level, "] ", message)
+  # Get actual timestamp as POSIXct object
+  actual_timestamp <- Sys.time()
+  
+  # Format for console display
+  display_timestamp <- format(actual_timestamp, "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  log_message <- paste0("[", display_timestamp, "] [", level, "] ", message)
   cat(log_message, "\n")
   
-  log_df <- data.frame(
-    timestamp = as.POSIXct(timestamp),
+  # Store log entry using actual POSIXct timestamp for BigQuery
+  new_entry <- data.frame(
+    timestamp = actual_timestamp,  # Use actual POSIXct object, not converted string
     level = level,
     message = message,
     run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
@@ -109,18 +124,40 @@ create_log_entry <- function(message, level = "INFO") {
     stringsAsFactors = FALSE
   )
   
-  log_tbl <- bq_table(ds, "vald_processing_log")
-  
-  tryCatch({
-    if (!bq_table_exists(log_tbl)) {
-      bq_table_create(log_tbl, fields = log_df)
-    }
-    bq_table_upload(log_tbl, log_df, write_disposition = "WRITE_APPEND")
-  }, error = function(e) {
-    cat("Failed to write log to BigQuery:", e$message, "\n")
-  })
+  # Add to global log storage
+  log_entries <<- rbind(log_entries, new_entry)
   
   return(log_message)
+}
+
+# Function to upload all logs at once at the end
+upload_logs_to_bigquery <- function() {
+  if (nrow(log_entries) == 0) {
+    cat("No logs to upload\n")
+    return(TRUE)
+  }
+  
+  tryCatch({
+    cat("Uploading", nrow(log_entries), "log entries to BigQuery...\n")
+    
+    log_tbl <- bq_table(ds, "vald_processing_log")
+    
+    # Create table if it doesn't exist
+    if (!bq_table_exists(log_tbl)) {
+      bq_table_create(log_tbl, fields = log_entries[0, ])
+      cat("Created vald_processing_log table\n")
+    }
+    
+    # Upload all logs in one batch
+    bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
+    cat("Successfully uploaded", nrow(log_entries), "log entries to BigQuery\n")
+    return(TRUE)
+    
+  }, error = function(e) {
+    cat("Failed to upload logs to BigQuery:", e$message, "\n")
+    cat("Logs are preserved in console output\n")
+    return(FALSE)
+  })
 }
 
 script_start_time <- Sys.time()
@@ -2288,6 +2325,9 @@ create_log_entry(paste("Final route executed:", route_taken))
 create_log_entry(paste("Total execution time:", 
                       round(difftime(Sys.time(), script_start_time, units = "mins"), 2), "minutes"))
 create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
+
+# Upload all collected logs to BigQuery in one batch
+upload_logs_to_bigquery()
 
 tryCatch({
   DBI::dbDisconnect(con)
