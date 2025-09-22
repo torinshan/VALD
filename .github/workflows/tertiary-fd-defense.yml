@@ -1,0 +1,74 @@
+name: Tertiary FD Defense — email + dedupe
+uses: r-lib/actions/setup-r-dependencies@v2
+with:
+cache-version: 1
+extra-packages: |
+any::bigrquery
+any::DBI
+any::dplyr
+any::readr
+any::lubridate
+any::gargle
+any::jsonlite
+
+
+- name: Google auth (service account key or workload identity)
+if: steps.gate.outputs.allow == 'true'
+uses: google-github-actions/auth@v2
+with:
+# Option A: Service Account JSON key stored in repo secrets
+credentials_json: ${{ secrets.GCP_BQ_SA_KEY }}
+# Option B (preferred): Workload Identity Federation
+# workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+# service_account: ${{ secrets.GCP_BQ_SA }}
+
+
+- name: Install gcloud SDK
+if: steps.gate.outputs.allow == 'true'
+uses: google-github-actions/setup-gcloud@v2
+
+
+- name: gcloud auth print-access-token (for bigrquery gargle flow)
+if: steps.gate.outputs.allow == 'true'
+run: gcloud auth print-access-token > /dev/null
+
+
+- name: Run tertiary defense (R)
+if: steps.gate.outputs.allow == 'true'
+id: rcheck
+run: |
+chmod +x ci/tertiary_fd_defense.R
+Rscript ci/tertiary_fd_defense.R
+
+
+- name: Upload artifacts (CSV/JSON)
+if: steps.gate.outputs.allow == 'true'
+uses: actions/upload-artifact@v4
+with:
+name: fd-dupe-artifacts
+path: artifacts/**
+if-no-files-found: ignore
+
+
+# === Email notification only when duplicates are found ===
+- name: Send email (SMTP) if duplicates detected
+if: steps.gate.outputs.allow == 'true' && steps.rcheck.outputs.dupe_count != '' && steps.rcheck.outputs.dupe_count != '0'
+uses: dawidd6/action-send-mail@v3
+with:
+server_address: ${{ secrets.SMTP_HOST }}
+server_port: ${{ secrets.SMTP_PORT }}
+username: ${{ secrets.SMTP_USERNAME }}
+password: ${{ secrets.SMTP_PASSWORD }}
+subject: "VALD duplicate test_ID alert: ${{ steps.rcheck.outputs.dupe_count }} found"
+from: ${{ secrets.FROM_EMAIL }}
+to: ${{ secrets.TO_EMAIL }}
+secure: true
+convert_markdown: true
+html_body: |
+<h3>VALD duplicate test_IDs detected</h3>
+<p><b>Project</b>: ${{ env.GCP_PROJECT }}<br/>
+<b>Dataset</b>: ${{ env.BQ_DATASET }}<br/>
+<b>Table</b>: ${{ env.BASE_TABLE }}<br/>
+<b>Duplicate count</b>: <code>${{ steps.rcheck.outputs.dupe_count }}</code></p>
+<p>We also materialized a deduplicated table <code>${{ env.UNIQUE_TABLE }}</code> and view <code>${{ env.UNIQUE_VIEW }}</code> in BigQuery.</p>
+<p>CSV and JSON artifacts are attached in the workflow run.</p>
