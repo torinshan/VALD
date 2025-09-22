@@ -1849,21 +1849,21 @@ if (count_mismatch && date_mismatch) {
   )
   
   for (table_name in names(datasets_to_upload)) {
-    dataset <- datasets_to_upload[[table_name]]
+     payload <- datasets_to_upload[[table_name]]
     
     create_log_entry(paste("Preparing to upload", table_name), "INFO")
     
     tryCatch({
       # Pre-upload data summary
-      if (nrow(dataset) > 0) {
-        create_log_entry(paste(table_name, "pre-upload summary: ", nrow(dataset), "rows,", ncol(dataset), "columns"), "INFO")
+      if (nrow(payload) > 0) {
+        create_log_entry(paste(table_name, "pre-upload summary: ", nrow(payload), "rows,", ncol(payload), "columns"), "INFO")
         
         # Validate test_ID for tables that should have it
-        if ("test_ID" %in% names(dataset)) {
-          validate_test_ids(dataset, paste("Pre_Upload", table_name, sep = "_"))
+        if ("test_ID" %in% names(payload)) {
+          validate_test_ids(payload, paste("Pre_Upload", table_name, sep = "_"))
         }
         
-        upload_results[[table_name]] <- enhanced_upload_to_bq(dataset, table_name, "WRITE_TRUNCATE")
+        upload_results[[table_name]] <- enhanced_upload_to_bq(payload, table_name, "WRITE_TRUNCATE")
         
         if (upload_results[[table_name]]) {
           create_log_entry(paste("SUCCESS: Uploaded", table_name), "INFO")
@@ -2262,16 +2262,16 @@ if (count_mismatch && date_mismatch) {
     upload_results <- list()
     
     for (table_name in names(datasets_to_upload)) {
-      dataset <- datasets_to_upload[[table_name]]
+      payload <- datasets_to_upload[[table_name]]
       
       tryCatch({
-        if (nrow(dataset) > 0) {
+        if (nrow(payload) > 0) {
           # Validate test_ID for tables that should have it
-          if ("test_ID" %in% names(dataset)) {
-            validate_test_ids(dataset, paste("Partial_Pre_Upload", table_name, sep = "_"))
+          if ("test_ID" %in% names(payload)) {
+            validate_test_ids(payload, paste("Partial_Pre_Upload", table_name, sep = "_"))
           }
           
-          upload_results[[table_name]] <- enhanced_upload_to_bq(dataset, table_name, "WRITE_TRUNCATE")
+          upload_results[[table_name]] <- enhanced_upload_to_bq(payload, table_name, "WRITE_TRUNCATE")
           
           if (upload_results[[table_name]]) {
             create_log_entry(paste("SUCCESS: Uploaded", table_name), "INFO")
