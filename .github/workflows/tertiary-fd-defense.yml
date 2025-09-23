@@ -3,25 +3,31 @@ name: Tertiary FD Defense (15m PT)
 on:
   workflow_dispatch:
   schedule:
-    # Run at minutes 11,26,41,56 every hour (UTC). We'll gate by LA time below.
+    # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
     - cron: "11,26,41,56 * * * *"
+
+permissions:
+  contents: read
 
 jobs:
   run-tertiary-defense:
     runs-on: ubuntu-latest
 
     env:
+      # ----- App config -----
       GCP_PROJECT: sac-vald-hub
       BQ_DATASET: analytics
       BQ_LOCATION: US
-      # Optional email envs (script only emails when these are set)
+
+      # Mirror secrets into env so we can safely reference in `if:` conditions
+      GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
       TO_EMAIL:   ${{ secrets.TO_EMAIL }}
       SMTP_HOST:  ${{ secrets.SMTP_HOST }}
       SMTP_PORT:  ${{ secrets.SMTP_PORT }}
       SMTP_USER:  ${{ secrets.SMTP_USER }}
       SMTP_PASS:  ${{ secrets.SMTP_PASS }}
-      # Optional: VALD creds if the script needs them for context
+
       VALD_CLIENT_ID:     ${{ secrets.VALD_CLIENT_ID }}
       VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
       VALD_TENANT_ID:     ${{ secrets.VALD_TENANT_ID }}
@@ -31,7 +37,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- Time gate: only run between 06:11 and 20:00 America/Los_Angeles ----
+      - name: Echo UTC and LA time
+        run: |
+          echo "UTC now: $(date -u)"
+          echo "LA  now: $(TZ=America/Los_Angeles date)"
+
+      # ---- Gate by Pacific Time (06:11–19:56 PT every 15 minutes) ----
       - name: Gate by Pacific Time window
         id: gate
         shell: bash
@@ -39,41 +50,41 @@ jobs:
           LA_HOUR=$(TZ=America/Los_Angeles date +%H)
           LA_MIN=$(TZ=America/Los_Angeles date +%M)
 
-          # Only hours 06..19 inclusive (i.e., last run occurs at 19:56)
           if [ "$LA_HOUR" -lt 6 ] || [ "$LA_HOUR" -gt 19 ]; then
-            echo "outside_window=true" >> $GITHUB_OUTPUT
+            echo "outside_window=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           case "$LA_MIN" in
-            11|26|41|56) echo "outside_window=false" >> $GITHUB_OUTPUT ;;
-            *) echo "outside_window=true" >> $GITHUB_OUTPUT ;;
+            11|26|41|56) echo "outside_window=false" >> "$GITHUB_OUTPUT" ;;
+            *)           echo "outside_window=true"  >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Stop if outside LA window
-        if: steps.gate.outputs.outside_window == 'true'
+        if: ${{ steps.gate.outputs.outside_window == 'true' }}
         run: echo "Skipping this tick (outside 06:11–20:00 PT cadence)."
 
-      # ---- (Optional) Authenticate to Google via a service account key JSON secret ----
-      # If you use Workload Identity or gcloud SSO instead, you can remove this block.
+      # ---- Google auth (only if key present) ----
       - name: Google Auth (service account key)
-        if: steps.gate.outputs.outside_window == 'false' && secrets.GCP_SA_KEY_JSON != ''
+        if: ${{ steps.gate.outputs.outside_window == 'false' && env.GCP_SA_KEY_JSON != '' }}
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+          credentials_json: ${{ env.GCP_SA_KEY_JSON }}
 
       - name: Setup gcloud (optional)
-        if: steps.gate.outputs.outside_window == 'false'
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: google-github-actions/setup-gcloud@v2
 
+      # ---- R setup & deps ----
       - name: Setup R
-        if: steps.gate.outputs.outside_window == 'false'
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: r-lib/actions/setup-r@v2
 
       - name: Install R packages (cached)
-        if: steps.gate.outputs.outside_window == 'false'
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
+          use-public-rspm: true
           extra-packages: >
             any::bigrquery
             any::DBI
@@ -96,19 +107,9 @@ jobs:
             any::glue
             any::valdr
 
-      - name: Run tertiary defense script
-        if: steps.gate.outputs.outside_window == 'false'
+      # ---- Run the tertiary defense script at the new path ----
+      - name: Run tertiary defense
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
         run: |
-          Rscript .github/scripts/tertiary_fd_defense.R
-
-      # Upload any artifacts the script writes (dupe snapshots & summary files)
-      - name: Upload duplicate artifacts (if present)
-        if: steps.gate.outputs.outside_window == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fd-dupe-outputs
-          path: |
-            vald_fd_jumps_dupes.csv
-            vald_fd_jumps_dupes.json
-            tertiary_fd_defense_summary.json
-          if-no-files-found: ignore
+          chmod +x .github/scripts/tertiary_fd_defense.R
+          .github/scripts/tertiary_fd_defense.R
