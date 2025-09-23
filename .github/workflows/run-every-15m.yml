@@ -155,6 +155,43 @@ jobs:
           bq query --use_legacy_sql=false --location=US --format=pretty \
             "SELECT level, COUNT(*) AS message_count 
              FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\` 
+
+    - name: Collect failure context
+        id: tail_logs
+        if: steps.window.outputs.ok == 'true' && always()
+        run: |
+          set -e
+          echo 'last<<EOF' >> "$GITHUB_OUTPUT"
+          bq query --use_legacy_sql=false --location=US --format=pretty \
+            "SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', timestamp), level, message
+             FROM \`$GCP_PROJECT.$BQ_DATASET.vald_processing_log\`
+             WHERE run_id = '${{ github.run_id }}'
+             ORDER BY timestamp DESC
+             LIMIT 30" 2>&1 || echo "No BigQuery logs found for this run."
+          echo 'EOF' >> "$GITHUB_OUTPUT"
+
+      # Email only if something failed in this job
+      - name: Email on failure
+        if: failure() && steps.window.outputs.ok == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
+          to: ${{ secrets.ALERT_EMAIL_TO }}
+          from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
+          content_type: text/html
+          body: |
+            <p><strong>Status:</strong> Failed</p>
+            <p><strong>Repo:</strong> ${{ github.repository }}<br/>
+               <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
+               <strong>Commit:</strong> ${{ github.sha }}<br/>
+               <strong>Actor:</strong> ${{ github.actor }}</p>
+            <p><strong>Processing log (last 30 rows):</strong></p>
+            <pre>${{ steps.tail_logs.outputs.last }}</pre>
+      
              WHERE run_id = '${{ github.run_id }}' 
              GROUP BY level 
              ORDER BY level" || echo "No summary available."
