@@ -1,74 +1,114 @@
-name: Tertiary FD Defense — email + dedupe
-uses: r-lib/actions/setup-r-dependencies@v2
-with:
-cache-version: 1
-extra-packages: |
-any::bigrquery
-any::DBI
-any::dplyr
-any::readr
-any::lubridate
-any::gargle
-any::jsonlite
+name: Tertiary FD Defense (15m PT)
 
+on:
+  workflow_dispatch:
+  schedule:
+    # Run at minutes 11,26,41,56 every hour (UTC). We'll gate by LA time below.
+    - cron: "11,26,41,56 * * * *"
 
-- name: Google auth (service account key or workload identity)
-if: steps.gate.outputs.allow == 'true'
-uses: google-github-actions/auth@v2
-with:
-# Option A: Service Account JSON key stored in repo secrets
-credentials_json: ${{ secrets.GCP_BQ_SA_KEY }}
-# Option B (preferred): Workload Identity Federation
-# workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-# service_account: ${{ secrets.GCP_BQ_SA }}
+jobs:
+  run-tertiary-defense:
+    runs-on: ubuntu-latest
 
+    env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+      BQ_LOCATION: US
+      # Optional email envs (script only emails when these are set)
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      TO_EMAIL:   ${{ secrets.TO_EMAIL }}
+      SMTP_HOST:  ${{ secrets.SMTP_HOST }}
+      SMTP_PORT:  ${{ secrets.SMTP_PORT }}
+      SMTP_USER:  ${{ secrets.SMTP_USER }}
+      SMTP_PASS:  ${{ secrets.SMTP_PASS }}
+      # Optional: VALD creds if the script needs them for context
+      VALD_CLIENT_ID:     ${{ secrets.VALD_CLIENT_ID }}
+      VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
+      VALD_TENANT_ID:     ${{ secrets.VALD_TENANT_ID }}
+      VALD_REGION:        use
 
-- name: Install gcloud SDK
-if: steps.gate.outputs.allow == 'true'
-uses: google-github-actions/setup-gcloud@v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      # ---- Time gate: only run between 06:11 and 20:00 America/Los_Angeles ----
+      - name: Gate by Pacific Time window
+        id: gate
+        shell: bash
+        run: |
+          LA_HOUR=$(TZ=America/Los_Angeles date +%H)
+          LA_MIN=$(TZ=America/Los_Angeles date +%M)
 
-- name: gcloud auth print-access-token (for bigrquery gargle flow)
-if: steps.gate.outputs.allow == 'true'
-run: gcloud auth print-access-token > /dev/null
+          # Only hours 06..19 inclusive (i.e., last run occurs at 19:56)
+          if [ "$LA_HOUR" -lt 6 ] || [ "$LA_HOUR" -gt 19 ]; then
+            echo "outside_window=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
+          case "$LA_MIN" in
+            11|26|41|56) echo "outside_window=false" >> $GITHUB_OUTPUT ;;
+            *) echo "outside_window=true" >> $GITHUB_OUTPUT ;;
+          esac
 
-- name: Run tertiary defense (R)
-if: steps.gate.outputs.allow == 'true'
-id: rcheck
-run: |
-chmod +x ci/tertiary_fd_defense.R
-Rscript ci/tertiary_fd_defense.R
+      - name: Stop if outside LA window
+        if: steps.gate.outputs.outside_window == 'true'
+        run: echo "Skipping this tick (outside 06:11–20:00 PT cadence)."
 
+      # ---- (Optional) Authenticate to Google via a service account key JSON secret ----
+      # If you use Workload Identity or gcloud SSO instead, you can remove this block.
+      - name: Google Auth (service account key)
+        if: steps.gate.outputs.outside_window == 'false' && secrets.GCP_SA_KEY_JSON != ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
 
-- name: Upload artifacts (CSV/JSON)
-if: steps.gate.outputs.allow == 'true'
-uses: actions/upload-artifact@v4
-with:
-name: fd-dupe-artifacts
-path: artifacts/**
-if-no-files-found: ignore
+      - name: Setup gcloud (optional)
+        if: steps.gate.outputs.outside_window == 'false'
+        uses: google-github-actions/setup-gcloud@v2
 
+      - name: Setup R
+        if: steps.gate.outputs.outside_window == 'false'
+        uses: r-lib/actions/setup-r@v2
 
-# === Email notification only when duplicates are found ===
-- name: Send email (SMTP) if duplicates detected
-if: steps.gate.outputs.allow == 'true' && steps.rcheck.outputs.dupe_count != '' && steps.rcheck.outputs.dupe_count != '0'
-uses: dawidd6/action-send-mail@v3
-with:
-server_address: ${{ secrets.SMTP_HOST }}
-server_port: ${{ secrets.SMTP_PORT }}
-username: ${{ secrets.SMTP_USERNAME }}
-password: ${{ secrets.SMTP_PASSWORD }}
-subject: "VALD duplicate test_ID alert: ${{ steps.rcheck.outputs.dupe_count }} found"
-from: ${{ secrets.FROM_EMAIL }}
-to: ${{ secrets.TO_EMAIL }}
-secure: true
-convert_markdown: true
-html_body: |
-<h3>VALD duplicate test_IDs detected</h3>
-<p><b>Project</b>: ${{ env.GCP_PROJECT }}<br/>
-<b>Dataset</b>: ${{ env.BQ_DATASET }}<br/>
-<b>Table</b>: ${{ env.BASE_TABLE }}<br/>
-<b>Duplicate count</b>: <code>${{ steps.rcheck.outputs.dupe_count }}</code></p>
-<p>We also materialized a deduplicated table <code>${{ env.UNIQUE_TABLE }}</code> and view <code>${{ env.UNIQUE_VIEW }}</code> in BigQuery.</p>
-<p>CSV and JSON artifacts are attached in the workflow run.</p>
+      - name: Install R packages (cached)
+        if: steps.gate.outputs.outside_window == 'false'
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: >
+            any::bigrquery
+            any::DBI
+            any::dplyr
+            any::tidyr
+            any::readr
+            any::stringr
+            any::purrr
+            any::tibble
+            any::data.table
+            any::hms
+            any::lubridate
+            any::httr
+            any::jsonlite
+            any::xml2
+            any::curl
+            any::gargle
+            any::rlang
+            any::lifecycle
+            any::glue
+            any::valdr
+
+      - name: Run tertiary defense script
+        if: steps.gate.outputs.outside_window == 'false'
+        run: |
+          Rscript .github/scripts/tertiary_fd_defense.R
+
+      # Upload any artifacts the script writes (dupe snapshots & summary files)
+      - name: Upload duplicate artifacts (if present)
+        if: steps.gate.outputs.outside_window == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-dupe-outputs
+          path: |
+            vald_fd_jumps_dupes.csv
+            vald_fd_jumps_dupes.json
+            tertiary_fd_defense_summary.json
+          if-no-files-found: ignore
