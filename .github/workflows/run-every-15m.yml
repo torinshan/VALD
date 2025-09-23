@@ -1,192 +1,91 @@
 name: R → BigQuery every 15m (WIF)
+libcurl4-openssl-dev libssl-dev libxml2-dev \
+libfontconfig1-dev libfreetype6-dev libpng-dev \
+libtiff5-dev libjpeg-dev zlib1g-dev \
+libharfbuzz-dev libfribidi-dev \
+libsecret-1-dev libsecret-1-0
 
-on:
-  schedule:
-    # Run every 15 minutes in UTC; we further gate by Pacific window + :11 cadence below
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    concurrency:
-      group: vald-q15
-      cancel-in-progress: false
+- name: Verify script exists
+if: steps.gate.outputs.ok == 'true'
+run: test -f .github/scripts/run.R
 
-    # Needed for Workload Identity Federation and repo access
-    permissions:
-      id-token: write
-      contents: read
 
-    env:
-      GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics
+- name: Install R packages (CRAN)
+if: steps.gate.outputs.ok == 'true'
+run: |
+R -q -e "
+packages <- c(
+'DBI','bigrquery',
+'dplyr','tidyr','readr','stringr','purrr','tibble',
+'data.table','hms','lubridate',
+'httr','jsonlite','xml2','curl',
+'valdr','gargle',
+'rlang','lifecycle'
+)
+install.packages(
+packages,
+repos='https://packagemanager.posit.co/cran/__linux__/noble/latest',
+Ncpus=parallel::detectCores()
+)
+for (pkg in packages) if (!suppressWarnings(require(pkg, character.only=TRUE, quietly=TRUE))) stop('Failed to load: ', pkg)
+cat('All packages installed and loaded successfully\n')
+"
 
-    steps:
-      - name: Show current time (UTC/PT)
-        run: |
-          echo "UTC now: $(date -u)"
-          echo "LA  now: $(TZ=America/Los_Angeles date)"
 
-      # Gate by Pacific Time window AND 11-minute cadence (:11,:26,:41,:56)
-      - name: Gate to 06:11–20:00 PT and :11 cadence
-        id: gate
-        shell: bash
-        run: |
-          LA_HOUR=$(TZ=America/Los_Angeles date +%H)
-          LA_MIN=$(TZ=America/Los_Angeles date +%M)
+- name: Run R pipeline
+if: steps.gate.outputs.ok == 'true'
+env:
+VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
+VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
+VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
+VALD_REGION: use
+run: |
+set -e
+Rscript .github/scripts/run.R
 
-          # Hour window 06:00–19:59 inclusive (we'll also check minute=11+15k)
-          if [ "$LA_HOUR" -lt 6 ] || [ "$LA_HOUR" -ge 20 ]; then
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping this tick (outside 06:11–20:00 PT window)."
-            exit 0
-          fi
 
-          # Cadence: only run when minute is 11 mod 15 (i.e., 11,26,41,56)
-          mod=$(( (10#$LA_MIN - 11) % 15 ))
-          if [ $mod -ne 0 ]; then
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping this tick (PT minute $LA_MIN not 11 mod 15)."
-            exit 0
-          fi
+- name: Ensure BigQuery dataset exists
+if: steps.gate.outputs.ok == 'true' && always()
+run: |
+bq mk --dataset --location=US "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset exists or creation failed"
 
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-          echo "Proceeding (within 06:11–20:00 PT, cadence OK)."
 
-      - name: Stop if gate says skip
-        if: steps.gate.outputs.ok != 'true'
-        run: exit 0
+- name: Check processing logs (tail)
+id: tail_logs
+if: steps.gate.outputs.ok == 'true' && always()
+run: |
+{
+bq query --use_legacy_sql=false --location=US --format=pretty \
+"SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', timestamp) AS ts, level, message
+FROM \`${GCP_PROJECT}.${BQ_DATASET}.vald_processing_log\`
+WHERE run_id = '${{ github.run_id }}'
+ORDER BY timestamp DESC
+LIMIT 30";
+} 2>&1 | tee /tmp/log_tail.txt || echo "No BigQuery logs found for this run."
+echo 'last<<EOF' >> "$GITHUB_OUTPUT"
+cat /tmp/log_tail.txt >> "$GITHUB_OUTPUT"
+echo 'EOF' >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
-        if: steps.gate.outputs.ok == 'true'
 
-      - name: Authenticate to Google Cloud (WIF)
-        id: auth
-        if: steps.gate.outputs.ok == 'true'
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
-          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
-          create_credentials_file: true
-          token_format: access_token
-          access_token_lifetime: 3600s
-
-      - name: Setup gcloud SDK
-        if: steps.gate.outputs.ok == 'true'
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: sac-vald-hub
-          install_components: bq
-
-      - name: Test GCP Authentication
-        if: steps.gate.outputs.ok == 'true'
-        run: |
-          gcloud auth list
-          bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
-
-      - uses: r-lib/actions/setup-r@v2
-        if: steps.gate.outputs.ok == 'true'
-        with:
-          use-public-rspm: true
-
-      # Cache R library to speed up installs
-      - name: Cache R packages
-        if: steps.gate.outputs.ok == 'true'
-        uses: actions/cache@v3
-        with:
-          path: /home/runner/work/_temp/Library
-          key: ${{ runner.os }}-r-${{ hashFiles('**/*.R') }}
-          restore-keys: |
-            ${{ runner.os }}-r-
-
-      - name: System libs
-        if: steps.gate.outputs.ok == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libcurl4-openssl-dev libssl-dev libxml2-dev \
-            libfontconfig1-dev libfreetype6-dev libpng-dev \
-            libtiff5-dev libjpeg-dev zlib1g-dev \
-            libharfbuzz-dev libfribidi-dev \
-            libsecret-1-dev libsecret-1-0
-
-      - name: Verify script exists
-        if: steps.gate.outputs.ok == 'true'
-        run: test -f .github/scripts/run.R
-
-      - name: Install R packages (CRAN)
-        if: steps.gate.outputs.ok == 'true'
-        run: |
-          R -q -e "
-          packages <- c(
-            'DBI','bigrquery',
-            'dplyr','tidyr','readr','stringr','purrr','tibble',
-            'data.table','hms','lubridate',
-            'httr','jsonlite','xml2','curl',
-            'valdr','gargle',
-            'rlang','lifecycle'
-          )
-          install.packages(
-            packages,
-            repos='https://packagemanager.posit.co/cran/__linux__/noble/latest',
-            Ncpus=parallel::detectCores()
-          )
-          for (pkg in packages) if (!suppressWarnings(require(pkg, character.only=TRUE, quietly=TRUE))) stop('Failed to load: ', pkg)
-          cat('All packages installed and loaded successfully\n')
-          "
-
-      - name: Run R pipeline
-        if: steps.gate.outputs.ok == 'true'
-        env:
-          VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
-          VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-          VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-          VALD_REGION: use
-        run: |
-          set -e
-          Rscript .github/scripts/run.R
-
-      - name: Ensure BigQuery dataset exists
-        if: steps.gate.outputs.ok == 'true' && always()
-        run: |
-          bq mk --dataset --location=US "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset exists or creation failed"
-
-      - name: Check processing logs (tail)
-        id: tail_logs
-        if: steps.gate.outputs.ok == 'true' && always()
-        run: |
-          {
-            bq query --use_legacy_sql=false --location=US --format=pretty \
-              "SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', timestamp) AS ts, level, message
-               FROM \`${GCP_PROJECT}.${BQ_DATASET}.vald_processing_log\`
-               WHERE run_id = '${{ github.run_id }}'
-               ORDER BY timestamp DESC
-               LIMIT 30";
-          } 2>&1 | tee /tmp/log_tail.txt || echo "No BigQuery logs found for this run."
-          echo 'last<<EOF' >> "$GITHUB_OUTPUT"
-          cat /tmp/log_tail.txt >> "$GITHUB_OUTPUT"
-          echo 'EOF' >> "$GITHUB_OUTPUT"
-
-      # Email only if the job failed
-      - name: Email on failure
-        if: failure() && steps.gate.outputs.ok == 'true'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
-          to: ${{ secrets.ALERT_EMAIL_TO }}
-          from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
-          content_type: text/html
-          body: |
-            <p><strong>Status:</strong> Failed</p>
-            <p><strong>Repo:</strong> ${{ github.repository }}<br/>
-               <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
-               <strong>Commit:</strong> ${{ github.sha }}<br/>
-               <strong>Actor:</strong> ${{ github.actor }}</p>
-            <p><strong>Processing log (last 30 rows):</strong></p>
-            <pre>${{ steps.tail_logs.outputs.last }}</pre>
+# Email only if the job failed
+- name: Email on failure
+if: failure() && steps.gate.outputs.ok == 'true'
+uses: dawidd6/action-send-mail@v3
+with:
+server_address: ${{ secrets.SMTP_HOST }}
+server_port: ${{ secrets.SMTP_PORT }}
+username: ${{ secrets.SMTP_USERNAME }}
+password: ${{ secrets.SMTP_PASSWORD }}
+subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
+to: ${{ secrets.ALERT_EMAIL_TO }}
+from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
+content_type: text/html
+body: |
+<p><strong>Status:</strong> Failed</p>
+<p><strong>Repo:</strong> ${{ github.repository }}<br/>
+<strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
+<strong>Commit:</strong> ${{ github.sha }}<br/>
+<strong>Actor:</strong> ${{ github.actor }}</p>
+<p><strong>Processing log (last 30 rows):</strong></p>
+<pre>${{ steps.tail_logs.outputs.last }}</pre>
