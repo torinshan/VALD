@@ -6,14 +6,18 @@ on:
     # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
     - cron: "11,26,41,56 * * * *"
 
-# Needed for Workload Identity Federation and repo access
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   run-tertiary-defense:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # Needed for Workload Identity Federation and repo access
+    permissions:
+      id-token: write
+      contents: read
 
     env:
       # ----- App config -----
@@ -21,50 +25,42 @@ jobs:
       BQ_DATASET: analytics
       BQ_LOCATION: US
 
-      # Email config (keep these for potential notifications)
-      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-      TO_EMAIL:   ${{ secrets.TO_EMAIL }}
-      SMTP_HOST:  ${{ secrets.SMTP_HOST }}
-      SMTP_PORT:  ${{ secrets.SMTP_PORT }}
-      SMTP_USER:  ${{ secrets.SMTP_USER }}
-      SMTP_PASS:  ${{ secrets.SMTP_PASS }}
-
       VALD_CLIENT_ID:     ${{ secrets.VALD_CLIENT_ID }}
       VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
       VALD_TENANT_ID:     ${{ secrets.VALD_TENANT_ID }}
       VALD_REGION:        use
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Echo UTC and LA time
+      - name: Show current time (UTC/PT)
         run: |
           echo "UTC now: $(date -u)"
           echo "LA  now: $(TZ=America/Los_Angeles date)"
 
-      # ---- Gate by Pacific Time (same hours as main workflow, offset schedule) ----
+      # DST-safe hour gating only (no minute modulo). GitHub cron is best-effort and can drift several minutes,
+      # so we don't reject based on exact minute. Let cron enforce the 15m cadence; we only enforce PT window.
       - name: Gate to 06:00–19:59 PT
         id: gate
         shell: bash
         run: |
           LA_HOUR=$(TZ=America/Los_Angeles date +%H)
           if [ "$LA_HOUR" -ge 6 ] && [ "$LA_HOUR" -lt 20 ]; then
-            echo "outside_window=false" >> "$GITHUB_OUTPUT"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
             echo "Proceeding (within 06:00–19:59 PT)."
           else
-            echo "outside_window=true" >> "$GITHUB_OUTPUT"
-            echo "Outside 06:00–19:59 PT – skipping."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "Outside 06:00–19:59 PT — skipping."
           fi
 
-      - name: Stop if outside LA window
-        if: ${{ steps.gate.outputs.outside_window == 'true' }}
-        run: echo "Skipping this tick (outside 06:00–19:59 PT)."
+      - name: Stop if gate says skip
+        if: steps.gate.outputs.ok != 'true'
+        run: exit 0
 
-      # ---- Google auth (same WIF setup as main workflow) ----
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.ok == 'true'
+
       - name: Authenticate to Google Cloud (WIF)
         id: auth
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
+        if: steps.gate.outputs.ok == 'true'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
@@ -74,52 +70,71 @@ jobs:
           access_token_lifetime: 3600s
 
       - name: Setup gcloud SDK
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
+        if: steps.gate.outputs.ok == 'true'
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: sac-vald-hub
           install_components: bq
 
       - name: Test GCP Authentication
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
+        if: steps.gate.outputs.ok == 'true'
         run: |
           gcloud auth list
           bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
 
-      # ---- R setup & deps ----
-      - name: Setup R
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: r-lib/actions/setup-r@v2
-
-      - name: Install R packages (cached)
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: r-lib/actions/setup-r-dependencies@v2
+      - uses: r-lib/actions/setup-r@v2
+        if: steps.gate.outputs.ok == 'true'
         with:
-          extra-packages: >
-            any::bigrquery
-            any::DBI
-            any::dplyr
-            any::tidyr
-            any::readr
-            any::stringr
-            any::purrr
-            any::tibble
-            any::data.table
-            any::hms
-            any::lubridate
-            any::httr
-            any::jsonlite
-            any::xml2
-            any::curl
-            any::gargle
-            any::rlang
-            any::lifecycle
-            any::glue
-            any::valdr
+          use-public-rspm: true
 
-      # ---- Run the tertiary defense script at the new path ----
-      - name: Run tertiary defense
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
+      # Cache R library to speed up installs
+      - name: Cache R packages
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/cache@v3
+        with:
+          path: /home/runner/work/_temp/Library
+          key: ${{ runner.os }}-r-${{ hashFiles('**/*.R') }}
+          restore-keys: |
+            ${{ runner.os }}-r-
+
+      - name: System libs
+        if: steps.gate.outputs.ok == 'true'
         run: |
-          chmod +x .github/scripts/tertiary_fd_defense.R
-          .github/scripts/tertiary_fd_defense.R
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libfreetype6-dev libpng-dev \
+            libtiff5-dev libjpeg-dev zlib1g-dev \
+            libharfbuzz-dev libfribidi-dev \
+            libsecret-1-dev libsecret-1-0
+
+      - name: Verify script exists
+        if: steps.gate.outputs.ok == 'true'
+        run: test -f .github/scripts/tertiary_fd_defense.R
+
+      - name: Install R packages (CRAN)
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          R -q -e "
+          packages <- c(
+            'DBI','bigrquery',
+            'dplyr','tidyr','readr','stringr','purrr','tibble',
+            'data.table','hms','lubridate',
+            'httr','jsonlite','xml2','curl',
+            'valdr','gargle',
+            'rlang','lifecycle'
+          )
+          install.packages(
+            packages,
+            repos='https://packagemanager.posit.co/cran/__linux__/noble/latest',
+            Ncpus=parallel::detectCores()
+          )
+          for (pkg in packages) if (!suppressWarnings(require(pkg, character.only=TRUE, quietly=TRUE))) stop('Failed to load: ', pkg)
+          cat('All packages installed and loaded successfully\n')
+          "
+
+      - name: Run tertiary defense
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          set -e
+          Rscript .github/scripts/tertiary_fd_defense.R
