@@ -6,7 +6,9 @@ on:
     # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
     - cron: "11,26,41,56 * * * *"
 
+# Needed for Workload Identity Federation and repo access
 permissions:
+  id-token: write
   contents: read
 
 jobs:
@@ -19,8 +21,7 @@ jobs:
       BQ_DATASET: analytics
       BQ_LOCATION: US
 
-      # Mirror secrets into env so we can safely reference in `if:` conditions
-      GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+      # Email config (keep these for potential notifications)
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
       TO_EMAIL:   ${{ secrets.TO_EMAIL }}
       SMTP_HOST:  ${{ secrets.SMTP_HOST }}
@@ -60,16 +61,30 @@ jobs:
         if: ${{ steps.gate.outputs.outside_window == 'true' }}
         run: echo "Skipping this tick (outside 06:00–19:59 PT)."
 
-      # ---- Google auth (only if key present) ----
-      - name: Google Auth (service account key)
-        if: ${{ steps.gate.outputs.outside_window == 'false' && env.GCP_SA_KEY_JSON != '' }}
+      # ---- Google auth (same WIF setup as main workflow) ----
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ env.GCP_SA_KEY_JSON }}
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: access_token
+          access_token_lifetime: 3600s
 
-      - name: Setup gcloud (optional)
+      - name: Setup gcloud SDK
         if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: sac-vald-hub
+          install_components: bq
+
+      - name: Test GCP Authentication
+        if: ${{ steps.gate.outputs.outside_window == 'false' }}
+        run: |
+          gcloud auth list
+          bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
 
       # ---- R setup & deps ----
       - name: Setup R
@@ -80,7 +95,6 @@ jobs:
         if: ${{ steps.gate.outputs.outside_window == 'false' }}
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          use-public-rspm: true
           extra-packages: >
             any::bigrquery
             any::DBI
