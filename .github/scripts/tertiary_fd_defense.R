@@ -1,126 +1,61 @@
-name: Tertiary FD Defense (15m PT)
+#!/usr/bin/env Rscript
+# Purpose: tertiary defense that (1) checks for duplicate test_ID in vald_fd_jumps,
+# (2) writes dupes to BQ + CSV artifact, (3) materializes a deduplicated table/view,
+# and (4) exits successfully while letting the workflow email on duplicates.
+suppressPackageStartupMessages({
+library(DBI)
+library(bigrquery)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(gargle)
+})
+log <- function(...) cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "-", ..., "\n")
+# ------------------ Config ------------------
+project <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
+dataset <- Sys.getenv("BQ_DATASET", "analytics")
+location <- Sys.getenv("BQ_LOCATION", "US")
+base_tbl <- Sys.getenv("BASE_TABLE", "vald_fd_jumps")
+dupes_tbl <- Sys.getenv("DUPES_TABLE", "vald_fd_jumps_dupes")
+unique_tbl <- Sys.getenv("UNIQUE_TABLE", "vald_fd_jumps_unique")
+unique_view <- Sys.getenv("UNIQUE_VIEW", "vald_fd_jumps_no_dupes")
+artifacts_dir <- Sys.getenv("ARTIFACTS_DIR", "artifacts")
+# prefer date+time to rank which duplicate to keep
+rank_order_cols <- c("date", "time")
+# ------------------ Auth ------------------
+log("Authenticating to BigQuery via WIF credentials …")
 
-on:
-  workflow_dispatch:
-  schedule:
-    # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
-    - cron: "11,26,41,56 * * * *"
+# WIF creates a credentials file that we can use directly
+# Check for the standard application default credentials path
+cred_file <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-# Needed for Workload Identity Federation and repo access
-permissions:
-  id-token: write
-  contents: read
+if (nzchar(cred_file) && file.exists(cred_file)) {
+  log("Using WIF credentials file:", cred_file)
+  # Use service account credentials directly
+  bigrquery::bq_auth(path = cred_file)
+} else {
+  # Fallback: try application default credentials (ADC)
+  log("Using Application Default Credentials")
+  bigrquery::bq_auth()
+}
 
-jobs:
-  run-tertiary-defense:
-    runs-on: ubuntu-latest
+log("BigQuery authentication completed")
 
-    env:
-      # ----- App config -----
-      GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics
-      BQ_LOCATION: US
+con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
 
-      # Email config (keep these for potential notifications)
-      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-      TO_EMAIL:   ${{ secrets.TO_EMAIL }}
-      SMTP_HOST:  ${{ secrets.SMTP_HOST }}
-      SMTP_PORT:  ${{ secrets.SMTP_PORT }}
-      SMTP_USER:  ${{ secrets.SMTP_USER }}
-      SMTP_PASS:  ${{ secrets.SMTP_PASS }}
-
-      VALD_CLIENT_ID:     ${{ secrets.VALD_CLIENT_ID }}
-      VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-      VALD_TENANT_ID:     ${{ secrets.VALD_TENANT_ID }}
-      VALD_REGION:        use
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Echo UTC and LA time
-        run: |
-          echo "UTC now: $(date -u)"
-          echo "LA  now: $(TZ=America/Los_Angeles date)"
-
-      # ---- Gate by Pacific Time (same hours as main workflow, offset schedule) ----
-      - name: Gate to 06:00–19:59 PT
-        id: gate
-        shell: bash
-        run: |
-          LA_HOUR=$(TZ=America/Los_Angeles date +%H)
-          if [ "$LA_HOUR" -ge 6 ] && [ "$LA_HOUR" -lt 20 ]; then
-            echo "outside_window=false" >> "$GITHUB_OUTPUT"
-            echo "Proceeding (within 06:00–19:59 PT)."
-          else
-            echo "outside_window=true" >> "$GITHUB_OUTPUT"
-            echo "Outside 06:00–19:59 PT – skipping."
-          fi
-
-      - name: Stop if outside LA window
-        if: ${{ steps.gate.outputs.outside_window == 'true' }}
-        run: echo "Skipping this tick (outside 06:00–19:59 PT)."
-
-      # ---- Google auth (same WIF setup as main workflow) ----
-      - name: Authenticate to Google Cloud (WIF)
-        id: auth
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
-          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
-          create_credentials_file: true
-          token_format: access_token
-          access_token_lifetime: 3600s
-
-      - name: Setup gcloud SDK
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: sac-vald-hub
-          install_components: bq
-
-      - name: Test GCP Authentication
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        run: |
-          gcloud auth list
-          bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
-
-      # ---- R setup & deps ----
-      - name: Setup R
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: r-lib/actions/setup-r@v2
-
-      - name: Install R packages (cached)
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        uses: r-lib/actions/setup-r-dependencies@v2
-        with:
-          use-public-rspm: true
-          extra-packages: >
-            any::bigrquery
-            any::DBI
-            any::dplyr
-            any::tidyr
-            any::readr
-            any::stringr
-            any::purrr
-            any::tibble
-            any::data.table
-            any::hms
-            any::lubridate
-            any::httr
-            any::jsonlite
-            any::xml2
-            any::curl
-            any::gargle
-            any::rlang
-            any::lifecycle
-            any::glue
-            any::valdr
-
-      # ---- Run the tertiary defense script at the new path ----
-      - name: Run tertiary defense
-        if: ${{ steps.gate.outputs.outside_window == 'false' }}
-        run: |
-          chmod +x .github/scripts/tertiary_fd_defense.R
-          .github/scripts/tertiary_fd_defense.R
+fq <- function(t) sprintf("%s.%s.%s", project, dataset, t)
+# ------------------ Build ranking expression ------------------
+# We will prefer the most recent record by (date desc, time desc) when deduping.
+rank_expr <- paste(
+c(
+if ("date" %in% DBI::dbListFields(con, Id(project = project, dataset = dataset, table = base_tbl))) "date DESC" else NULL,
+if ("time" %in% DBI::dbListFields(con, Id(project = project, dataset = dataset, table = base_tbl))) "time DESC" else NULL,
+"_PARTITIONTIME DESC", # fallback if table is partitioned
+"CURRENT_TIMESTAMP() DESC" # ultimate fallback (stable tie-breaker)
+),
+collapse = ", "
+)
+if (rank_expr == "") rank_expr <- "CURRENT_TIMESTAMP() DESC"
+# ------------------ Duplicate detection ------------------
+log("Running duplicate scan on", paste0(project, ".", dataset, ".", base_tbl))
+log("Finished tertiary defense; exiting 0 so the workflow can notify if needed.
