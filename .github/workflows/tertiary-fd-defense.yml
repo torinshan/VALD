@@ -42,8 +42,8 @@ jobs:
           echo "UTC now: $(date -u)"
           echo "LA  now: $(TZ=America/Los_Angeles date)"
 
-      # ---- Gate by Pacific Time (06:11–19:56 PT every 15 minutes) ----
-       - name: Gate to 06:00–19:59 PT
+      # ---- Gate by Pacific Time (same hours as main workflow, offset schedule) ----
+      - name: Gate to 06:00–19:59 PT
         id: gate
         shell: bash
         run: |
@@ -56,14 +56,9 @@ jobs:
             echo "Outside 06:00–19:59 PT – skipping."
           fi
 
-          case "$LA_MIN" in
-            11|26|41|56) echo "outside_window=false" >> "$GITHUB_OUTPUT" ;;
-            *)           echo "outside_window=true"  >> "$GITHUB_OUTPUT" ;;
-          esac
-
       - name: Stop if outside LA window
         if: ${{ steps.gate.outputs.outside_window == 'true' }}
-        run: echo "Skipping this tick (outside 06:11–20:00 PT cadence)."
+        run: echo "Skipping this tick (outside 06:00–19:59 PT)."
 
       # ---- Google auth (only if key present) ----
       - name: Google Auth (service account key)
