@@ -23,21 +23,11 @@ artifacts_dir <- Sys.getenv("ARTIFACTS_DIR", "artifacts")
 # prefer date+time to rank which duplicate to keep
 rank_order_cols <- c("date", "time")
 # ------------------ Auth ------------------
-log("Authenticating to BigQuery via WIF credentials …")
+log("Authenticating to BigQuery via WIF...")
 
-# WIF creates a credentials file that we can use directly
-# Check for the standard application default credentials path
-cred_file <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-
-if (nzchar(cred_file) && file.exists(cred_file)) {
-  log("Using WIF credentials file:", cred_file)
-  # Use service account credentials directly
-  bigrquery::bq_auth(path = cred_file)
-} else {
-  # Fallback: try application default credentials (ADC)
-  log("Using Application Default Credentials")
-  bigrquery::bq_auth()
-}
+# WIF sets up Application Default Credentials automatically
+# Just use bq_auth() with no parameters to pick up the WIF credentials
+bigrquery::bq_auth()
 
 log("BigQuery authentication completed")
 
