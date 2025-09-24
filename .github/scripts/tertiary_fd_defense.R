@@ -23,16 +23,21 @@ artifacts_dir <- Sys.getenv("ARTIFACTS_DIR", "artifacts")
 # prefer date+time to rank which duplicate to keep
 rank_order_cols <- c("date", "time")
 # ------------------ Auth ------------------
-log("Authenticating to BigQuery via WIF...")
-
-# WIF sets up Application Default Credentials automatically
-# Just use bq_auth() with no parameters to pick up the WIF credentials
-bigrquery::bq_auth()
-
-log("BigQuery authentication completed")
+log("Authenticating to BigQuery via gcloud token …")
+access_token <- tryCatch(system("gcloud auth print-access-token", intern = TRUE)[1], error = function(e) "")
+if (nzchar(access_token)) {
+  token <- gargle::gargle2.0_token(
+    scope = 'https://www.googleapis.com/auth/bigquery',
+    client = gargle::gargle_client(),
+    credentials = list(access_token = access_token)
+  )
+  bigrquery::bq_auth(token = token)
+  log("bq_auth OK")
+} else {
+  stop("Could not obtain gcloud access token")
+}
 
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
-
 fq <- function(t) sprintf("%s.%s.%s", project, dataset, t)
 # ------------------ Build ranking expression ------------------
 # We will prefer the most recent record by (date desc, time desc) when deduping.
