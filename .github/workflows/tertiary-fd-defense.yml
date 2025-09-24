@@ -43,16 +43,17 @@ jobs:
           echo "LA  now: $(TZ=America/Los_Angeles date)"
 
       # ---- Gate by Pacific Time (06:11–19:56 PT every 15 minutes) ----
-      - name: Gate by Pacific Time window
+       - name: Gate to 06:00–19:59 PT
         id: gate
         shell: bash
         run: |
           LA_HOUR=$(TZ=America/Los_Angeles date +%H)
-          LA_MIN=$(TZ=America/Los_Angeles date +%M)
-
-          if [ "$LA_HOUR" -lt 6 ] || [ "$LA_HOUR" -gt 19 ]; then
+          if [ "$LA_HOUR" -ge 6 ] && [ "$LA_HOUR" -lt 20 ]; then
+            echo "outside_window=false" >> "$GITHUB_OUTPUT"
+            echo "Proceeding (within 06:00–19:59 PT)."
+          else
             echo "outside_window=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Outside 06:00–19:59 PT – skipping."
           fi
 
           case "$LA_MIN" in
