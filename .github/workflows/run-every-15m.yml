@@ -169,8 +169,7 @@ jobs:
           subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
           to: ${{ secrets.ALERT_EMAIL_TO }}
           from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
-          content_type: text/html
-          body: |
+          html_body: |-
             <p><strong>Status:</strong> Failed</p>
             <p><strong>Repo:</strong> ${{ github.repository }}<br/>
                <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
