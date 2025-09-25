@@ -1827,7 +1827,7 @@ if (count_mismatch && date_mismatch) {
           TRUE ~ ((impulse_right - impulse_left) / impulse_right) 
         )
       ) %>% 
-      select(-any_of(c("testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
+      select(-any_of(c("testDateUtc","testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
                 "rightMaxForce", "leftRepetitions", "rightRepetitions"))) %>%
       left_join(processed_data$mergable_roster, by = "vald_id")
     
