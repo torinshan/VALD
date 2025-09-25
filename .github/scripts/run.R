@@ -1827,7 +1827,7 @@ if (count_mismatch && date_mismatch) {
           TRUE ~ ((impulse_right - impulse_left) / impulse_right) 
         )
       ) %>% 
-      select(-any_of(c("testDateUtc","testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
+      select(-any_of(c("testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
                 "rightMaxForce", "leftRepetitions", "rightRepetitions"))) %>%
       left_join(processed_data$mergable_roster, by = "vald_id")
     
@@ -1966,7 +1966,7 @@ if (count_mismatch && date_mismatch) {
   create_log_entry(paste("Rebound records:", nrow(forcedecks_rebound_clean)))
   create_log_entry(paste("IMTP records:", nrow(forcedecks_IMTP_clean)))
   create_log_entry("FULL PROCESSING branch completed successfully")
-  
+
 } else if (count_mismatch && !date_mismatch) {
   create_log_entry("Only count mismatch – running partial code.")
   
@@ -2005,7 +2005,7 @@ if (count_mismatch && date_mismatch) {
     validate_test_ids(forcedecks_raw, "Partial_ForceDecks_Raw")
     
     ############################################################################
-    # IDENTICAL CMJ processing as full processing
+    # IDENTICAL CMJ processing as full processing WITH ALL SCORING LOGIC
     ############################################################################
     
     cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ", "LCMJ", "SJ", "ABCMJ"))
@@ -2035,7 +2035,125 @@ if (count_mismatch && date_mismatch) {
       
       validate_test_ids(cmj_new, "Partial_CMJ_New")
       
-      forcedecks_jump_clean <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL")
+      # CRITICAL: Append new data to existing data first
+      cmj_all <- safe_append_with_primary_key(cmj_new, existing_data$forcedecks_jump_clean, "test_ID", "CMJ_PARTIAL") %>%
+        arrange(full_name, test_type, date)
+      
+      validate_test_ids(cmj_all, "Partial_CMJ_All_After_Append")
+      
+      # CRITICAL: Apply FULL scoring logic to combined dataset (same as full processing)
+      forcedecks_jump_clean <- cmj_all %>%
+        group_by(full_name, test_type) %>%
+        mutate(
+          across(
+            any_of(c("jump_height_inches_imp_mom", "relative_peak_concentric_force",
+              "rsi_modified_imp_mom", "relative_peak_eccentric_force")),
+            list(
+              zscore = ~map_dbl(row_number(), function(idx) {
+                current_date <- date[idx]
+                window_start <- current_date - days(30)
+                window_end   <- current_date - days(1)
+                baseline_vals <- .x[date >= window_start & date <= window_end & !is.na(.x)]
+                if (length(baseline_vals) < 3) return(0)
+                sdv <- sd(baseline_vals)
+                if (sdv == 0) return(NA_real_)
+                (.x[idx] - mean(baseline_vals)) / sdv
+              })
+            ),
+            .names = "{.fn}_{.col}"
+          )
+        ) %>%
+        ungroup() %>%
+        group_by(full_name) %>%
+        mutate(
+          across(
+            any_of(c("jump_height_inches_imp_mom", "rsi_modified_imp_mom", "relative_peak_eccentric_force")),
+            list(
+              readiness = ~map_dbl(row_number(), function(idx) {
+                current_date <- date[idx]
+                window_start <- current_date - days(30)
+                window_end   <- current_date - days(1)
+                cmj_mask <- (test_type == "CMJ")
+                baseline_vals <- .x[cmj_mask & date >= window_start & date <= window_end & !is.na(.x)]
+                if (length(baseline_vals) < 3) return(NA_real_)
+                baseline_mean <- mean(baseline_vals)
+                if (is.na(.x[idx]) || baseline_mean == 0) return(NA_real_)
+                (.x[idx] - baseline_mean) / baseline_mean
+              })
+            ),
+            .names = "{.fn}_{.col}"
+          )
+        ) %>%
+        ungroup()
+      
+      # Filter outliers (same as full processing)
+      if ("zscore_jump_height_inches_imp_mom" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          filter(
+            if_else(!is.na(body_weight_lbs),
+                    between(zscore_jump_height_inches_imp_mom, -3, 3),
+                    between(zscore_jump_height_inches_imp_mom, -2.5, 2.5))
+          )
+      }
+      
+      if ("zscore_relative_peak_concentric_force" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          filter(
+            if_else(!is.na(body_weight_lbs),
+                    between(zscore_relative_peak_concentric_force, -3, 3),
+                    between(zscore_relative_peak_concentric_force, -2.5, 2.5))
+          )
+      }
+      
+      if ("zscore_rsi_modified_imp_mom" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          filter(
+            if_else(!is.na(body_weight_lbs),
+                    between(zscore_rsi_modified_imp_mom, -3, 3),
+                    between(zscore_rsi_modified_imp_mom, -2.5, 2.5))
+          )
+      }
+      
+      forcedecks_jump_clean <- forcedecks_jump_clean %>%
+        filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
+        select(
+          -any_of(c("jump_height_readiness", "epf_readiness", "rsi_readiness")),
+          -any_of("position"),
+          -starts_with("zscore_"),
+          -starts_with("readiness_relative_peak_concentric")
+        )
+      
+      # Rename readiness columns (same as full processing)
+      if ("readiness_jump_height_inches_imp_mom" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          rename(jump_height_readiness = readiness_jump_height_inches_imp_mom)
+      }
+      if ("readiness_relative_peak_eccentric_force" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          rename(epf_readiness = readiness_relative_peak_eccentric_force)
+      }
+      if ("readiness_rsi_modified_imp_mom" %in% names(forcedecks_jump_clean)) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          rename(rsi_readiness = readiness_rsi_modified_imp_mom)
+      }
+      
+      # Performance scores (same as full processing)
+      if (all(c("jump_height_inches_imp_mom", "relative_peak_eccentric_force", 
+                "bodymass_relative_takeoff_power", "rsi_modified_imp_mom") %in% names(forcedecks_jump_clean))) {
+        forcedecks_jump_clean <- forcedecks_jump_clean %>%
+          mutate(
+            calc_performance_score =
+              percent_rank(jump_height_inches_imp_mom) * 100 +
+              percent_rank(relative_peak_eccentric_force) * 100 +
+              percent_rank(bodymass_relative_takeoff_power) * 100 +
+              percent_rank(rsi_modified_imp_mom) * 100,
+            performance_score = percent_rank(calc_performance_score) * 100
+          ) %>%
+          group_by(team) %>%
+          mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+          ungroup() %>%
+          select(-calc_performance_score)
+      }
       
       validate_test_ids(forcedecks_jump_clean, "Partial_CMJ_Final")
       assert_unique_test_ids_df(forcedecks_jump_clean, "vald_fd_jumps (pre-upload, partial)")
@@ -2047,10 +2165,10 @@ if (count_mismatch && date_mismatch) {
     }
     
     ############################################################################
-    # IDENTICAL processing for other test types (abbreviated for partial)
+    # COMPLETE processing for other test types (with ALL missing logic)
     ############################################################################
     
-    # DJ processing
+    # DJ processing (same as full)
     dj_temp <- forcedecks_raw %>% filter(test_type %in% c("DJ"))
     if(nrow(dj_temp) > 0) {
       forcedecks_jump_DJ_clean <- dj_temp %>%
@@ -2080,7 +2198,7 @@ if (count_mismatch && date_mismatch) {
       forcedecks_jump_DJ_clean <- existing_data$forcedecks_jump_DJ_clean
     }
     
-    # SLJ processing
+    # SLJ processing WITH COMPLETE bilateral calculations
     slj_temp <- processed_data$trials_wider %>%
       mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
       left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
@@ -2118,7 +2236,26 @@ if (count_mismatch && date_mismatch) {
                           "relative_peak_concentric_force", "relative_peak_eccentric_force", "lower_limb_stiffness", 
                           "rsi_modified_imp_mom")),
           names_sep = "_"
-        ) %>%
+        )
+      
+      # CRITICAL: Add missing bilateral calculations
+      if("peak_landing_force_Left" %in% names(forcedecks_SLJ_clean) & "peak_landing_force_Right" %in% names(forcedecks_SLJ_clean)) {
+        forcedecks_SLJ_clean <- forcedecks_SLJ_clean %>%
+          mutate(
+            peak_landing_force_bilateral = rowMeans(cbind(peak_landing_force_Left, peak_landing_force_Right), na.rm = TRUE),
+            peak_landing_velocity_bilateral = rowMeans(cbind(peak_landing_velocity_Left, peak_landing_velocity_Right), na.rm = TRUE),
+            peak_takeoff_velocity_bilateral = rowMeans(cbind(peak_takeoff_velocity_Left, peak_takeoff_velocity_Right), na.rm = TRUE),
+            time_to_peak_force_bilateral = rowMeans(cbind(time_to_peak_force_Left, time_to_peak_force_Right), na.rm = TRUE),
+            weight_relative_peak_takeoff_force_bilateral = rowMeans(cbind(weight_relative_peak_takeoff_force_Left, weight_relative_peak_takeoff_force_Right), na.rm = TRUE),
+            weight_relative_peak_landing_force_bilateral = rowMeans(cbind(weight_relative_peak_landing_force_Left, weight_relative_peak_landing_force_Right), na.rm = TRUE),
+            relative_peak_concentric_force_bilateral = rowMeans(cbind(relative_peak_concentric_force_Left, relative_peak_concentric_force_Right), na.rm = TRUE),
+            relative_peak_eccentric_force_bilateral = rowMeans(cbind(relative_peak_eccentric_force_Left, relative_peak_eccentric_force_Right), na.rm = TRUE),
+            lower_limb_stiffness_bilateral = rowMeans(cbind(lower_limb_stiffness_Left, lower_limb_stiffness_Right), na.rm = TRUE),
+            rsi_modified_imp_mom_bilateral = rowMeans(cbind(rsi_modified_imp_mom_Left, rsi_modified_imp_mom_Right), na.rm = TRUE)
+          )
+      }
+      
+      forcedecks_SLJ_clean <- forcedecks_SLJ_clean %>%
         rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
         rename_with(~str_replace(.x, "_Right$", "_right"), everything())
       
@@ -2128,7 +2265,7 @@ if (count_mismatch && date_mismatch) {
       forcedecks_SLJ_clean <- existing_data$forcedecks_SLJ_clean
     }
     
-    # RSI processing
+    # RSI processing WITH COMPLETE bilateral calculations
     rsi_temp <- processed_data$trials_wider %>%
       mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
       left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
@@ -2164,7 +2301,24 @@ if (count_mismatch && date_mismatch) {
           values_from = any_of(c("start_to_peak_force", "peak_vertical_force", "rfd_at_100ms", "rfd_at_250ms",
                           "iso_bm_rel_force_peak", "iso_bm_rel_force_100", "iso_bm_rel_force_200", "iso_abs_impulse_100")),
           names_sep = "_"
-        ) %>%
+        )
+      
+      # CRITICAL: Add missing bilateral calculations
+      if ("start_to_peak_force_Left" %in% names(forcedecks_RSI_clean) && "start_to_peak_force_Right" %in% names(forcedecks_RSI_clean)) {
+        forcedecks_RSI_clean <- forcedecks_RSI_clean %>%
+          mutate(
+            start_to_peak_force_bilateral = rowMeans(cbind(start_to_peak_force_Left, start_to_peak_force_Right), na.rm = TRUE),
+            peak_vertical_force_bilateral = rowMeans(cbind(peak_vertical_force_Left, peak_vertical_force_Right), na.rm = TRUE),
+            rfd_at_100ms_bilateral = rowMeans(cbind(rfd_at_100ms_Left, rfd_at_100ms_Right), na.rm = TRUE),
+            rfd_at_250ms_bilateral = rowMeans(cbind(rfd_at_250ms_Left, rfd_at_250ms_Right), na.rm = TRUE),
+            iso_bm_rel_force_peak_bilateral = rowMeans(cbind(iso_bm_rel_force_peak_Left, iso_bm_rel_force_peak_Right), na.rm = TRUE),
+            iso_bm_rel_force_100_bilateral = rowMeans(cbind(iso_bm_rel_force_100_Left, iso_bm_rel_force_100_Right), na.rm = TRUE),
+            iso_bm_rel_force_200_bilateral = rowMeans(cbind(iso_bm_rel_force_200_Left, iso_bm_rel_force_200_Right), na.rm = TRUE),
+            iso_abs_impulse_100_bilateral = rowMeans(cbind(iso_abs_impulse_100_Left, iso_abs_impulse_100_Right), na.rm = TRUE)
+          )
+      }
+      
+      forcedecks_RSI_clean <- forcedecks_RSI_clean %>%
         rename_with(~str_replace(.x, "_Left$", "_left"), everything()) %>%
         rename_with(~str_replace(.x, "_Right$", "_right"), everything())
       
@@ -2174,7 +2328,7 @@ if (count_mismatch && date_mismatch) {
       forcedecks_RSI_clean <- existing_data$forcedecks_RSI_clean
     }
     
-    # Rebound processing
+    # Rebound processing WITH COMPLETE bilateral logic
     rebound_temp <- processed_data$trials_wider %>%
       mutate(test_ID = as.character(testid), vald_id = athleteid) %>% 
       left_join(processed_data$tests_processed %>% select(test_ID, test_type), by = "test_ID") %>% 
@@ -2226,16 +2380,32 @@ if (count_mismatch && date_mismatch) {
           names_sep = "_"
         )
       
+      # CRITICAL: Add missing bilateral calculations for SLCMRJ tests
+      bilateral_cols <- names(forcedecks_rebound_clean)[grepl("_bilateral$", names(forcedecks_rebound_clean))]
+      for (col in bilateral_cols) {
+        left_col <- str_replace(col, "_bilateral$", "_left")
+        right_col <- str_replace(col, "_bilateral$", "_right")
+        
+        if (left_col %in% names(forcedecks_rebound_clean) && right_col %in% names(forcedecks_rebound_clean)) {
+          forcedecks_rebound_clean <- forcedecks_rebound_clean %>%
+            mutate(!!col := case_when(
+              test_type == "SLCMRJ" & is.na(!!sym(col)) ~ 
+                rowMeans(cbind(!!sym(left_col), !!sym(right_col)), na.rm = TRUE),
+              TRUE ~ !!sym(col)
+            ))
+        }
+      }
+      
       forcedecks_rebound_clean <- safe_append_with_primary_key(forcedecks_rebound_clean, existing_data$forcedecks_rebound_clean, "test_ID", "Rebound_PARTIAL")
       create_log_entry(paste("Partial Rebound processing:", nrow(forcedecks_rebound_clean), "total records"))
     } else {
       forcedecks_rebound_clean <- existing_data$forcedecks_rebound_clean
     }
     
-    # IMTP processing
+    # IMTP processing WITH COMPLETE performance scoring
     imtp_temp <- forcedecks_raw %>% filter(test_type == "IMTP")
     if(nrow(imtp_temp) > 0) {
-      forcedecks_IMTP_clean <- imtp_temp %>%
+      imtp_new <- imtp_temp %>%
         select(any_of(c(
           "test_ID", "vald_id", "full_name", "position", "team", "date", "time",
           "start_to_peak_force", "rfd_at_100ms", "rfd_at_200ms", "force_at_100ms", 
@@ -2245,42 +2415,142 @@ if (count_mismatch && date_mismatch) {
         filter(!is.na(peak_vertical_force)) %>%
         arrange(full_name, date)
       
-      forcedecks_IMTP_clean <- safe_append_with_primary_key(forcedecks_IMTP_clean, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP_PARTIAL")
+      # Append to existing data first
+      forcedecks_IMTP_clean <- safe_append_with_primary_key(imtp_new, existing_data$forcedecks_IMTP_clean, "test_ID", "IMTP_PARTIAL")
+      
+      # CRITICAL: Add missing performance scoring logic
+      if (all(c("peak_vertical_force", "start_to_peak_force", "rfd_at_100ms") %in% names(forcedecks_IMTP_clean))) {
+        forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
+          mutate(
+            calc_performance_score = percent_rank(peak_vertical_force) * 100 * 2 +
+              (100 - percent_rank(start_to_peak_force) * 100) +
+              percent_rank(rfd_at_100ms) * 100,
+            performance_score = percent_rank(calc_performance_score) * 100
+          )
+        
+        if ("team" %in% names(forcedecks_IMTP_clean)) {
+          forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
+            group_by(team) %>%
+            mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+            ungroup()
+        }
+        
+        forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
+          select(-calc_performance_score)
+      }
+      
+      forcedecks_IMTP_clean <- forcedecks_IMTP_clean %>%
+        filter(!is.na(peak_vertical_force))
+      
       create_log_entry(paste("Partial IMTP processing:", nrow(forcedecks_IMTP_clean), "total records"))
     } else {
       forcedecks_IMTP_clean <- existing_data$forcedecks_IMTP_clean
     }
     
-    # Nordboard processing (abbreviated)
+    # CRITICAL: Add body weight processing (was completely missing in partial)
+    bw_temp <- forcedecks_raw %>% 
+      select(any_of(c("vald_id", "body_weight_lbs", "date"))) %>% 
+      filter(!is.na(body_weight_lbs))
+    
+    if(nrow(bw_temp) > 0) {
+      bw <- bw_temp %>%
+        group_by(vald_id, date) %>%
+        summarise(body_weight_lbs = mean(body_weight_lbs, na.rm = TRUE), .groups = "drop") %>%
+        arrange(vald_id, date)
+      create_log_entry(paste("Partial body weight data processed:", nrow(bw), "records"))
+    } else {
+      bw <- data.frame(vald_id = character(0), date = as.Date(character(0)), body_weight_lbs = numeric(0))
+      create_log_entry("No body weight data in partial processing")
+    }
+    
+    # Nordboard processing WITH COMPLETE body weight integration and data type fix
     set_start_date(partial_start_date)
     injest_nordboard_tests <- get_nordbord_data()
     nordboard_temp <- injest_nordboard_tests$tests
     
     if(nrow(nordboard_temp) > 0) {
-      nordboard_clean <- nordboard_temp %>% 
+      nordboard_new <- nordboard_temp %>% 
         select(-any_of(c("device", "notes", "testTypeId"))) %>% 
+        mutate(
+          # CRITICAL: Fix testDateUtc data type mismatch by ensuring consistent handling
+          modifiedDateUtc_chr = as.character(modifiedDateUtc),
+          modifiedDateUtc_parsed = coalesce(
+            ymd_hms(modifiedDateUtc_chr, tz = "UTC", quiet = TRUE),
+            ymd_hm(modifiedDateUtc_chr,  tz = "UTC", quiet = TRUE),
+            ymd_h(modifiedDateUtc_chr,   tz = "UTC", quiet = TRUE),
+            ymd(modifiedDateUtc_chr,     tz = "UTC")
+          ),
+          modifiedDateUtc_local = with_tz(modifiedDateUtc_parsed, "America/Los_Angeles"),
+          date = as.Date(modifiedDateUtc_local),
+          time = hms::as_hms(modifiedDateUtc_local)
+        ) %>%
+        # CRITICAL: Remove testDateUtc to prevent data type mismatch
+        select(-any_of(c("modifiedDateUtc_chr", "modifiedDateUtc_parsed", "modifiedDateUtc_local", "modifiedDateUtc", "testDateUtc"))) %>% 
         mutate(
           test_ID = as.character(testId),  # Preserve test_ID
           vald_id = athleteId,
           test_type = testTypeName,
-          modifiedDateUtc_parsed = ymd_hms(modifiedDateUtc, tz = "UTC", quiet = TRUE),
-          modifiedDateUtc_local = with_tz(modifiedDateUtc_parsed, "America/Los_Angeles"),
-          date = as.Date(modifiedDateUtc_local),
-          time = hms::as_hms(modifiedDateUtc_local),
-          avg_force_left = leftAvgForce - leftCalibration,
-          max_force_left = leftMaxForce - leftCalibration,
-          avg_force_right = rightAvgForce - rightCalibration,
-          max_force_right = rightMaxForce - rightCalibration,
+          # COMPLETE asymmetry and force calculations
+          impulse_left = if_else(leftRepetitions == 0, NA_integer_, if_else(leftCalibration == 0, leftImpulse, NA_integer_)),
+          avg_force_left = if_else(leftRepetitions == 0, NA_integer_, leftAvgForce - leftCalibration),
+          max_force_left = if_else(leftRepetitions == 0, NA_integer_, leftMaxForce - leftCalibration),
+          impulse_right = if_else(rightRepetitions == 0, NA_integer_, if_else(rightCalibration == 0, rightImpulse, NA_integer_)),
+          avg_force_right = if_else(rightRepetitions == 0, NA_integer_, rightAvgForce - rightCalibration),
+          max_force_right = if_else(rightRepetitions == 0, NA_integer_, rightMaxForce - rightCalibration),
           reps_left = leftRepetitions,
           reps_right = rightRepetitions,
           avg_force_bilateral = rowMeans(cbind(avg_force_left, avg_force_right), na.rm = TRUE),
-          max_force_bilateral = rowMeans(cbind(max_force_left, max_force_right), na.rm = TRUE)
+          max_force_bilateral = rowMeans(cbind(max_force_left, max_force_right), na.rm = TRUE),
+          # COMPLETE asymmetry calculations
+          avg_force_asymmetry = case_when(
+            is.na(avg_force_left) | is.na(avg_force_right) ~ NA_integer_,
+            avg_force_left == 0 & avg_force_right == 0 ~ NA_integer_,
+            avg_force_left >= avg_force_right ~ ((avg_force_left - avg_force_right) / avg_force_left),
+            TRUE ~ ((avg_force_right - avg_force_left) / avg_force_right) 
+          ),
+          max_force_asymmetry = case_when(
+            is.na(max_force_left) | is.na(max_force_right) ~ NA_integer_,
+            max_force_left == 0 & max_force_right == 0 ~ NA_integer_,
+            max_force_left >= max_force_right ~ ((max_force_left - max_force_right) / max_force_left),
+            TRUE ~ ((max_force_right - max_force_left) / max_force_right) 
+          ),
+          impulse_asymmetry = case_when(
+            is.na(impulse_left) | is.na(impulse_right) ~ NA_integer_,
+            impulse_left == 0 & impulse_right == 0 ~ NA_integer_,
+            impulse_left >= impulse_right ~ ((impulse_left - impulse_right) / impulse_left),
+            TRUE ~ ((impulse_right - impulse_left) / impulse_right) 
+          )
         ) %>%
         select(-any_of(c("testTypeName", "athleteId", "testId", "leftTorque", "rightTorque", "leftMaxForce", 
-                  "rightMaxForce", "leftRepetitions", "rightRepetitions", "modifiedDateUtc_parsed", "modifiedDateUtc_local", "modifiedDateUtc"))) %>%
+                  "rightMaxForce", "leftRepetitions", "rightRepetitions"))) %>%
         left_join(processed_data$mergable_roster, by = "vald_id")
       
-      nordboard_clean <- safe_append_with_primary_key(nordboard_clean, existing_data$nordboard_clean, "test_ID", "Nordboard_PARTIAL")
+      # CRITICAL: Add missing body weight integration (complete logic from full processing)
+      if (nrow(bw) > 0) {
+        nordboard_new <- nordboard_new %>%
+          left_join(bw %>% 
+                      select(vald_id, date, body_weight_lbs) %>%  
+                      rename(bw_date = date) %>%  
+                      arrange(vald_id, bw_date),
+                    by = "vald_id", relationship = "many-to-many"
+          ) %>%
+          group_by(vald_id, date) %>%  
+          filter(bw_date <= date) %>%  
+          slice_max(bw_date, n = 1, with_ties = FALSE) %>%
+          ungroup() %>%
+          mutate(
+            # COMPLETE relative body weight calculations
+            max_force_relative_bw = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                           max_force_bilateral / body_weight_lbs, NA_real_),
+            max_force_left_relative_bw = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                                max_force_left / body_weight_lbs, NA_real_),
+            max_force_right_relative_bw = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                                 max_force_right / body_weight_lbs, NA_real_)
+          ) %>%
+          select(-any_of(c("bw_date", "body_weight_lbs")))
+      }
+      
+      nordboard_clean <- safe_append_with_primary_key(nordboard_new, existing_data$nordboard_clean, "test_ID", "Nordboard_PARTIAL")
       create_log_entry(paste("Partial Nordboard processing:", nrow(nordboard_clean), "total records"))
     } else {
       nordboard_clean <- existing_data$nordboard_clean
