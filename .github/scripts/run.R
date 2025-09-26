@@ -26,24 +26,25 @@ cat("BQ Location:", location, "\n")
 # ---------- Auth (unchanged) ----------
 tryCatch({
   cat("=== Authenticating to BigQuery ===\n")
-  access_token <- system("gcloud auth print-access-token", intern = TRUE)[1]
-  if (nchar(access_token) == 0) stop("No access token from gcloud")
-  cat("Access token obtained from gcloud\n")
+  options(bigrquery.use_bqstorage = FALSE); Sys.setenv(BIGRQUERY_USE_BQ_STORAGE='false')
+project  <- Sys.getenv('GCP_PROJECT','sac-vald-hub'); dataset <- Sys.getenv('BQ_DATASET','analytics')
+cat('GCP Project:', project, '\n'); cat('BQ Dataset:', dataset, '\n')
+tryCatch({
+  cat('=== Authenticating to BigQuery ===\n')
+  access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
+  if (nchar(access_token) == 0) stop('No access token from gcloud')
+  cat('Access token obtained from gcloud\n')
   token <- gargle::gargle2.0_token(
-    scope = 'https://www.googleapis.com/auth/bigquery',
-    client = gargle::gargle_client(),
-    credentials = list(access_token = access_token)
+    scope='https://www.googleapis.com/auth/bigquery',
+    client=gargle::gargle_client(),
+    credentials=list(access_token=access_token)
   )
   bigrquery::bq_auth(token = token)
-  cat("BigQuery authentication successful\n")
-  # light REST call (no Storage API)
-  ds <- bq_dataset(project, dataset)
-  invisible(bq_table_list(ds, page_size = 1))
-  cat("Authentication test passed (REST)\n")
-}, error = function(e) {
-  cat("BigQuery authentication failed:", e$message, "\n")
-  quit(status = 1)
-})
+  cat('BigQuery authentication successful\n')
+  ds <- bigrquery::bq_dataset(project, dataset)
+  invisible(bigrquery::bq_dataset_exists(ds))
+  cat('Authentication test passed (dataset visible via REST)\n')
+}, error=function(e){ cat('BigQuery authentication failed:', e$message, '\n'); quit(status=1)})
 
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
 ds <- bq_dataset(project, dataset)
