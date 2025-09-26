@@ -1,5 +1,10 @@
 name: R → BigQuery every 15m (WIF)
 
+on:
+  schedule:
+    - cron: "*/15 * * * *" # UTC; gate by Pacific hours below
+  workflow_dispatch:
+
 jobs:
   run:
     runs-on: ubuntu-latest
