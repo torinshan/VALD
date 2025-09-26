@@ -1,4 +1,4 @@
-name: "R \u2192 BigQuery every 15m (WIF)"
+name: R → BigQuery every 15m (WIF)
 true:
   schedule:
   - cron: '*/15 * * * *'
