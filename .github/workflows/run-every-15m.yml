@@ -1,150 +1,713 @@
-name: R → BigQuery every 15m (WIF)
+#!/usr/bin/env Rscript
 
-on:
-  schedule:
-    - cron: "*/15 * * * *" # UTC; gate by Pacific hours below
-  workflow_dispatch:
+tryCatch({
+  suppressPackageStartupMessages({
+    library(bigrquery); library(DBI)
+    library(dplyr); library(tidyr); library(readr); library(stringr)
+    library(purrr); library(tibble); library(data.table)
+    library(hms); library(lubridate)
+    library(httr); library(jsonlite); library(xml2); library(curl)
+    library(valdr); library(gargle); library(rlang); library(lifecycle)
+    library(glue); library(slider)
+  })
+}, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    concurrency:
-      group: vald-q15
-      cancel-in-progress: false
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      GCP_PROJECT: sac-vald-hub
-      BQ_DATASET: analytics
-      BIGRQUERY_USE_BQ_STORAGE: 'false'
-    steps:
-    - name: Show current time (UTC/PT)
-      run: 'echo "UTC now: $(date -u)"
+# Disable BigQuery Storage API to avoid readsessions permission
+options(bigrquery.use_bqstorage = FALSE)
+Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 
-        echo "LA  now: $(TZ=America/Los_Angeles date)"
+project  <- Sys.getenv("GCP_PROJECT",  "sac-vald-hub")
+dataset  <- Sys.getenv("BQ_DATASET",   "analytics")
+location <- Sys.getenv("BQ_LOCATION",  "US")
+cat("GCP Project:", project, "\n")
+cat("BQ Dataset:", dataset, "\n")
+cat("BQ Location:", location, "\n")
 
-        '
-    - name: "Gate to 06:00\u201319:59 PT"
-      id: gate
-      shell: bash
-      run: "LA_HOUR=$(TZ=America/Los_Angeles date +%H)\nif [ \"$LA_HOUR\" -ge 6 ]\
-        \ && [ \"$LA_HOUR\" -lt 20 ]; then\n  echo \"ok=true\" >> \"$GITHUB_OUTPUT\"\
-        \n  echo \"Proceeding (within 06:00\u201319:59 PT).\"\nelse\n  echo \"ok=false\"\
-        \ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00\u201319:59 PT \u2014 skipping.\"\
-        \nfi\n"
-    - name: Stop if gate says skip
-      if: steps.gate.outputs.ok != 'true'
-      run: exit 0
-    - uses: actions/checkout@v4
-      if: steps.gate.outputs.ok == 'true'
-    - name: Authenticate to Google Cloud (WIF)
-      id: auth
-      if: steps.gate.outputs.ok == 'true'
-      uses: google-github-actions/auth@v2
-      with:
-        workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
-        service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
-        create_credentials_file: true
-        token_format: access_token
-        access_token_lifetime: 3600s
-    - name: Setup gcloud SDK
-      if: steps.gate.outputs.ok == 'true'
-      uses: google-github-actions/setup-gcloud@v2
-      with:
-        project_id: sac-vald-hub
-        install_components: bq
-    - name: Test GCP Authentication
-      if: steps.gate.outputs.ok == 'true'
-      run: 'gcloud auth list
+# ---------- Auth ----------
+tryCatch({
+  cat("=== Authenticating to BigQuery ===\n")
+  access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
+  if (nchar(access_token) == 0) stop('No access token from gcloud')
+  cat('Access token obtained from gcloud\n')
+  token <- gargle::gargle2.0_token(
+    scope='https://www.googleapis.com/auth/bigquery',
+    client=gargle::gargle_client(),
+    credentials=list(access_token=access_token)
+  )
+  bigrquery::bq_auth(token = token)
+  cat('BigQuery authentication successful\n')
+  ds <- bigrquery::bq_dataset(project, dataset)
+  invisible(bigrquery::bq_dataset_exists(ds))
+  cat('Authentication test passed (dataset visible via REST)\n')
+}, error=function(e){ cat('BigQuery authentication failed:', e$message, '\n'); quit(status=1)})
 
-        bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
+con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
+ds <- bq_dataset(project, dataset)
+if (!bq_dataset_exists(ds)) {
+  bq_dataset_create(ds, location = location)
+  cat("Created BigQuery dataset:", dataset, "in", location, "\n")
+}
 
-        '
-    - uses: r-lib/actions/setup-r@v2
-      if: steps.gate.outputs.ok == 'true'
-      with:
-        use-public-rspm: true
-    - name: Install R dependencies (pak)
-      if: steps.gate.outputs.ok == 'true'
-      uses: r-lib/actions/setup-r-dependencies@v2
-      with:
-        extra-packages: 'DBI
-          bigrquery
-          dplyr
-          tidyr
-          readr
-          stringr
-          purrr
-          tibble
-          data.table
-          hms
-          lubridate
-          httr
-          jsonlite
-          xml2
-          curl
-          valdr
-          gargle
-          rlang
-          lifecycle
-          glue
-          slider'
-        cache: true
-    - name: System libs
-      if: steps.gate.outputs.ok == 'true'
-      run: "sudo apt-get update\nsudo apt-get install -y \\\n  libcurl4-openssl-dev\
-        \ libssl-dev libxml2-dev \\\n  libfontconfig1-dev libfreetype6-dev libpng-dev\
-        \ \\\n  libtiff5-dev libjpeg-dev zlib1g-dev \\\n  libharfbuzz-dev libfribidi-dev\
-        \ \\\n  libsecret-1-dev libsecret-1-0\n"
-    - name: Verify script exists
-      if: steps.gate.outputs.ok == 'true'
-      run: test -f .github/scripts/run.R
-    - name: Run R pipeline
-      if: steps.gate.outputs.ok == 'true'
-      env:
-        VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
-        VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-        VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-        VALD_REGION: use
-      run: 'set -e
+# ---------- Logging ----------
+log_entries <- tibble(
+  timestamp = as.POSIXct(character(0)), level = character(0), message = character(0),
+  run_id = character(0), repository = character(0)
+)
+create_log_entry <- function(message, level="INFO") {
+  ts <- Sys.time()
+  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  log_entries <<- bind_rows(log_entries, tibble(
+    timestamp = ts, level = level, message = message,
+    run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
+  ))
+}
+upload_logs_to_bigquery <- function() {
+  if (nrow(log_entries)==0) return(invisible(TRUE))
+  tryCatch({
+    log_tbl <- bq_table(ds, "vald_processing_log")
+    if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
+    bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
+    TRUE
+  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+}
 
-        Rscript .github/scripts/run.R
+script_start_time <- Sys.time()
+create_log_entry("=== VALD DATA PROCESSING SCRIPT STARTED ===", "START")
 
-        '
-    - name: Ensure BigQuery dataset exists
-      if: steps.gate.outputs.ok == 'true' && always()
-      run: 'bq mk --dataset --location=US "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset
-        exists or creation failed"
+# ---------- Helpers: REST-only reads, schema, upload ----------
+read_bq_table <- function(table_name) {
+  tbl <- bq_table(ds, table_name)
+  if (!bq_table_exists(tbl)) return(tibble())
+  q <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
+  tryCatch({
+    job_tbl <- bq_project_query(project, q, use_legacy_sql = FALSE)
+    bq_table_download(job_tbl, quiet = TRUE, use_bqstorage_api = FALSE)
+  }, error=function(e){ create_log_entry(paste("Read error", table_name, ":", e$message), "WARN"); tibble() })
+}
 
-        '
-    - name: Check processing logs (tail)
-      id: tail_logs
-      if: steps.gate.outputs.ok == 'true' && always()
-      run: "{\n  bq query --use_legacy_sql=false --location=US --format=pretty \\\n\
-        \    \"SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', timestamp) AS ts, level,\
-        \ message\n     FROM \\`${GCP_PROJECT}.${BQ_DATASET}.vald_processing_log\\\
-        `\n     WHERE run_id = '${{ github.run_id }}'\n     ORDER BY timestamp DESC\n\
-        \     LIMIT 30\";\n} 2>&1 | tee /tmp/log_tail.txt || echo \"No BigQuery logs\
-        \ found for this run.\"\necho 'last<<EOF' >> \"$GITHUB_OUTPUT\"\ncat /tmp/log_tail.txt\
-        \ >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"\n"
-    - name: Send failure notification
-      if: failure() && steps.gate.outputs.ok == 'true'
-      uses: dawidd6/action-send-mail@v3
-      with:
-        server_address: ${{ secrets.SMTP_HOST }}
-        server_port: ${{ secrets.SMTP_PORT }}
-        username: ${{ secrets.SMTP_USERNAME }}
-        password: ${{ secrets.SMTP_PASSWORD }}
-        subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
-        to: "torinshan@gmail.com, torin.shanahan@csus.edu"
-        from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
-        html_body: |
-          <p><strong>Status:</strong> Failed</p>
-          <p><strong>Repo:</strong> ${{ github.repository }}<br/>
-             <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
-             <strong>Commit:</strong> ${{ github.sha }}<br/>
-             <strong>Actor:</strong> ${{ github.actor }}</p>
-          <p><strong>Processing log (last 30 rows):</strong></p>
-          <pre>${{ steps.tail_logs.outputs.last }}</pre>
+ensure_table <- function(tbl, data, partition_field="date", cluster_fields=character()) {
+  if (bq_table_exists(tbl)) return(invisible(TRUE))
+  tp <- NULL
+  if (!is.null(partition_field) && partition_field %in% names(data)) {
+    tp <- bq_time_partition("DAY", field = partition_field)
+  }
+  cl <- intersect(cluster_fields, names(data))
+  bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering = cl)
+  create_log_entry(glue("Created table {tbl$table} (partition={partition_field}, cluster={paste(cl, collapse=',')} )"))
+  invisible(TRUE)
+}
+
+is_character_col <- function(colname) {
+  colname %in% c("name","full_name","given_name","family_name","email","team",
+                 "position","position_class","sport","sex","test_type","triallimb",
+                 "vald_id","test_ID","external_id","unit_of_measure","unit_of_measure_symbol",
+                 "definition","metric","r_name","group")
+}
+is_date_col <- function(colname) colname %in% c("date","date_of_birth")
+is_time_col <- function(colname) colname %in% c("time")
+is_integer_col <- function(colname) colname %in% c("height","reps_left","reps_right")
+
+standardize_data_types <- function(data, table_name) {
+  if (nrow(data) == 0) return(data)
+  # drop all-NA cols
+  data <- data[, names(data)[!vapply(data, function(x) all(is.na(x)), logical(1))], drop=FALSE]
+  for (cn in names(data)) {
+    x <- data[[cn]]
+    if (is_character_col(cn)) {
+      data[[cn]] <- as.character(x)
+    } else if (is_date_col(cn)) {
+      data[[cn]] <- as.Date(x)
+    } else if (is_time_col(cn)) {
+      data[[cn]] <- hms::as_hms(x)
+    } else if (is_integer_col(cn)) {
+      if (is.character(x)) suppressWarnings(data[[cn]] <- as.integer(as.numeric(x))) else data[[cn]] <- as.integer(x)
+    } else {
+      if (is.numeric(x)) data[[cn]] <- as.numeric(x) else suppressWarnings(data[[cn]] <- as.numeric(x))
+      data[[cn]][is.infinite(data[[cn]]) | is.nan(data[[cn]])] <- NA_real_
+    }
+  }
+  data
+}
+
+bq_upsert <- function(data, table_name, key="test_ID",
+                      mode=c("MERGE","TRUNCATE"),
+                      partition_field="date",
+                      cluster_fields=c("team","test_type","vald_id")) {
+  mode <- match.arg(mode)
+  data <- standardize_data_types(data, table_name)
+  tbl <- bq_table(ds, table_name)
+
+  if (nrow(data) == 0) { create_log_entry(paste("No rows to upload for", table_name)); return(TRUE) }
+
+  if (!bq_table_exists(tbl)) {
+    ensure_table(tbl, data, partition_field, cluster_fields)
+    bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
+    meta <- bq_table_meta(tbl)
+    create_log_entry(glue("Uploaded {meta$numRows %||% NA} rows to new table {table_name}"))
+    return(TRUE)
+  }
+
+  if (mode == "TRUNCATE") {
+    bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
+    meta <- bq_table_meta(tbl)
+    create_log_entry(glue("Truncated+uploaded; {table_name} now has {meta$numRows %||% NA} rows"))
+    return(TRUE)
+  }
+
+  # MERGE
+  stage <- bq_table(ds, paste0(table_name, "_stage"))
+  if (bq_table_exists(stage)) bq_table_delete(stage)
+  bq_table_create(stage, fields = as_bq_fields(data))
+  bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
+
+  cols <- names(data); if (!key %in% cols) stop(glue("Key {key} missing for {table_name}"))
+  up_cols <- setdiff(cols, key); if (length(up_cols)==0) stop(glue("No updatable cols for {table_name}"))
+
+  set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
+  insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
+  insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
+  sql <- glue("MERGE `{project}.{dataset}.{table_name}` T
+               USING `{project}.{dataset}.{table_name}_stage` S
+               ON T.`{key}`=S.`{key}`
+               WHEN MATCHED THEN UPDATE SET {set_clause}
+               WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})")
+  DBI::dbExecute(con, sql)
+  bq_table_delete(stage)
+  meta <- bq_table_meta(tbl)
+  create_log_entry(glue("MERGE complete; {table_name} now has {meta$numRows %||% NA} rows"))
+  TRUE
+}
+
+fix_rsi_data_type <- function() {
+  create_log_entry("Checking body_weight_lbs type in vald_fd_rsi")
+  q <- sprintf("SELECT data_type FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS`
+               WHERE table_name='vald_fd_rsi' AND column_name='body_weight_lbs'",
+               project, dataset)
+  tryCatch({
+    t <- DBI::dbGetQuery(con, q)
+    if (nrow(t) && identical(t$data_type[1], "STRING")) {
+      create_log_entry("Converting body_weight_lbs STRING -> FLOAT64")
+      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64", project, dataset))
+      DBI::dbExecute(con, sprintf("UPDATE `%s.%s.vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64)", project, dataset))
+      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` DROP COLUMN body_weight_lbs", project, dataset))
+      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs", project, dataset))
+      create_log_entry("Converted body_weight_lbs to FLOAT64")
+    } else {
+      create_log_entry("body_weight_lbs already FLOAT64 or column missing")
+    }
+  }, error=function(e){ create_log_entry(paste("RSI type fix:", e$message), "WARN") })
+}
+
+# ---------- Current BQ state ----------
+create_log_entry("=== READING CURRENT DATA STATE FROM BIGQUERY ===")
+current_dates <- read_bq_table("dates") %>% select(date) %>% distinct() %>% mutate(date = as.Date(date))
+if (nrow(current_dates)==0) current_dates <- tibble(date = as.Date(character(0)))
+tests_tbl <- read_bq_table("tests") %>% mutate(test_ID = as.character(test_ID)) %>% distinct()
+
+latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=TRUE) else as.Date("1900-01-01")
+count_tests_current <- nrow(tests_tbl)
+create_log_entry(glue("Current state - Latest date: {latest_date_current} Test count: {count_tests_current}"))
+
+# ---------- Backfill missing team/position data ----------
+create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
+Vald_roster_backfill <- read_bq_table("vald_roster")
+
+total_backfilled <- 0
+
+if (nrow(Vald_roster_backfill) > 0) {
+  # Check each table for missing team/position and backfill
+  tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
+                       "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
+  
+  for (table_name in tables_to_check) {
+    tryCatch({
+      existing_data <- read_bq_table(table_name)
+      
+      if (nrow(existing_data) > 0) {
+        # Find records missing team or position
+        missing_info <- existing_data %>%
+          filter(is.na(team) | is.na(position) | team == "" | position == "") %>%
+          select(test_ID, vald_id) %>%
+          distinct()
+        
+        if (nrow(missing_info) > 0) {
+          create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
+          
+          # Get the roster info for these athletes
+          roster_updates <- missing_info %>%
+            left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id") %>%
+            filter(!is.na(team) | !is.na(position))
+          
+          if (nrow(roster_updates) > 0) {
+            create_log_entry(glue("Updating {nrow(roster_updates)} records in {table_name} with roster data"))
+            
+            # Get full records and update team/position
+            records_to_update <- existing_data %>%
+              filter(test_ID %in% roster_updates$test_ID) %>%
+              select(-team, -position, -sport) %>%
+              left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id")
+            
+            if (nrow(records_to_update) > 0) {
+              # Use MERGE mode to update these specific records
+              bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
+                       partition_field = "date", cluster_fields = c("team", "vald_id"))
+              create_log_entry(glue("Successfully backfilled team/position for {nrow(records_to_update)} records in {table_name}"))
+              total_backfilled <- total_backfilled + nrow(records_to_update)
+            }
+          } else {
+            create_log_entry(glue("No roster matches found for missing records in {table_name}"), "WARN")
+          }
+        } else {
+          create_log_entry(glue("All records in {table_name} have complete team/position data"))
+        }
+      } else {
+        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
+      }
+    }, error = function(e) {
+      create_log_entry(glue("Error checking {table_name} for missing data: {e$message}"), "WARN")
+    })
+  }
+  
+  if (total_backfilled > 0) {
+    create_log_entry(glue("=== BACKFILL COMPLETE: Updated {total_backfilled} total records across all tables ==="))
+  } else {
+    create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
+  }
+} else {
+  create_log_entry("No vald_roster found - skipping team/position backfill", "WARN")
+}
+
+# ---------- Gate: run only if EITHER date OR count differ ----------
+create_log_entry("Probing VALD API for tests-only to compare date & count")
+all_tests_probe <- get_forcedecks_tests_only(start_date = NULL)
+
+probe_df <- as_tibble(all_tests_probe) %>%
+  mutate(
+    recorded_parsed = suppressWarnings(lubridate::ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE)),
+    recorded_local = dplyr::if_else(
+      recordedDateTimezone %in% c("Pacific Standard Time","Pacific Daylight Time","Pacific Time"),
+      with_tz(recorded_parsed, "America/Los_Angeles"),
+      recorded_parsed
+    ),
+    date = as.Date(recorded_local),
+    test_ID = as.character(testId)
+  )
+
+api_latest_date <- suppressWarnings(max(probe_df$date, na.rm = TRUE))
+api_test_count <- dplyr::n_distinct(probe_df$test_ID)
+
+create_log_entry(glue("API data - Latest date: {api_latest_date} Test count: {api_test_count}"))
+date_mismatch  <- !identical(api_latest_date, latest_date_current)
+count_mismatch <- api_test_count != count_tests_current
+create_log_entry(glue("date_mismatch: {date_mismatch}"))
+create_log_entry(glue("count_mismatch: {count_mismatch}"))
+
+# Exit only if NEITHER date NOR count differ
+if (!date_mismatch && !count_mismatch) {
+  create_log_entry("No changes detected - date and count both match. Exiting.")
+  create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
+  upload_logs_to_bigquery(); try(DBI::dbDisconnect(con), silent=TRUE); quit(status=0)
+}
+
+create_log_entry(glue("Changes detected - Running update (date_mismatch: {date_mismatch}, count_mismatch: {count_mismatch})"))
+
+# ---------- Overlap start date (latest - 1 day), then fetch ----------
+overlap_days <- 1L
+start_dt <- latest_date_current - lubridate::days(overlap_days)
+set_start_date(sprintf("%sT00:00:00Z", start_dt))
+create_log_entry(glue("Running with overlap start: {start_dt}T00:00:00Z"))
+
+create_log_entry("Fetching ForceDecks data from VALD API...")
+injest_fd <- get_forcedecks_data()
+
+profiles <- as.data.table(injest_fd$profiles)
+definitions <- as.data.table(injest_fd$result_definitions)
+tests <- as.data.table(injest_fd$tests)
+trials <- as.data.table(injest_fd$trials)
+
+roster <- as_tibble(profiles)[, c("profileId","givenName","familyName")] %>%
+  mutate(full_name = paste(trimws(givenName), trimws(familyName)),
+         vald_id = as.character(profileId)) %>%
+  select(vald_id, full_name)
+
+tests_processed <- as_tibble(tests) %>%
+  mutate(
+    vald_id = as.character(profileId),
+    test_type = testType,
+    test_ID = as.character(testId),
+    recordedDateUtc_parsed = lubridate::ymd_hms(recordedDateUtc, tz = "UTC", quiet = TRUE),
+    recordedDateUtc_local = dplyr::if_else(
+      recordedDateTimezone %in% c("Pacific Standard Time","Pacific Daylight Time","Pacific Time"),
+      lubridate::with_tz(recordedDateUtc_parsed, "America/Los_Angeles"),
+      recordedDateUtc_parsed
+    ),
+    date = as.Date(recordedDateUtc_local),
+    time = hms::as_hms(recordedDateUtc_local)
+  ) %>%
+  select(-testId, -tenantId, -profileId, -testType, -weight,
+         -analysedDateUtc, -analysedDateOffset, -analysedDateTimezone,
+         -recordedDateUtc_parsed, -recordedDateUtc_local, -recordedDateUtc,
+         -recordedDateOffset, -recordedDateTimezone, -recordingId)
+
+new_test_types <- sort(unique(tests_processed$test_type))
+create_log_entry(glue("New ForceDecks test types present: {paste(new_test_types, collapse=', ')}"))
+
+trials_wider <- as_tibble(trials) %>%
+  tidyr::pivot_wider(
+    id_cols = c(testId, trialId, athleteId, recordedUTC, recordedTimezone, trialLimb),
+    names_from = definition_result, values_from = value, values_fn = dplyr::first
+  ) %>%
+  mutate(
+    recordedUTC_parsed = ymd_hms(recordedUTC, tz="UTC", quiet=TRUE),
+    recordedUTC_local = dplyr::if_else(
+      recordedTimezone %in% c("Pacific Standard Time","Pacific Daylight Time","Pacific Time"),
+      lubridate::with_tz(recordedUTC_parsed, "America/Los_Angeles"),
+      recordedUTC_parsed
+    ),
+    date = as.Date(recordedUTC_local), time = hms::as_hms(recordedUTC_local)
+  ) %>%
+  select(-recordedUTC_parsed, -recordedUTC_local) %>%
+  rename_with(tolower)
+
+mergable_trials <- trials_wider %>%
+  mutate(test_ID = as.character(testid)) %>%
+  group_by(test_ID) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm=TRUE)),
+            triallimb = first(triallimb),
+            date = first(date), time = first(time),
+            athleteid = first(athleteid), .groups="drop") %>%
+  mutate(vald_id = as.character(athleteid)) %>% select(-athleteid)
+
+Vald_roster <- Vald_roster_backfill
+if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
+mergable_roster <- roster %>% left_join(Vald_roster %>% select(vald_id, position, sport, team), by="vald_id")
+
+forcedecks_raw <- mergable_trials %>%
+  left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+  left_join(mergable_roster, by="vald_id") %>%
+  mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
+
+bw <- forcedecks_raw %>%
+  select(vald_id, date, body_weight_lbs) %>%
+  filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
+  summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
+  arrange(vald_id, date)
+
+attach_bw <- function(df) {
+  if (!all(c("vald_id","date") %in% names(df))) return(df)
+  if (nrow(bw)==0) {
+    create_log_entry("No body weight data available for attachment", "WARN")
+    return(df)
+  }
+  dt <- as.data.table(df); bw_dt <- as.data.table(bw)
+  setkey(bw_dt, vald_id, date); setkey(dt, vald_id, date)
+  dt[bw_dt, body_weight_lbs := i.body_weight_lbs, roll=Inf, on=.(vald_id, date)]
+  as_tibble(dt)
+}
+
+# -------- Sections (gated) --------
+# CMJ: TRUNCATE
+if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
+  create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
+  cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
+  cmj_new <- cmj_temp %>%
+    select(any_of(c(
+      "test_ID","vald_id","full_name","position","team","test_type","date","time","body_weight_lbs",
+      "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
+      "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration","mean_ecc_con_ratio",
+      "mean_takeoff_velocity","peak_landing_velocity","peak_takeoff_force","peak_takeoff_velocity",
+      "concentric_rfd_100","start_to_peak_force_time","contraction_time","concentric_duration",
+      "eccentric_concentric_duration_ratio","flight_eccentric_time_ratio","displacement_at_takeoff",
+      "rsi_modified_imp_mom","positive_takeoff_impulse","positive_impulse","concentric_impulse",
+      "eccentric_braking_impulse","total_work","relative_peak_landing_force",
+      "relative_peak_concentric_force","relative_peak_eccentric_force","bm_rel_force_at_zero_velocity",
+      "landing_impulse","force_at_zero_velocity","cmj_stiffness","braking_phase_duration",
+      "takeoff_velocity","eccentric_time","peak_landing_acceleration","peak_takeoff_acceleration",
+      "concentric_rfd_200","eccentric_peak_power"
+    ))) %>%
+    filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
+
+  cmj_existing <- read_bq_table("vald_fd_jumps") %>% mutate(test_ID = as.character(test_ID))
+  cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
+
+  fd <- cmj_all %>% arrange(full_name, test_type, date) %>% group_by(full_name, test_type) %>%
+    mutate(
+      mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      zscore_jump_height_inches_imp_mom = if_else(sd_30d_jh > 0, (jump_height_inches_imp_mom - mean_30d_jh)/sd_30d_jh, NA_real_),
+      mean_30d_rpcf = slide_index_dbl(relative_peak_concentric_force, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      sd_30d_rpcf   = slide_index_dbl(relative_peak_concentric_force, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      zscore_relative_peak_concentric_force = if_else(sd_30d_rpcf > 0, (relative_peak_concentric_force - mean_30d_rpcf)/sd_30d_rpcf, NA_real_),
+      mean_30d_rsi = slide_index_dbl(rsi_modified_imp_mom, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      sd_30d_rsi   = slide_index_dbl(rsi_modified_imp_mom, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
+    ) %>% ungroup() %>%
+    group_by(full_name) %>%
+    mutate(
+      cmj_mask = (test_type == "CMJ"),
+      jh_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, jump_height_inches_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+      rsi_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, rsi_modified_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+      epf_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, relative_peak_eccentric_force, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+      jump_height_readiness = if_else(!is.na(jump_height_inches_imp_mom) & !is.na(jh_cmj_mean_30d) & jh_cmj_mean_30d != 0,
+                                      (jump_height_inches_imp_mom - jh_cmj_mean_30d)/jh_cmj_mean_30d, NA_real_),
+      rsi_readiness = if_else(!is.na(rsi_modified_imp_mom) & !is.na(rsi_cmj_mean_30d) & rsi_cmj_mean_30d != 0,
+                              (rsi_modified_imp_mom - rsi_cmj_mean_30d)/rsi_cmj_mean_30d, NA_real_),
+      epf_readiness = if_else(!is.na(relative_peak_eccentric_force) & !is.na(epf_cmj_mean_30d) & epf_cmj_mean_30d != 0,
+                              (relative_peak_eccentric_force - epf_cmj_mean_30d)/epf_cmj_mean_30d, NA_real_)
+    ) %>%
+    ungroup() %>%
+    filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
+    select(-starts_with("mean_30d_"), -starts_with("sd_30d_"), -cmj_mask,
+           -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"))
+
+  if (all(c("jump_height_inches_imp_mom","relative_peak_eccentric_force",
+            "bodymass_relative_takeoff_power","rsi_modified_imp_mom") %in% names(fd))) {
+    fd <- fd %>%
+      mutate(calc_performance_score =
+               percent_rank(jump_height_inches_imp_mom) * 100 +
+               percent_rank(relative_peak_eccentric_force) * 100 +
+               percent_rank(bodymass_relative_takeoff_power) * 100 +
+               percent_rank(rsi_modified_imp_mom) * 100,
+             performance_score = percent_rank(calc_performance_score) * 100) %>%
+      group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+      ungroup() %>% select(-calc_performance_score)
+  }
+  bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
+            partition_field="date", cluster_fields=c("team","test_type","vald_id"))
+} else create_log_entry("No new CMJ-family tests - skipping CMJ section")
+
+# DJ: MERGE
+if ("DJ" %in% new_test_types) {
+  create_log_entry("Processing DJ")
+  dj_new <- forcedecks_raw %>% filter(test_type=="DJ") %>%
+    select(any_of(c(
+      "test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "peak_takeoff_velocity","peak_landing_velocity","countermovement_depth","peak_landing_force",
+      "eccentric_time","jump_height_inches_imp_mom","bm_rel_force_at_zero_velocity","contact_time",
+      "contact_velocity","active_stiffness","passive_stiffness","reactive_strength_index",
+      "positive_takeoff_impulse","coefficient_of_restitution","active_stiffness_index",
+      "passive_stiffness_index","peak_impact_force","peak_driveoff_force"
+    ))) %>%
+    filter(!is.na(jump_height_inches_imp_mom), jump_height_inches_imp_mom>2, jump_height_inches_imp_mom<30) %>%
+    mutate(
+      velocity_ratio = if_else(!is.na(peak_takeoff_velocity) & !is.na(peak_landing_velocity) & peak_landing_velocity != 0,
+                               peak_takeoff_velocity/peak_landing_velocity, NA_real_),
+      force_ratio    = if_else(!is.na(peak_impact_force) & !is.na(peak_driveoff_force) & peak_driveoff_force != 0,
+                               peak_impact_force/peak_driveoff_force, NA_real_),
+      stiffness_ratio = if_else(!is.na(active_stiffness) & !is.na(passive_stiffness) & passive_stiffness != 0,
+                                active_stiffness/passive_stiffness, NA_real_)
+    )
+  bq_upsert(dj_new, "vald_fd_dj", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No new DJ tests - skipping DJ section")
+
+# RSI: MERGE
+if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
+  create_log_entry("Processing RSI")
+  rsi_new <- trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
+    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    filter(test_type %in% c("RSAIP","RSHIP","RSKIP")) %>%
+    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
+    select(any_of(c(
+      "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "start_to_peak_force","peak_vertical_force","rfd_at_100ms","rfd_at_250ms",
+      "iso_bm_rel_force_peak","iso_bm_rel_force_100","iso_bm_rel_force_200","iso_abs_impulse_100"
+    ))) %>%
+    group_by(test_ID, vald_id, triallimb) %>%
+    summarise(across(any_of(c("full_name","position","team")), first),
+              across(any_of(c("date","time","body_weight_lbs")), first),
+              across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+    tidyr::pivot_wider(
+      id_cols = any_of(c("test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs")),
+      names_from = triallimb, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs),
+      names_sep = "_"
+    ) %>%
+    rename_with(~str_replace(.x, "_Left$", "_left")) %>%
+    rename_with(~str_replace(.x, "_Right$", "_right"))
+  bq_upsert(rsi_new, "vald_fd_rsi", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No new RSI tests - skipping RSI section")
+
+# Rebound: MERGE
+if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
+  create_log_entry("Processing Rebound")
+  rebound_new <- trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
+    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    filter(test_type %in% c("CMRJ","SLCMRJ")) %>%
+    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
+    select(any_of(c(
+      "triallimb","test_ID","test_type","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "cmrj_takeoff_bm_rel_peak_force","cmrj_takeoff_countermovement_depth",
+      "cmrj_takeoff_concentric_peak_force","cmrj_takeoff_contraction_time","cmrj_takeoff_ecc_decel_impulse",
+      "cmrj_takeoff_ecc_duration","cmrj_takeoff_bm_rel_ecc_peak_force","cmrj_takeoff_jump_height_imp_mom_inches",
+      "cmrj_takeoff_rsi_modified_imp_mom","cmrj_rebound_active_stiffness","cmrj_rebound_active_stiffness_index",
+      "cmrj_rebound_contact_time","cmrj_rebound_countermovement_depth","cmrj_rebound_passive_stiffness",
+      "cmrj_rebound_passive_stiffness_index","cmrj_rebound_jump_height_imp_mom_inches"
+    ))) %>%
+    group_by(test_ID, vald_id, test_type, triallimb) %>%
+    summarise(across(any_of(c("full_name","position","team")), first),
+              across(any_of(c("date","time","body_weight_lbs")), first),
+              across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+    mutate(limb_suffix = case_when(
+      test_type == "CMRJ" ~ "bilateral",
+      test_type == "SLCMRJ" & triallimb == "Left" ~ "left",
+      test_type == "SLCMRJ" & triallimb == "Right" ~ "right",
+      TRUE ~ "bilateral"
+    )) %>%
+    tidyr::pivot_wider(
+      id_cols = any_of(c("test_ID","vald_id","test_type","full_name","position","team","date","time","body_weight_lbs")),
+      names_from = limb_suffix, values_from = -c(test_ID, vald_id, test_type, full_name, position, team, date, time, body_weight_lbs),
+      names_sep = "_"
+    )
+  bq_upsert(rebound_new, "vald_fd_rebound", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No new Rebound tests - skipping Rebound section")
+
+# SLJ: MERGE
+if ("SLJ" %in% new_test_types) {
+  create_log_entry("Processing SLJ")
+  slj_new <- trials_wider %>%
+    mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
+    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    filter(test_type == "SLJ") %>%
+    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
+    select(any_of(c(
+      "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "peak_landing_force","peak_landing_velocity","peak_takeoff_velocity","time_to_peak_force",
+      "weight_relative_peak_takeoff_force","weight_relative_peak_landing_force",
+      "relative_peak_concentric_force","relative_peak_eccentric_force","lower_limb_stiffness",
+      "rsi_modified_imp_mom"
+    ))) %>%
+    group_by(test_ID, vald_id, triallimb) %>%
+    summarise(across(any_of(c("full_name","position","team")), first),
+              across(any_of(c("date","time","body_weight_lbs")), first),
+              across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+    tidyr::pivot_wider(
+      id_cols = any_of(c("test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs")),
+      names_from = triallimb, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs),
+      names_sep = "_"
+    ) %>%
+    rename_with(~str_replace(.x, "_Left$", "_left")) %>%
+    rename_with(~str_replace(.x, "_Right$", "_right"))
+  bq_upsert(slj_new, "vald_fd_sl_jumps", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No new SLJ tests - skipping SLJ section")
+
+# IMTP: MERGE
+if ("IMTP" %in% new_test_types) {
+  create_log_entry("Processing IMTP")
+  imtp_new <- forcedecks_raw %>% filter(test_type=="IMTP") %>%
+    select(any_of(c(
+      "test_ID","vald_id","full_name","position","team","date","time",
+      "start_to_peak_force","rfd_at_100ms","rfd_at_200ms","force_at_100ms",
+      "iso_bm_rel_force_peak","peak_vertical_force","force_at_200ms"
+    ))) %>%
+    filter(!is.na(peak_vertical_force)) %>% arrange(full_name, date)
+
+  if (all(c("peak_vertical_force","start_to_peak_force","rfd_at_100ms") %in% names(imtp_new))) {
+    imtp_new <- imtp_new %>%
+      mutate(calc_performance_score = percent_rank(peak_vertical_force) * 200 +
+               (100 - percent_rank(start_to_peak_force) * 100) +
+               percent_rank(rfd_at_100ms) * 100,
+             performance_score = percent_rank(calc_performance_score) * 100) %>%
+      group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+      ungroup() %>% select(-calc_performance_score)
+  }
+  bq_upsert(imtp_new, "vald_fd_imtp", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No new IMTP tests - skipping IMTP section")
+
+# Nordbord: MERGE (pull only if returned)
+create_log_entry("Fetching Nordbord data from VALD API...")
+injest_nord <- get_nordbord_data()
+nord_tests <- injest_nord$tests
+if (nrow(nord_tests) > 0) {
+  create_log_entry(glue("Processing Nordbord ({nrow(nord_tests)} tests)"))
+  nb <- as_tibble(nord_tests) %>%
+    select(-any_of(c("device","notes","testTypeId"))) %>%
+    mutate(
+      modifiedDateUtc_chr = as.character(modifiedDateUtc),
+      modifiedDateUtc_parsed = coalesce(
+        ymd_hms(modifiedDateUtc_chr, tz="UTC", quiet=TRUE),
+        ymd_hm(modifiedDateUtc_chr,  tz="UTC", quiet=TRUE),
+        ymd_h(modifiedDateUtc_chr,   tz="UTC", quiet=TRUE),
+        ymd(modifiedDateUtc_chr,     tz="UTC")
+      ),
+      modifiedDateUtc_local = with_tz(modifiedDateUtc_parsed, "America/Los_Angeles"),
+      date = as.Date(modifiedDateUtc_local),
+      time = hms::as_hms(modifiedDateUtc_local),
+      vald_id = athleteId,
+      test_ID = as.character(testId),
+      test_type = testTypeName,
+      impulse_left  = if_else(leftRepetitions==0, NA_real_, if_else(leftCalibration==0, leftImpulse, NA_real_)),
+      avg_force_left = if_else(leftRepetitions==0, NA_real_, leftAvgForce - leftCalibration),
+      max_force_left = if_else(leftRepetitions==0, NA_real_, leftMaxForce - leftCalibration),
+      impulse_right  = if_else(rightRepetitions==0, NA_real_, if_else(rightCalibration==0, rightImpulse, NA_real_)),
+      avg_force_right = if_else(rightRepetitions==0, NA_real_, rightAvgForce - rightCalibration),
+      max_force_right = if_else(rightRepetitions==0, NA_real_, rightMaxForce - rightCalibration),
+      reps_left  = leftRepetitions, reps_right = rightRepetitions,
+      avg_force_bilateral = rowMeans(cbind(avg_force_left, avg_force_right), na.rm = TRUE),
+      max_force_bilateral = rowMeans(cbind(max_force_left, max_force_right), na.rm = TRUE),
+      avg_force_asymmetry = case_when(
+        is.na(avg_force_left) | is.na(avg_force_right) ~ NA_real_,
+        avg_force_left == 0 & avg_force_right == 0 ~ NA_real_,
+        avg_force_left >= avg_force_right ~ ((avg_force_left - avg_force_right) / avg_force_left),
+        TRUE ~ ((avg_force_right - avg_force_left) / avg_force_right)
+      ),
+      max_force_asymmetry = case_when(
+        is.na(max_force_left) | is.na(max_force_right) ~ NA_real_,
+        max_force_left == 0 & max_force_right == 0 ~ NA_real_,
+        max_force_left >= max_force_right ~ ((max_force_left - max_force_right) / max_force_left),
+        TRUE ~ ((max_force_right - max_force_left) / max_force_right)
+      ),
+      impulse_asymmetry = case_when(
+        is.na(impulse_left) | is.na(impulse_right) ~ NA_real_,
+        impulse_left == 0 & impulse_right == 0 ~ NA_real_,
+        impulse_left >= impulse_right ~ ((impulse_left - impulse_right) / impulse_left),
+        TRUE ~ ((impulse_right - impulse_left) / impulse_right)
+      )
+    ) %>%
+    select(-any_of(c("modifiedDateUtc_chr","modifiedDateUtc_parsed","modifiedDateUtc_local",
+                     "modifiedDateUtc","testDateUtc","athleteId","testId",
+                     "leftTorque","rightTorque","leftMaxForce","rightMaxForce",
+                     "leftRepetitions","rightRepetitions","testTypeName"))) %>%
+    left_join(mergable_roster, by="vald_id") %>%
+    attach_bw()
+
+  if ("body_weight_lbs" %in% names(nb)) {
+    nb <- nb %>%
+      mutate(
+        max_force_relative_bw = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                        max_force_bilateral / body_weight_lbs, NA_real_),
+        max_force_left_relative_bw  = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                              max_force_left / body_weight_lbs, NA_real_),
+        max_force_right_relative_bw = if_else(!is.na(body_weight_lbs) & body_weight_lbs != 0,
+                                              max_force_right / body_weight_lbs, NA_real_)
+      ) %>%
+      select(-any_of("body_weight_lbs"))
+  }
+  bq_upsert(nb, "vald_nord_all", key="test_ID", mode="MERGE",
+            partition_field="date", cluster_fields=c("team","vald_id"))
+} else create_log_entry("No Nordbord tests - skipping Nordbord section")
+
+# Dates & Tests
+dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
+tests_delta <- forcedecks_raw %>% select(test_ID) %>% distinct()
+bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
+bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = character())
+
+# RSI fix (non-destructive)
+fix_rsi_data_type()
+
+create_log_entry("=== SCRIPT EXECUTION SUMMARY ===")
+create_log_entry(sprintf("Total execution time: %s minutes", round(difftime(Sys.time(), script_start_time, units="mins"),2)))
+create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
+upload_logs_to_bigquery()
+try(DBI::dbDisconnect(con), silent = TRUE)
+cat("Script completed successfully\n")
