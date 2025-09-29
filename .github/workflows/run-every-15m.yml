@@ -129,7 +129,7 @@ jobs:
         \     LIMIT 30\";\n} 2>&1 | tee /tmp/log_tail.txt || echo \"No BigQuery logs\
         \ found for this run.\"\necho 'last<<EOF' >> \"$GITHUB_OUTPUT\"\ncat /tmp/log_tail.txt\
         \ >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"\n"
-    - name: Email on failure
+    - name: Send failure notification
       if: failure() && steps.gate.outputs.ok == 'true'
       uses: dawidd6/action-send-mail@v3
       with:
@@ -137,13 +137,14 @@ jobs:
         server_port: ${{ secrets.SMTP_PORT }}
         username: ${{ secrets.SMTP_USERNAME }}
         password: ${{ secrets.SMTP_PASSWORD }}
-        subject: "VALD q15 FAILED \u2014 run #${{ github.run_number }} on ${{ github.ref_name\
-          \ }}"
+        subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
         to: "torinshan@gmail.com, torin.shanahan@csus.edu"
         from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
-        html_body: "<p><strong>Status:</strong> Failed</p>\n<p><strong>Repo:</strong>\
-          \ ${{ github.repository }}<br/>\n   <strong>Run:</strong> <a href=\"https://github.com/${{\
-          \ github.repository }}/actions/runs/${{ github.run_id }}\">Open in GitHub</a><br/>\n\
-          \   <strong>Commit:</strong> ${{ github.sha }}<br/>\n   <strong>Actor:</strong>\
-          \ ${{ github.actor }}</p>\n<p><strong>Processing log (last 30 rows):</strong></p>\n\
-          <pre>${{ steps.tail_logs.outputs.last }}</pre>"
+        html_body: |
+          <p><strong>Status:</strong> Failed</p>
+          <p><strong>Repo:</strong> ${{ github.repository }}<br/>
+             <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
+             <strong>Commit:</strong> ${{ github.sha }}<br/>
+             <strong>Actor:</strong> ${{ github.actor }}</p>
+          <p><strong>Processing log (last 30 rows):</strong></p>
+          <pre>${{ steps.tail_logs.outputs.last }}</pre>
