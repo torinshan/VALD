@@ -23,14 +23,9 @@ cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
 
-# ---------- Auth (unchanged) ----------
+# ---------- Auth ----------
 tryCatch({
   cat("=== Authenticating to BigQuery ===\n")
-  options(bigrquery.use_bqstorage = FALSE); Sys.setenv(BIGRQUERY_USE_BQ_STORAGE='false')
-project  <- Sys.getenv('GCP_PROJECT','sac-vald-hub'); dataset <- Sys.getenv('BQ_DATASET','analytics')
-cat('GCP Project:', project, '\n'); cat('BQ Dataset:', dataset, '\n')
-tryCatch({
-  cat('=== Authenticating to BigQuery ===\n')
   access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
   if (nchar(access_token) == 0) stop('No access token from gcloud')
   cat('Access token obtained from gcloud\n')
@@ -214,7 +209,65 @@ latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=
 count_tests_current <- nrow(tests_tbl)
 create_log_entry(glue("Current state - Latest date: {latest_date_current} Test count: {count_tests_current}"))
 
-# ---------- Gate: run only if BOTH date and count differ ----------
+# ---------- Backfill missing team/position data ----------
+create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
+Vald_roster_backfill <- read_bq_table("vald_roster")
+
+if (nrow(Vald_roster_backfill) > 0) {
+  # Check each table for missing team/position and backfill
+  tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
+                       "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
+  
+  for (table_name in tables_to_check) {
+    tryCatch({
+      existing_data <- read_bq_table(table_name)
+      
+      if (nrow(existing_data) > 0) {
+        # Find records missing team or position
+        missing_info <- existing_data %>%
+          filter(is.na(team) | is.na(position) | team == "" | position == "") %>%
+          select(test_ID, vald_id) %>%
+          distinct()
+        
+        if (nrow(missing_info) > 0) {
+          create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
+          
+          # Get the roster info for these athletes
+          roster_updates <- missing_info %>%
+            left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id") %>%
+            filter(!is.na(team) | !is.na(position))
+          
+          if (nrow(roster_updates) > 0) {
+            create_log_entry(glue("Updating {nrow(roster_updates)} records in {table_name} with roster data"))
+            
+            # Get full records and update team/position
+            records_to_update <- existing_data %>%
+              filter(test_ID %in% roster_updates$test_ID) %>%
+              select(-any_of(c("team", "position", "sport"))) %>%
+              left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id")
+            
+            if (nrow(records_to_update) > 0) {
+              # Use MERGE mode to update these specific records
+              bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
+                       partition_field = "date", cluster_fields = c("team", "vald_id"))
+              create_log_entry(glue("Successfully backfilled team/position for {nrow(records_to_update)} records in {table_name}"))
+            }
+          } else {
+            create_log_entry(glue("No roster matches found for missing records in {table_name}"), "WARN")
+          }
+        } else {
+          create_log_entry(glue("All records in {table_name} have complete team/position data"))
+        }
+      }
+    }, error = function(e) {
+      create_log_entry(glue("Error checking {table_name} for missing data: {e$message}"), "WARN")
+    })
+  }
+} else {
+  create_log_entry("No vald_roster found - skipping team/position backfill", "WARN")
+}
+
+# ---------- Gate: run only if EITHER date OR count differ ----------
 create_log_entry("Probing VALD API for tests-only to compare date & count")
 all_tests_probe <- get_forcedecks_tests_only(start_date = NULL)
 
@@ -239,11 +292,14 @@ count_mismatch <- api_test_count != count_tests_current
 create_log_entry(glue("date_mismatch: {date_mismatch}"))
 create_log_entry(glue("count_mismatch: {count_mismatch}"))
 
-if (!(date_mismatch && count_mismatch)) {
-  create_log_entry("No run: both date and test count do not differ — exiting.")
+# Exit only if NEITHER date NOR count differ
+if (!date_mismatch && !count_mismatch) {
+  create_log_entry("No changes detected - date and count both match. Exiting.")
   create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
   upload_logs_to_bigquery(); try(DBI::dbDisconnect(con), silent=TRUE); quit(status=0)
 }
+
+create_log_entry(glue("Changes detected - Running update (date_mismatch: {date_mismatch}, count_mismatch: {count_mismatch})"))
 
 # ---------- Overlap start date (latest - 1 day), then fetch ----------
 overlap_days <- 1L
@@ -312,7 +368,7 @@ mergable_trials <- trials_wider %>%
             athleteid = first(athleteid), .groups="drop") %>%
   mutate(vald_id = as.character(athleteid)) %>% select(-athleteid)
 
-Vald_roster <- read_bq_table("vald_roster")
+Vald_roster <- Vald_roster_backfill
 if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
 mergable_roster <- roster %>% left_join(Vald_roster %>% select(vald_id, position, sport, team), by="vald_id")
 
@@ -329,7 +385,10 @@ bw <- forcedecks_raw %>%
 
 attach_bw <- function(df) {
   if (!all(c("vald_id","date") %in% names(df))) return(df)
-  if (nrow(bw)==0) return(df)
+  if (nrow(bw)==0) {
+    create_log_entry("No body weight data available for attachment", "WARN")
+    return(df)
+  }
   dt <- as.data.table(df); bw_dt <- as.data.table(bw)
   setkey(bw_dt, vald_id, date); setkey(dt, vald_id, date)
   dt[bw_dt, body_weight_lbs := i.body_weight_lbs, roll=Inf, on=.(vald_id, date)]
@@ -405,7 +464,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   }
   bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
             partition_field="date", cluster_fields=c("team","test_type","vald_id"))
-} else create_log_entry("No new CMJ-family tests — skipping CMJ section")
+} else create_log_entry("No new CMJ-family tests - skipping CMJ section")
 
 # DJ: MERGE
 if ("DJ" %in% new_test_types) {
@@ -430,7 +489,7 @@ if ("DJ" %in% new_test_types) {
     )
   bq_upsert(dj_new, "vald_fd_dj", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new DJ tests — skipping DJ section")
+} else create_log_entry("No new DJ tests - skipping DJ section")
 
 # RSI: MERGE
 if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
@@ -459,7 +518,7 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
     rename_with(~str_replace(.x, "_Right$", "_right"))
   bq_upsert(rsi_new, "vald_fd_rsi", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new RSI tests — skipping RSI section")
+} else create_log_entry("No new RSI tests - skipping RSI section")
 
 # Rebound: MERGE
 if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
@@ -496,7 +555,7 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
     )
   bq_upsert(rebound_new, "vald_fd_rebound", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new Rebound tests — skipping Rebound section")
+} else create_log_entry("No new Rebound tests - skipping Rebound section")
 
 # SLJ: MERGE
 if ("SLJ" %in% new_test_types) {
@@ -527,7 +586,7 @@ if ("SLJ" %in% new_test_types) {
     rename_with(~str_replace(.x, "_Right$", "_right"))
   bq_upsert(slj_new, "vald_fd_sl_jumps", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new SLJ tests — skipping SLJ section")
+} else create_log_entry("No new SLJ tests - skipping SLJ section")
 
 # IMTP: MERGE
 if ("IMTP" %in% new_test_types) {
@@ -551,7 +610,7 @@ if ("IMTP" %in% new_test_types) {
   }
   bq_upsert(imtp_new, "vald_fd_imtp", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new IMTP tests — skipping IMTP section")
+} else create_log_entry("No new IMTP tests - skipping IMTP section")
 
 # Nordbord: MERGE (pull only if returned)
 create_log_entry("Fetching Nordbord data from VALD API...")
@@ -624,7 +683,7 @@ if (nrow(nord_tests) > 0) {
   }
   bq_upsert(nb, "vald_nord_all", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No Nordbord tests — skipping Nordbord section")
+} else create_log_entry("No Nordbord tests - skipping Nordbord section")
 
 # Dates & Tests
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
