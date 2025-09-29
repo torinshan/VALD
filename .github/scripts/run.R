@@ -82,7 +82,7 @@ read_bq_table <- function(table_name) {
   q <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
   tryCatch({
     job_tbl <- bq_project_query(project, q, use_legacy_sql = FALSE)
-    bq_table_download(job_tbl, quiet = TRUE, use_bqstorage_api = FALSE)
+    bq_table_download(job_tbl, quiet = TRUE)
   }, error=function(e){ create_log_entry(paste("Read error", table_name, ":", e$message), "WARN"); tibble() })
 }
 
@@ -213,6 +213,8 @@ create_log_entry(glue("Current state - Latest date: {latest_date_current} Test c
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
 Vald_roster_backfill <- read_bq_table("vald_roster")
 
+total_backfilled <- 0
+
 if (nrow(Vald_roster_backfill) > 0) {
   # Check each table for missing team/position and backfill
   tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
@@ -243,7 +245,7 @@ if (nrow(Vald_roster_backfill) > 0) {
             # Get full records and update team/position
             records_to_update <- existing_data %>%
               filter(test_ID %in% roster_updates$test_ID) %>%
-              select(-any_of(c("team", "position", "sport"))) %>%
+              select(-team, -position, -sport) %>%
               left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id")
             
             if (nrow(records_to_update) > 0) {
@@ -251,6 +253,7 @@ if (nrow(Vald_roster_backfill) > 0) {
               bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
                        partition_field = "date", cluster_fields = c("team", "vald_id"))
               create_log_entry(glue("Successfully backfilled team/position for {nrow(records_to_update)} records in {table_name}"))
+              total_backfilled <- total_backfilled + nrow(records_to_update)
             }
           } else {
             create_log_entry(glue("No roster matches found for missing records in {table_name}"), "WARN")
@@ -258,10 +261,18 @@ if (nrow(Vald_roster_backfill) > 0) {
         } else {
           create_log_entry(glue("All records in {table_name} have complete team/position data"))
         }
+      } else {
+        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
       }
     }, error = function(e) {
       create_log_entry(glue("Error checking {table_name} for missing data: {e$message}"), "WARN")
     })
+  }
+  
+  if (total_backfilled > 0) {
+    create_log_entry(glue("=== BACKFILL COMPLETE: Updated {total_backfilled} total records across all tables ==="))
+  } else {
+    create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
   }
 } else {
   create_log_entry("No vald_roster found - skipping team/position backfill", "WARN")
