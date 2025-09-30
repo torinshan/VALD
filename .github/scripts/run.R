@@ -95,24 +95,15 @@ create_log_entry("=== VALD DATA PROCESSING SCRIPT STARTED ===", "START")
 
 # ---------- Helpers: REST-only reads, schema, upload ----------
 
-# Check if table exists and has data
+# Check if table exists (without row count check to avoid Storage API)
 table_exists_and_has_data <- function(table_name) {
   tbl <- bq_table(ds, table_name)
   if (!bq_table_exists(tbl)) {
-    create_log_entry(paste("Table", table_name, "does not exist"), "WARN")
+    create_log_entry(paste("Table", table_name, "does not exist"), "INFO")
     return(FALSE)
   }
-  
-  tryCatch({
-    count_query <- sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", project, dataset, table_name)
-    result <- DBI::dbGetQuery(con, count_query)
-    has_data <- result$row_count > 0
-    create_log_entry(paste("Table", table_name, "exists with", result$row_count, "rows"))
-    return(has_data)
-  }, error = function(e) {
-    create_log_entry(paste("Error checking table", table_name, "row count:", e$message), "ERROR")
-    return(FALSE)
-  })
+  create_log_entry(paste("Table", table_name, "exists"), "INFO")
+  return(TRUE)
 }
 
 safe_bq_query <- function(query, description = "") {
@@ -132,7 +123,7 @@ safe_bq_query <- function(query, description = "") {
 
 read_bq_table <- function(table_name) {
   if (!table_exists_and_has_data(table_name)) {
-    create_log_entry(paste("Table", table_name, "does not exist or is empty, returning empty data frame"), "INFO")
+    create_log_entry(paste("Table", table_name, "does not exist, returning empty data frame"), "INFO")
     return(data.frame())
   }
   
@@ -140,7 +131,7 @@ read_bq_table <- function(table_name) {
   result <- safe_bq_query(query, paste("reading", table_name))
   
   if (nrow(result) == 0) {
-    create_log_entry(paste("Table", table_name, "exists but returned no data"), "WARN")
+    create_log_entry(paste("Table", table_name, "returned no data"), "INFO")
     return(data.frame())
   }
   
@@ -347,6 +338,28 @@ if (nrow(Vald_roster_backfill) > 0) {
 # Reuse roster for processing
 Vald_roster <- Vald_roster_backfill
 if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
+
+# ---------- VALD API Setup ----------
+create_log_entry("=== CONFIGURING VALD API ===")
+tryCatch({
+  client_id <- Sys.getenv("VALD_CLIENT_ID")
+  client_secret <- Sys.getenv("VALD_CLIENT_SECRET")
+  tenant_id <- Sys.getenv("VALD_TENANT_ID")
+  region <- Sys.getenv("VALD_REGION", "use")
+
+  if (client_id == "" || client_secret == "" || tenant_id == "") {
+    stop("Missing required VALD API credentials")
+  }
+
+  set_credentials(client_id, client_secret, tenant_id, region)
+  set_start_date("2024-01-01T00:00:00Z")
+  
+  create_log_entry("VALD API credentials configured successfully")
+}, error = function(e) {
+  create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
+  upload_logs_to_bigquery()
+  quit(status = 1)
+})
 
 # ---------- Gate: run only if EITHER date OR count differ ----------
 create_log_entry("Probing VALD API for tests-only to compare date & count")
