@@ -23,23 +23,47 @@ cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
 
-# ---------- Auth ----------
+# ---------- Auth (Working Version) ----------
 tryCatch({
   cat("=== Authenticating to BigQuery ===\n")
-  access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
-  if (nchar(access_token) == 0) stop('No access token from gcloud')
-  cat('Access token obtained from gcloud\n')
-  token <- gargle::gargle2.0_token(
-    scope='https://www.googleapis.com/auth/bigquery',
-    client=gargle::gargle_client(),
-    credentials=list(access_token=access_token)
-  )
-  bigrquery::bq_auth(token = token)
-  cat('BigQuery authentication successful\n')
-  ds <- bigrquery::bq_dataset(project, dataset)
-  invisible(bigrquery::bq_dataset_exists(ds))
-  cat('Authentication test passed (dataset visible via REST)\n')
-}, error=function(e){ cat('BigQuery authentication failed:', e$message, '\n'); quit(status=1)})
+  
+  # Get access token from gcloud
+  access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
+  access_token <- access_token_result[1]
+  
+  if (nchar(access_token) > 0) {
+    cat("Access token obtained from gcloud\n")
+    
+    # Create gargle token object
+    token <- gargle::gargle2.0_token(
+      scope = 'https://www.googleapis.com/auth/bigquery',
+      client = gargle::gargle_client(),
+      credentials = list(access_token = access_token)
+    )
+    
+    # Set token for bigrquery
+    bigrquery::bq_auth(token = token)
+    cat("BigQuery authentication successful\n")
+    
+    # Test authentication immediately
+    test_con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
+    test_result <- DBI::dbGetQuery(test_con, "SELECT 1 as test")
+    DBI::dbDisconnect(test_con)
+    
+    if (nrow(test_result) == 1 && test_result$test == 1) {
+      cat("Authentication test passed (dataset visible via REST)\n")
+    } else {
+      stop("Authentication test failed")
+    }
+    
+  } else {
+    stop("Could not obtain access token from gcloud")
+  }
+  
+}, error = function(e) {
+  cat("BigQuery authentication failed:", e$message, "\n")
+  quit(status = 1)
+})
 
 con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
 ds <- bq_dataset(project, dataset)
@@ -76,14 +100,58 @@ script_start_time <- Sys.time()
 create_log_entry("=== VALD DATA PROCESSING SCRIPT STARTED ===", "START")
 
 # ---------- Helpers: REST-only reads, schema, upload ----------
-read_bq_table <- function(table_name) {
+
+# Check if table exists and has data
+table_exists_and_has_data <- function(table_name) {
   tbl <- bq_table(ds, table_name)
-  if (!bq_table_exists(tbl)) return(tibble())
-  q <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
+  if (!bq_table_exists(tbl)) {
+    create_log_entry(paste("Table", table_name, "does not exist"), "WARN")
+    return(FALSE)
+  }
+  
   tryCatch({
-    job_tbl <- bq_project_query(project, q, use_legacy_sql = FALSE)
-    bq_table_download(job_tbl, quiet = TRUE)
-  }, error=function(e){ create_log_entry(paste("Read error", table_name, ":", e$message), "WARN"); tibble() })
+    count_query <- sprintf("SELECT COUNT(*) as row_count FROM `%s.%s.%s`", project, dataset, table_name)
+    result <- DBI::dbGetQuery(con, count_query)
+    has_data <- result$row_count > 0
+    create_log_entry(paste("Table", table_name, "exists with", result$row_count, "rows"))
+    return(has_data)
+  }, error = function(e) {
+    create_log_entry(paste("Error checking table", table_name, "row count:", e$message), "ERROR")
+    return(FALSE)
+  })
+}
+
+safe_bq_query <- function(query, description = "") {
+  tryCatch({
+    result <- DBI::dbGetQuery(con, query)
+    if (nchar(description) > 0) {
+      create_log_entry(paste("Successfully executed:", description))
+    }
+    return(result)
+  }, error = function(e) {
+    if (nchar(description) > 0) {
+      create_log_entry(paste("Query failed for", description, ":", e$message), "ERROR")
+    }
+    return(data.frame())
+  })
+}
+
+read_bq_table <- function(table_name) {
+  if (!table_exists_and_has_data(table_name)) {
+    create_log_entry(paste("Table", table_name, "does not exist or is empty, returning empty data frame"), "INFO")
+    return(data.frame())
+  }
+  
+  query <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
+  result <- safe_bq_query(query, paste("reading", table_name))
+  
+  if (nrow(result) == 0) {
+    create_log_entry(paste("Table", table_name, "exists but returned no data"), "WARN")
+    return(data.frame())
+  }
+  
+  create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows"))
+  return(result)
 }
 
 ensure_table <- function(tbl, data, partition_field="date", cluster_fields=character()) {
@@ -110,7 +178,6 @@ is_integer_col <- function(colname) colname %in% c("height","reps_left","reps_ri
 
 standardize_data_types <- function(data, table_name) {
   if (nrow(data) == 0) return(data)
-  # drop all-NA cols
   data <- data[, names(data)[!vapply(data, function(x) all(is.na(x)), logical(1))], drop=FALSE]
   for (cn in names(data)) {
     x <- data[[cn]]
@@ -189,7 +256,7 @@ fix_rsi_data_type <- function() {
     if (nrow(t) && identical(t$data_type[1], "STRING")) {
       create_log_entry("Converting body_weight_lbs STRING -> FLOAT64")
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64", project, dataset))
-      DBI::dbExecute(con, sprintf("UPDATE `%s.%s.vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64)", project, dataset))
+      DBI::dbExecute(con, sprintf("UPDATE `%s.%s.vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64) WHERE TRUE", project, dataset))
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` DROP COLUMN body_weight_lbs", project, dataset))
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs", project, dataset))
       create_log_entry("Converted body_weight_lbs to FLOAT64")
@@ -201,9 +268,19 @@ fix_rsi_data_type <- function() {
 
 # ---------- Current BQ state ----------
 create_log_entry("=== READING CURRENT DATA STATE FROM BIGQUERY ===")
-current_dates <- read_bq_table("dates") %>% select(date) %>% distinct() %>% mutate(date = as.Date(date))
-if (nrow(current_dates)==0) current_dates <- tibble(date = as.Date(character(0)))
-tests_tbl <- read_bq_table("tests") %>% mutate(test_ID = as.character(test_ID)) %>% distinct()
+current_dates <- read_bq_table("dates")
+if (nrow(current_dates) > 0) {
+  current_dates <- current_dates %>% select(date) %>% distinct() %>% mutate(date = as.Date(date))
+} else {
+  current_dates <- tibble(date = as.Date(character(0)))
+}
+
+tests_tbl <- read_bq_table("tests")
+if (nrow(tests_tbl) > 0) {
+  tests_tbl <- tests_tbl %>% mutate(test_ID = as.character(test_ID)) %>% distinct()
+} else {
+  tests_tbl <- tibble(test_ID = character(0))
+}
 
 latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=TRUE) else as.Date("1900-01-01")
 count_tests_current <- nrow(tests_tbl)
@@ -216,7 +293,6 @@ Vald_roster_backfill <- read_bq_table("vald_roster")
 total_backfilled <- 0
 
 if (nrow(Vald_roster_backfill) > 0) {
-  # Check each table for missing team/position and backfill
   tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
                        "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
   
@@ -225,7 +301,6 @@ if (nrow(Vald_roster_backfill) > 0) {
       existing_data <- read_bq_table(table_name)
       
       if (nrow(existing_data) > 0) {
-        # Find records missing team or position
         missing_info <- existing_data %>%
           filter(is.na(team) | is.na(position) | team == "" | position == "") %>%
           select(test_ID, vald_id) %>%
@@ -234,7 +309,6 @@ if (nrow(Vald_roster_backfill) > 0) {
         if (nrow(missing_info) > 0) {
           create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
           
-          # Get the roster info for these athletes
           roster_updates <- missing_info %>%
             left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id") %>%
             filter(!is.na(team) | !is.na(position))
@@ -242,14 +316,12 @@ if (nrow(Vald_roster_backfill) > 0) {
           if (nrow(roster_updates) > 0) {
             create_log_entry(glue("Updating {nrow(roster_updates)} records in {table_name} with roster data"))
             
-            # Get full records and update team/position
             records_to_update <- existing_data %>%
               filter(test_ID %in% roster_updates$test_ID) %>%
               select(-team, -position, -sport) %>%
               left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id")
             
             if (nrow(records_to_update) > 0) {
-              # Use MERGE mode to update these specific records
               bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
                        partition_field = "date", cluster_fields = c("team", "vald_id"))
               create_log_entry(glue("Successfully backfilled team/position for {nrow(records_to_update)} records in {table_name}"))
@@ -278,6 +350,10 @@ if (nrow(Vald_roster_backfill) > 0) {
   create_log_entry("No vald_roster found - skipping team/position backfill", "WARN")
 }
 
+# Reuse roster for processing
+Vald_roster <- Vald_roster_backfill
+if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
+
 # ---------- Gate: run only if EITHER date OR count differ ----------
 create_log_entry("Probing VALD API for tests-only to compare date & count")
 all_tests_probe <- get_forcedecks_tests_only(start_date = NULL)
@@ -303,7 +379,6 @@ count_mismatch <- api_test_count != count_tests_current
 create_log_entry(glue("date_mismatch: {date_mismatch}"))
 create_log_entry(glue("count_mismatch: {count_mismatch}"))
 
-# Exit only if NEITHER date NOR count differ
 if (!date_mismatch && !count_mismatch) {
   create_log_entry("No changes detected - date and count both match. Exiting.")
   create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
@@ -379,8 +454,6 @@ mergable_trials <- trials_wider %>%
             athleteid = first(athleteid), .groups="drop") %>%
   mutate(vald_id = as.character(athleteid)) %>% select(-athleteid)
 
-Vald_roster <- Vald_roster_backfill
-if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
 mergable_roster <- roster %>% left_join(Vald_roster %>% select(vald_id, position, sport, team), by="vald_id")
 
 forcedecks_raw <- mergable_trials %>%
