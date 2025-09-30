@@ -1,0 +1,530 @@
+name: Test BigQuery Read Methods
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-read-methods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: 'access_token'
+          access_token_lifetime: '3600s'
+      
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      
+      - name: Install R packages
+        run: |
+          R -q -e "install.packages(c('bigrquery', 'DBI', 'httr', 'gargle', 'jsonlite', 'dplyr', 'tibble'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')"
+      
+      - name: Test BigQuery Read Methods
+        run: |
+          R -q -e "
+          suppressPackageStartupMessages({
+            library(bigrquery)
+            library(DBI)
+            library(httr)
+            library(gargle)
+            library(jsonlite)
+            library(dplyr)
+            library(tibble)
+          })
+          
+          cat('=== Testing BigQuery Read Methods Without Storage API Permission ===\n\n')
+          
+          project <- 'sac-vald-hub'
+          dataset <- 'analytics'
+          
+          # Disable Storage API globally
+          options(bigrquery.use_bqstorage = FALSE)
+          Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = 'false')
+          cat('Storage API disabled globally\n')
+          
+          # Authenticate using working method
+          cat('\n--- Authenticating ---\n')
+          access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
+          cat('Access token obtained, length:', nchar(access_token), '\n')
+          
+          token <- gargle::gargle2.0_token(
+            scope = 'https://www.googleapis.com/auth/bigquery',
+            client = gargle::gargle_client(),
+            credentials = list(access_token = access_token)
+          )
+          
+          bq_auth(token = token)
+          cat('Authentication successful\n')
+          
+          # Re-disable Storage API after auth (sometimes reset)
+          options(bigrquery.use_bqstorage = FALSE)
+          Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = 'false')
+          
+          ds <- bq_dataset(project, dataset)
+          
+          # Use existing dates table for testing
+          test_tbl <- bq_table(ds, 'dates')
+          
+          if (!bq_table_exists(test_tbl)) {
+            cat('\nERROR: dates table does not exist. Creating a test table...\n')
+            test_data <- data.frame(date = as.Date(c('2024-01-01', '2024-01-02', '2024-01-03')))
+            test_tbl <- bq_table(ds, 'test_temp')
+            bq_table_create(test_tbl, fields = as_bq_fields(test_data))
+            bq_table_upload(test_tbl, test_data, write_disposition = 'WRITE_TRUNCATE')
+            cat('Created temporary test table\n')
+          } else {
+            cat('Using existing dates table for testing\n')
+          }
+          
+          cat('\n========================================\n')
+          
+          # Method 1: Standard DBI::dbGetQuery
+          cat('\n--- Method 1: DBI::dbGetQuery (Standard Approach) ---\n')
+          tryCatch({
+            con <- dbConnect(bigquery(), project = project)
+            result <- dbGetQuery(con, sprintf('SELECT * FROM \`%s.%s.dates\` LIMIT 5', project, dataset))
+            dbDisconnect(con)
+            cat('✓ SUCCESS: Read', nrow(result), 'rows\n')
+            cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          # Method 2: bq_table_download direct
+          cat('\n--- Method 2: bq_table_download (Direct) ---\n')
+          tryCatch({
+            result <- bq_table_download(test_tbl, n_max = 5)
+            cat('✓ SUCCESS: Read', nrow(result), 'rows\n')
+            cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          # Method 3: bq_project_query + bq_table_download
+          cat('\n--- Method 3: bq_project_query + bq_table_download ---\n')
+          tryCatch({
+            query <- sprintf('SELECT * FROM \`%s.%s.dates\` LIMIT 5', project, dataset)
+            query_job <- bq_project_query(project, query, use_legacy_sql = FALSE)
+            result <- bq_table_download(query_job, n_max = 5)
+            cat('✓ SUCCESS: Read', nrow(result), 'rows\n')
+            cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          # Method 4: Direct REST API using tabledata.list
+          cat('\n--- Method 4: Direct REST API (tabledata.list endpoint) ---\n')
+          tryCatch({
+            # Get table metadata for schema
+            meta <- bq_table_meta(test_tbl)
+            fields <- meta\$schema\$fields
+            
+            # Make direct REST API call
+            url <- sprintf(
+              'https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/dates/data',
+              project, dataset
+            )
+            
+            response <- GET(
+              url,
+              add_headers(Authorization = paste('Bearer', bq_token()\$credentials\$access_token)),
+              query = list(maxResults = 5)
+            )
+            
+            if (http_error(response)) {
+              stop('HTTP ', status_code(response), ': ', content(response, 'text'))
+            }
+            
+            content_data <- content(response, 'parsed')
+            
+            if (is.null(content_data\$rows)) {
+              cat('✗ No rows returned\n')
+            } else {
+              # Parse rows into data frame
+              parsed_rows <- lapply(content_data\$rows, function(row) {
+                values <- lapply(seq_along(fields), function(i) {
+                  val <- row\$f[[i]]\$v
+                  field <- fields[[i]]
+                  
+                  if (is.null(val)) return(NA)
+                  
+                  if (field\$type == 'DATE') {
+                    return(as.Date(val))
+                  } else if (field\$type == 'INTEGER' || field\$type == 'INT64') {
+                    return(as.integer(val))
+                  } else if (field\$type == 'FLOAT' || field\$type == 'FLOAT64') {
+                    return(as.numeric(val))
+                  } else {
+                    return(as.character(val))
+                  }
+                })
+                names(values) <- sapply(fields, function(f) f\$name)
+                return(as.data.frame(values, stringsAsFactors = FALSE))
+              })
+              
+              result <- bind_rows(parsed_rows)
+              cat('✓ SUCCESS: Read', nrow(result), 'rows via REST API\n')
+              cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+              cat('  Sample data:\n')
+              print(head(result, 2))
+            }
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          # Method 5: Small page size
+          cat('\n--- Method 5: bq_table_download with page_size=1 ---\n')
+          tryCatch({
+            result <- bq_table_download(test_tbl, page_size = 1, n_max = 3)
+            cat('✓ SUCCESS: Read', nrow(result), 'rows\n')
+            cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          # Method 6: Paginated REST API
+          cat('\n--- Method 6: Paginated REST API (Production Method) ---\n')
+          tryCatch({
+            meta <- bq_table_meta(test_tbl)
+            fields <- meta\$schema\$fields
+            
+            all_rows <- list()
+            page_token <- NULL
+            page_num <- 1
+            max_pages <- 3  # Limit for test
+            
+            repeat {
+              url <- sprintf(
+                'https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/dates/data',
+                project, dataset
+              )
+              
+              query_params <- list(maxResults = 2)
+              if (!is.null(page_token)) {
+                query_params\$pageToken <- page_token
+              }
+              
+              response <- GET(
+                url,
+                add_headers(Authorization = paste('Bearer', bq_token()\$credentials\$access_token)),
+                query = query_params
+              )
+              
+              if (http_error(response)) {
+                stop('HTTP error: ', content(response, 'text'))
+              }
+              
+              content_data <- content(response, 'parsed')
+              
+              if (is.null(content_data\$rows) || length(content_data\$rows) == 0) {
+                break
+              }
+              
+              # Parse this page
+              page_data <- lapply(content_data\$rows, function(row) {
+                values <- lapply(seq_along(fields), function(i) {
+                  val <- row\$f[[i]]\$v
+                  field <- fields[[i]]
+                  if (is.null(val)) return(NA)
+                  if (field\$type == 'DATE') return(as.Date(val))
+                  if (field\$type %in% c('INTEGER', 'INT64')) return(as.integer(val))
+                  if (field\$type %in% c('FLOAT', 'FLOAT64')) return(as.numeric(val))
+                  return(as.character(val))
+                })
+                names(values) <- sapply(fields, function(f) f\$name)
+                as.data.frame(values, stringsAsFactors = FALSE)
+              })
+              
+              all_rows[[page_num]] <- bind_rows(page_data)
+              cat('  Page', page_num, '- fetched', nrow(all_rows[[page_num]]), 'rows\n')
+              
+              page_token <- content_data\$pageToken
+              if (is.null(page_token) || page_num >= max_pages) break
+              
+              page_num <- page_num + 1
+            }
+            
+            result <- bind_rows(all_rows)
+            cat('✓ SUCCESS: Read', nrow(result), 'total rows across', page_num, 'pages\n')
+            cat('  Columns:', paste(names(result), collapse = ', '), '\n')
+            cat('  Sample data:\n')
+            print(head(result, 3))
+          }, error = function(e) {
+            cat('✗ FAILED:', e\$message, '\n')
+          })
+          
+          cat('\n========================================\n')
+          cat('\n=== TEST COMPLETE ===\n')
+          cat('\nRecommendation: Use the method(s) that showed ✓ SUCCESS\n')
+          "
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "Test completed. Check logs above for:"
+          echo "  ✓ = Method works without Storage API"
+          echo "  ✗ = Method requires Storage API permission"
+          echo "=========================================="name: Test BigQuery Read Methods
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-read-methods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: 'access_token'
+          access_token_lifetime: '3600s'
+      
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      
+      - name: Install R packages
+        run: |
+          R -q -e "install.packages(c('bigrquery', 'DBI', 'httr', 'gargle', 'jsonlite', 'dplyr'), repos='https://packagemanager.posit.co/cran/__linux__/noble/latest')"
+      
+      - name: Test BigQuery Read Methods
+        run: |
+          R -q -e "
+          cat('=== Testing BigQuery Read Methods Without Storage API ===\n\n')
+          
+          library(bigrquery)
+          library(DBI)
+          library(httr)
+          library(gargle)
+          library(jsonlite)
+          library(dplyr)
+          
+          project <- Sys.getenv('GCP_PROJECT')
+          dataset <- Sys.getenv('BQ_DATASET')
+          
+          # Disable Storage API globally
+          options(bigrquery.use_bqstorage = FALSE)
+          Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = 'false')
+          
+          # Authenticate
+          access_token <- system('gcloud auth print-access-token', intern = TRUE)[1]
+          token <- gargle::gargle2.0_token(
+            scope = 'https://www.googleapis.com/auth/bigquery',
+            client = gargle::gargle_client(),
+            credentials = list(access_token = access_token)
+          )
+          bq_auth(token = token)
+          cat('Authentication successful\n\n')
+          
+          # Create test table if it doesn't exist
+          cat('--- Setting up test table ---\n')
+          test_data <- data.frame(
+            id = 1:5,
+            name = c('Alice', 'Bob', 'Charlie', 'David', 'Eve'),
+            value = c(10.5, 20.3, 30.1, 40.8, 50.2),
+            date = as.Date(c('2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04', '2024-01-05'))
+          )
+          
+          ds <- bq_dataset(project, dataset)
+          test_tbl <- bq_table(ds, 'test_read_methods')
+          
+          if (bq_table_exists(test_tbl)) {
+            cat('Test table exists, deleting...\n')
+            bq_table_delete(test_tbl)
+          }
+          
+          cat('Creating test table...\n')
+          bq_table_create(test_tbl, fields = as_bq_fields(test_data))
+          bq_table_upload(test_tbl, test_data, write_disposition = 'WRITE_TRUNCATE')
+          cat('Test table created with', nrow(test_data), 'rows\n\n')
+          
+          # Method 1: DBI::dbGetQuery (likely to use Storage API)
+          cat('--- Method 1: DBI::dbGetQuery ---\n')
+          tryCatch({
+            con <- dbConnect(bigquery(), project = project)
+            result <- dbGetQuery(con, sprintf('SELECT * FROM \`%s.%s.test_read_methods\`', project, dataset))
+            dbDisconnect(con)
+            cat('SUCCESS: Read', nrow(result), 'rows\n')
+            cat('Columns:', paste(names(result), collapse = ', '), '\n')
+            print(head(result, 2))
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Method 2: bq_table_download directly
+          cat('--- Method 2: bq_table_download directly ---\n')
+          tryCatch({
+            result <- bq_table_download(test_tbl, n_max = Inf)
+            cat('SUCCESS: Read', nrow(result), 'rows\n')
+            cat('Columns:', paste(names(result), collapse = ', '), '\n')
+            print(head(result, 2))
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Method 3: bq_project_query + bq_table_download
+          cat('--- Method 3: bq_project_query + bq_table_download ---\n')
+          tryCatch({
+            query <- sprintf('SELECT * FROM \`%s.%s.test_read_methods\`', project, dataset)
+            query_job <- bq_project_query(project, query, use_legacy_sql = FALSE)
+            result <- bq_table_download(query_job, page_size = 1000, n_max = Inf)
+            cat('SUCCESS: Read', nrow(result), 'rows\n')
+            cat('Columns:', paste(names(result), collapse = ', '), '\n')
+            print(head(result, 2))
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Method 4: Direct REST API using tabledata.list
+          cat('--- Method 4: Direct REST API (tabledata.list) ---\n')
+          tryCatch({
+            url <- sprintf(
+              'https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data',
+              project, dataset, 'test_read_methods'
+            )
+            
+            response <- GET(
+              url,
+              add_headers(Authorization = paste('Bearer', bq_token()\$credentials\$access_token)),
+              query = list(maxResults = 100)
+            )
+            
+            if (http_error(response)) {
+              stop('HTTP error: ', content(response, 'text'))
+            }
+            
+            content_data <- content(response, 'parsed')
+            
+            if (is.null(content_data\$rows)) {
+              cat('No rows returned\n')
+            } else {
+              cat('SUCCESS: API returned', length(content_data\$rows), 'rows\n')
+              cat('Schema fields:', length(content_data\$schema\$fields), '\n')
+              
+              # Parse first row as example
+              if (length(content_data\$rows) > 0) {
+                first_row <- content_data\$rows[[1]]
+                cat('First row values:', paste(sapply(first_row\$f, function(x) x\$v), collapse = ', '), '\n')
+              }
+            }
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Method 5: bq_table_download with small page_size
+          cat('--- Method 5: bq_table_download with small page_size ---\n')
+          tryCatch({
+            result <- bq_table_download(test_tbl, page_size = 2, n_max = 5, bigint = 'integer64')
+            cat('SUCCESS: Read', nrow(result), 'rows\n')
+            cat('Columns:', paste(names(result), collapse = ', '), '\n')
+            print(head(result, 2))
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Method 6: Manual pagination with REST API
+          cat('--- Method 6: Manual pagination with REST API ---\n')
+          tryCatch({
+            all_rows <- list()
+            page_token <- NULL
+            page_num <- 1
+            
+            repeat {
+              url <- sprintf(
+                'https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data',
+                project, dataset, 'test_read_methods'
+              )
+              
+              query_params <- list(maxResults = 2)
+              if (!is.null(page_token)) {
+                query_params\$pageToken <- page_token
+              }
+              
+              response <- GET(
+                url,
+                add_headers(Authorization = paste('Bearer', bq_token()\$credentials\$access_token)),
+                query = query_params
+              )
+              
+              if (http_error(response)) {
+                stop('HTTP error: ', content(response, 'text'))
+              }
+              
+              content_data <- content(response, 'parsed')
+              
+              if (is.null(content_data\$rows) || length(content_data\$rows) == 0) {
+                break
+              }
+              
+              cat('Page', page_num, '- fetched', length(content_data\$rows), 'rows\n')
+              all_rows <- c(all_rows, content_data\$rows)
+              
+              page_token <- content_data\$pageToken
+              if (is.null(page_token)) break
+              
+              page_num <- page_num + 1
+              if (page_num > 10) break  # Safety limit
+            }
+            
+            cat('SUCCESS: Read', length(all_rows), 'total rows across', page_num, 'pages\n')
+          }, error = function(e) {
+            cat('FAILED:', e\$message, '\n')
+          })
+          cat('\n')
+          
+          # Cleanup
+          cat('--- Cleanup ---\n')
+          tryCatch({
+            bq_table_delete(test_tbl)
+            cat('Test table deleted\n')
+          }, error = function(e) {
+            cat('Cleanup warning:', e\$message, '\n')
+          })
+          
+          cat('\n=== Test Complete ===\n')
+          "
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Summary ==="
+          echo "This workflow tests different methods to read BigQuery data."
+          echo "Methods that work without Storage API permissions can be used in the main script."
