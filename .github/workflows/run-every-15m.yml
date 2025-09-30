@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 120
     concurrency:
       group: vald-q15
       cancel-in-progress: false
