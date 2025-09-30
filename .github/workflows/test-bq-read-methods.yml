@@ -32,17 +32,31 @@ jobs:
           Rscript -e '
           library(bigrquery); library(httr); library(gargle); library(dplyr)
           
-          token <- system("gcloud auth print-access-token", intern=TRUE)[1]
-          t <- gargle::gargle2.0_token(scope="https://www.googleapis.com/auth/bigquery",
-                                        client=gargle::gargle_client(),
-                                        credentials=list(access_token=token))
-          bq_auth(token=t)
+          # Get token directly from gcloud
+          access_token <- system("gcloud auth print-access-token", intern=TRUE)[1]
+          cat("Token length:", nchar(access_token), "\n")
           
+          # Create gargle token for bigrquery
+          token <- gargle::gargle2.0_token(
+            scope="https://www.googleapis.com/auth/bigquery",
+            client=gargle::gargle_client(),
+            credentials=list(access_token=access_token)
+          )
+          bq_auth(token=token)
+          cat("bigrquery authenticated\n")
+          
+          # Make REST API call using the ORIGINAL access_token (not from bq_token)
           url <- "https://bigquery.googleapis.com/bigquery/v2/projects/sac-vald-hub/datasets/analytics/tables/dates/data?maxResults=3"
-          resp <- GET(url, add_headers(Authorization=paste("Bearer", bq_token()$credentials$access_token)))
+          resp <- GET(url, add_headers(Authorization=paste("Bearer", access_token)))
           
-          if(http_error(resp)) stop("Failed: ", content(resp,"text"))
+          if(http_error(resp)) {
+            cat("FAILED:", status_code(resp), "\n")
+            print(content(resp, "text"))
+            quit(status=1)
+          }
           
-          cat("SUCCESS: REST API works\n")
-          print(content(resp,"parsed")$totalRows)
+          cat("SUCCESS: REST API works!\n")
+          data <- content(resp, "parsed")
+          cat("Total rows in table:", data$totalRows, "\n")
+          cat("Rows fetched:", length(data$rows), "\n")
           '
