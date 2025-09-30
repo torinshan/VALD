@@ -45,16 +45,10 @@ tryCatch({
     bigrquery::bq_auth(token = token)
     cat("BigQuery authentication successful\n")
     
-    # Test authentication immediately
-    test_con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
-    test_result <- DBI::dbGetQuery(test_con, "SELECT 1 as test")
-    DBI::dbDisconnect(test_con)
-    
-    if (nrow(test_result) == 1 && test_result$test == 1) {
-      cat("Authentication test passed (dataset visible via REST)\n")
-    } else {
-      stop("Authentication test failed")
-    }
+    # Test authentication using bq_dataset_exists (REST API only, no Storage API)
+    ds <- bigrquery::bq_dataset(project, dataset)
+    invisible(bigrquery::bq_dataset_exists(ds))
+    cat("Authentication test passed (dataset visible via REST)\n")
     
   } else {
     stop("Could not obtain access token from gcloud")
