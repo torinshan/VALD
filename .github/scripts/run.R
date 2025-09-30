@@ -376,6 +376,20 @@ create_log_entry(glue("Current state - Latest date: {latest_date_current} Test c
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
 Vald_roster_backfill <- read_bq_table("vald_roster")
 
+# Rename columns from BigQuery schema to processing schema
+if (nrow(Vald_roster_backfill) > 0) {
+  if ("category_1" %in% names(Vald_roster_backfill)) {
+    Vald_roster_backfill <- Vald_roster_backfill %>% 
+      rename(team = category_1)
+    create_log_entry("Renamed category_1 to team in vald_roster")
+  }
+  if ("group_1" %in% names(Vald_roster_backfill)) {
+    Vald_roster_backfill <- Vald_roster_backfill %>% 
+      rename(position = group_1)
+    create_log_entry("Renamed group_1 to position in vald_roster")
+  }
+}
+                                            
 total_backfilled <- 0
 
 if (nrow(Vald_roster_backfill) > 0) {
