@@ -23,27 +23,34 @@ cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
 
+# Global variable to store access token for REST API calls
+GLOBAL_ACCESS_TOKEN <- NULL
+
 # ---------- Auth (Working Version) ----------
 tryCatch({
   cat("=== Authenticating to BigQuery ===\n")
   
-  # Get access token from gcloud
+  # Get access token from gcloud and store it globally
   access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
-  access_token <- access_token_result[1]
+  GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
   
-  if (nchar(access_token) > 0) {
+  if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
     cat("Access token obtained from gcloud\n")
     
     # Create gargle token object
     token <- gargle::gargle2.0_token(
       scope = 'https://www.googleapis.com/auth/bigquery',
       client = gargle::gargle_client(),
-      credentials = list(access_token = access_token)
+      credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
     )
     
     # Set token for bigrquery
     bigrquery::bq_auth(token = token)
     cat("BigQuery authentication successful\n")
+    
+    # CRITICAL: Re-set Storage API options AFTER authentication
+    options(bigrquery.use_bqstorage = FALSE)
+    Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
     
     # Test authentication using bq_dataset_exists (REST API only, no Storage API)
     ds <- bigrquery::bq_dataset(project, dataset)
@@ -59,7 +66,12 @@ tryCatch({
   quit(status = 1)
 })
 
-con <- DBI::dbConnect(bigrquery::bigquery(), project = project)
+con <- DBI::dbConnect(
+  bigrquery::bigquery(), 
+  project = project,
+  use_legacy_sql = FALSE,
+  bigint = "integer64"
+)
 ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
   bq_dataset_create(ds, location = location)
@@ -106,37 +118,112 @@ table_exists_and_has_data <- function(table_name) {
   return(TRUE)
 }
 
-safe_bq_query <- function(query, description = "") {
+read_bq_table <- function(table_name) {
+  tbl <- bq_table(ds, table_name)
+  if (!bq_table_exists(tbl)) {
+    create_log_entry(paste("Table", table_name, "does not exist"), "INFO")
+    return(data.frame())
+  }
+  
+  create_log_entry(paste("Reading table", table_name, "using REST API"), "INFO")
+  
   tryCatch({
-    result <- DBI::dbGetQuery(con, query)
-    if (nchar(description) > 0) {
-      create_log_entry(paste("Successfully executed:", description))
+    # Get table schema first
+    meta <- bq_table_meta(tbl)
+    fields <- meta$schema$fields
+    
+    # Use tabledata.list REST API endpoint (no Storage API required)
+    all_rows <- list()
+    page_token <- NULL
+    page_num <- 1
+    
+    repeat {
+      # Build REST API URL
+      url <- sprintf(
+        "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data",
+        project, dataset, table_name
+      )
+      
+      # Add page token if we have one
+      query_params <- list(maxResults = 10000)
+      if (!is.null(page_token)) {
+        query_params$pageToken <- page_token
+      }
+      
+      # Make REST API call with GLOBAL_ACCESS_TOKEN
+      response <- httr::GET(
+        url,
+        httr::add_headers(Authorization = paste("Bearer", GLOBAL_ACCESS_TOKEN)),
+        query = query_params
+      )
+      
+      if (httr::http_error(response)) {
+        stop(paste("REST API error:", httr::content(response, "text")))
+      }
+      
+      content <- httr::content(response, "parsed")
+      
+      # Check if we have rows
+      if (is.null(content$rows) || length(content$rows) == 0) {
+        if (page_num == 1) {
+          create_log_entry(paste("Table", table_name, "returned no data"), "INFO")
+          return(data.frame())
+        }
+        break
+      }
+      
+      # Parse rows into data frame
+      page_data <- lapply(content$rows, function(row) {
+        values <- lapply(seq_along(fields), function(i) {
+          val <- row$f[[i]]$v
+          field <- fields[[i]]
+          
+          # Convert based on field type
+          if (is.null(val)) {
+            return(NA)
+          } else if (field$type == "INTEGER" || field$type == "INT64") {
+            return(as.integer(val))
+          } else if (field$type == "FLOAT" || field$type == "FLOAT64") {
+            return(as.numeric(val))
+          } else if (field$type == "DATE") {
+            return(as.Date(val))
+          } else if (field$type == "TIME") {
+            return(hms::as_hms(val))
+          } else if (field$type == "TIMESTAMP") {
+            return(as.POSIXct(as.numeric(val), origin = "1970-01-01", tz = "UTC"))
+          } else {
+            return(as.character(val))
+          }
+        })
+        names(values) <- sapply(fields, function(f) f$name)
+        return(as.data.frame(values, stringsAsFactors = FALSE))
+      })
+      
+      all_rows[[page_num]] <- bind_rows(page_data)
+      
+      # Check for next page
+      page_token <- content$pageToken
+      if (is.null(page_token)) break
+      
+      page_num <- page_num + 1
+      
+      # Safety limit
+      if (page_num > 100) {
+        create_log_entry(paste("Warning: Hit page limit for", table_name), "WARN")
+        break
+      }
     }
+    
+    # Combine all pages
+    result <- bind_rows(all_rows)
+    
+    create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows via REST API"))
     return(result)
+    
   }, error = function(e) {
-    if (nchar(description) > 0) {
-      create_log_entry(paste("Query failed for", description, ":", e$message), "ERROR")
-    }
+    create_log_entry(paste("Error reading", table_name, ":", e$message), "ERROR")
     return(data.frame())
   })
-}
-
-read_bq_table <- function(table_name) {
-  if (!table_exists_and_has_data(table_name)) {
-    create_log_entry(paste("Table", table_name, "does not exist, returning empty data frame"), "INFO")
-    return(data.frame())
-  }
-  
-  query <- sprintf("SELECT * FROM `%s.%s.%s`", project, dataset, table_name)
-  result <- safe_bq_query(query, paste("reading", table_name))
-  
-  if (nrow(result) == 0) {
-    create_log_entry(paste("Table", table_name, "returned no data"), "INFO")
-    return(data.frame())
-  }
-  
-  create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows"))
-  return(result)
 }
 
 ensure_table <- function(tbl, data, partition_field="date", cluster_fields=character()) {
@@ -233,22 +320,36 @@ bq_upsert <- function(data, table_name, key="test_ID",
 
 fix_rsi_data_type <- function() {
   create_log_entry("Checking body_weight_lbs type in vald_fd_rsi")
-  q <- sprintf("SELECT data_type FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS`
-               WHERE table_name='vald_fd_rsi' AND column_name='body_weight_lbs'",
-               project, dataset)
+  
   tryCatch({
-    t <- DBI::dbGetQuery(con, q)
-    if (nrow(t) && identical(t$data_type[1], "STRING")) {
+    # Check if table exists first
+    tbl <- bq_table(ds, "vald_fd_rsi")
+    if (!bq_table_exists(tbl)) {
+      create_log_entry("Table vald_fd_rsi does not exist yet - skipping type fix")
+      return(invisible(TRUE))
+    }
+    
+    # Get table metadata to check column type
+    meta <- bq_table_meta(tbl)
+    fields <- meta$schema$fields
+    bw_field <- fields[sapply(fields, function(f) f$name == "body_weight_lbs")]
+    
+    if (length(bw_field) > 0 && bw_field[[1]]$type == "STRING") {
       create_log_entry("Converting body_weight_lbs STRING -> FLOAT64")
+      
+      # Use DBI for ALTER statements (DML operations don't trigger Storage API reads)
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64", project, dataset))
       DBI::dbExecute(con, sprintf("UPDATE `%s.%s.vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64) WHERE TRUE", project, dataset))
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` DROP COLUMN body_weight_lbs", project, dataset))
       DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs", project, dataset))
+      
       create_log_entry("Converted body_weight_lbs to FLOAT64")
     } else {
       create_log_entry("body_weight_lbs already FLOAT64 or column missing")
     }
-  }, error=function(e){ create_log_entry(paste("RSI type fix:", e$message), "WARN") })
+  }, error=function(e){ 
+    create_log_entry(paste("RSI type fix:", e$message), "WARN") 
+  })
 }
 
 # ---------- Current BQ state ----------
