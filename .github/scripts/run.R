@@ -107,17 +107,6 @@ create_log_entry("=== VALD DATA PROCESSING SCRIPT STARTED ===", "START")
 
 # ---------- Helpers: REST-only reads, schema, upload ----------
 
-# Check if table exists (without row count check to avoid Storage API)
-table_exists_and_has_data <- function(table_name) {
-  tbl <- bq_table(ds, table_name)
-  if (!bq_table_exists(tbl)) {
-    create_log_entry(paste("Table", table_name, "does not exist"), "INFO")
-    return(FALSE)
-  }
-  create_log_entry(paste("Table", table_name, "exists"), "INFO")
-  return(TRUE)
-}
-
 read_bq_table <- function(table_name) {
   tbl <- bq_table(ds, table_name)
   if (!bq_table_exists(tbl)) {
@@ -486,7 +475,7 @@ if (!date_mismatch && !count_mismatch) {
 
 create_log_entry(glue("Changes detected - Running update (date_mismatch: {date_mismatch}, count_mismatch: {count_mismatch})"))
 
-# ---------- Backfill missing team/position data ----------
+# ---------- Backfill missing team data ----------
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM DATA ===")
 
 total_backfilled <- 0
@@ -681,7 +670,7 @@ clean_column_names <- function(df) {
     # Remove multiple consecutive underscores
     gsub("_{2,}", "_", .) %>%
     # Remove leading/trailing underscores
-    gsub("^_|_$", "", .)
+    gsub("^_|_$", "", .")
   return(df)
 }
 
@@ -734,79 +723,116 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   } else {
     cmj_new <- cmj_temp %>%
       select(any_of(c(
-      "test_ID","vald_id","full_name","position","team","test_type","date","time",
-      "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
-      "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration","mean_ecc_con_ratio",
-      "mean_takeoff_velocity","peak_landing_velocity","peak_takeoff_force","peak_takeoff_velocity",
-      "concentric_rfd_100","start_to_peak_force_time","contraction_time","concentric_duration",
-      "eccentric_concentric_duration_ratio","flight_eccentric_time_ratio","displacement_at_takeoff",
-      "rsi_modified_imp_mom","positive_takeoff_impulse","positive_impulse","concentric_impulse",
-      "eccentric_braking_impulse","total_work","relative_peak_landing_force",
-      "relative_peak_concentric_force","relative_peak_eccentric_force","bm_rel_force_at_zero_velocity",
-      "landing_impulse","force_at_zero_velocity","cmj_stiffness","braking_phase_duration",
-      "takeoff_velocity","eccentric_time","peak_landing_acceleration","peak_takeoff_acceleration",
-      "concentric_rfd_200","eccentric_peak_power"
-    ))) %>%
-    filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
+        "test_ID","vald_id","full_name","team","test_type","date","time",
+        "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
+        "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration","mean_ecc_con_ratio",
+        "mean_takeoff_velocity","peak_landing_velocity","peak_takeoff_force","peak_takeoff_velocity",
+        "concentric_rfd_100","start_to_peak_force_time","contraction_time","concentric_duration",
+        "eccentric_concentric_duration_ratio","flight_eccentric_time_ratio","displacement_at_takeoff",
+        "rsi_modified_imp_mom","positive_takeoff_impulse","positive_impulse","concentric_impulse",
+        "eccentric_braking_impulse","total_work","relative_peak_landing_force",
+        "relative_peak_concentric_force","relative_peak_eccentric_force","bm_rel_force_at_zero_velocity",
+        "landing_impulse","force_at_zero_velocity","cmj_stiffness","braking_phase_duration",
+        "takeoff_velocity","eccentric_time","peak_landing_acceleration","peak_takeoff_acceleration",
+        "concentric_rfd_200","eccentric_peak_power"
+      ))) %>%
+      filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
 
-  cmj_existing <- read_bq_table("vald_fd_jumps") %>% 
-    mutate(test_ID = as.character(test_ID)) %>%
-    select(-any_of("position"))  # Remove position if it exists in old data
-  
-  cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
+    cmj_existing <- read_bq_table("vald_fd_jumps") %>% 
+      mutate(test_ID = as.character(test_ID)) %>%
+      select(-any_of("position"))  # Remove position if it exists in old data
+    
+    cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
-  fd <- cmj_all %>% 
-    arrange(full_name, test_type, date) %>%  # Ensure sorted before grouping
-    group_by(full_name, test_type) %>%
-    arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each group
-    mutate(
-      mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      zscore_jump_height_inches_imp_mom = if_else(sd_30d_jh > 0, (jump_height_inches_imp_mom - mean_30d_jh)/sd_30d_jh, NA_real_),
-      mean_30d_rpcf = slide_index_dbl(relative_peak_concentric_force, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      sd_30d_rpcf   = slide_index_dbl(relative_peak_concentric_force, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      zscore_relative_peak_concentric_force = if_else(sd_30d_rpcf > 0, (relative_peak_concentric_force - mean_30d_rpcf)/sd_30d_rpcf, NA_real_),
-      mean_30d_rsi = slide_index_dbl(rsi_modified_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      sd_30d_rsi   = slide_index_dbl(rsi_modified_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
-      zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
-    ) %>% ungroup() %>%
-    group_by(full_name) %>%
-    arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each full_name group
-    mutate(
-      cmj_mask = (test_type == "CMJ"),
-      jh_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, jump_height_inches_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
-      rsi_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, rsi_modified_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
-      epf_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, relative_peak_eccentric_force, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
-      jump_height_readiness = if_else(!is.na(jump_height_inches_imp_mom) & !is.na(jh_cmj_mean_30d) & jh_cmj_mean_30d != 0,
-                                      (jump_height_inches_imp_mom - jh_cmj_mean_30d)/jh_cmj_mean_30d, NA_real_),
-      rsi_readiness = if_else(!is.na(rsi_modified_imp_mom) & !is.na(rsi_cmj_mean_30d) & rsi_cmj_mean_30d != 0,
-                              (rsi_modified_imp_mom - rsi_cmj_mean_30d)/rsi_cmj_mean_30d, NA_real_),
-      epf_readiness = if_else(!is.na(relative_peak_eccentric_force) & !is.na(epf_cmj_mean_30d) & epf_cmj_mean_30d != 0,
-                              (relative_peak_eccentric_force - epf_cmj_mean_30d)/epf_cmj_mean_30d, NA_real_)
-    ) %>%
-    ungroup() %>%
-    filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
-    select(-starts_with("mean_30d_"), -starts_with("sd_30d_"), -cmj_mask,
-           -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"),
-           -starts_with("zscore_"))  # Remove z-score columns (not in BigQuery schema)
+    fd <- cmj_all %>% 
+      arrange(full_name, test_type, date) %>%  # Ensure sorted before grouping
+      group_by(full_name, test_type) %>%
+      arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each group
+      mutate(
+        mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        zscore_jump_height_inches_imp_mom = if_else(sd_30d_jh > 0, (jump_height_inches_imp_mom - mean_30d_jh)/sd_30d_jh, NA_real_),
+        mean_30d_rpcf = slide_index_dbl(relative_peak_concentric_force, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        sd_30d_rpcf   = slide_index_dbl(relative_peak_concentric_force, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        zscore_relative_peak_concentric_force = if_else(sd_30d_rpcf > 0, (relative_peak_concentric_force - mean_30d_rpcf)/sd_30d_rpcf, NA_real_),
+        mean_30d_rsi = slide_index_dbl(rsi_modified_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        sd_30d_rsi   = slide_index_dbl(rsi_modified_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+        zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
+      ) %>% ungroup() %>%
+      group_by(full_name) %>%
+      arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each full_name group
+      mutate(
+        cmj_mask = (test_type == "CMJ"),
+        jh_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, jump_height_inches_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+        rsi_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, rsi_modified_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+        epf_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, relative_peak_eccentric_force, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
+        jump_height_readiness = if_else(!is.na(jump_height_inches_imp_mom) & !is.na(jh_cmj_mean_30d) & jh_cmj_mean_30d != 0,
+                                        (jump_height_inches_imp_mom - jh_cmj_mean_30d)/jh_cmj_mean_30d, NA_real_),
+        rsi_readiness = if_else(!is.na(rsi_modified_imp_mom) & !is.na(rsi_cmj_mean_30d) & rsi_cmj_mean_30d != 0,
+                                (rsi_modified_imp_mom - rsi_cmj_mean_30d)/rsi_cmj_mean_30d, NA_real_),
+        epf_readiness = if_else(!is.na(relative_peak_eccentric_force) & !is.na(epf_cmj_mean_30d) & epf_cmj_mean_30d != 0,
+                                (relative_peak_eccentric_force - epf_cmj_mean_30d)/epf_cmj_mean_30d, NA_real_)
+      ) %>%
+      ungroup() %>%
+      filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
+      select(-starts_with("mean_30d_"), -starts_with("sd_30d_"), -cmj_mask,
+             -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"),
+             -starts_with("zscore_"))  # Remove z-score columns (not in BigQuery schema)
 
-  if (all(c("jump_height_inches_imp_mom","relative_peak_eccentric_force",
-            "bodymass_relative_takeoff_power","rsi_modified_imp_mom") %in% names(fd))) {
-    fd <- fd %>%
-      mutate(calc_performance_score =
-               percent_rank(jump_height_inches_imp_mom) * 100 +
-               percent_rank(relative_peak_eccentric_force) * 100 +
-               percent_rank(bodymass_relative_takeoff_power) * 100 +
-               percent_rank(rsi_modified_imp_mom) * 100,
-             performance_score = percent_rank(calc_performance_score) * 100) %>%
-      group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
-      ungroup() %>% select(-calc_performance_score)
+    if (all(c("jump_height_inches_imp_mom","relative_peak_eccentric_force",
+              "bodymass_relative_takeoff_power","rsi_modified_imp_mom") %in% names(fd))) {
+      fd <- fd %>%
+        mutate(calc_performance_score =
+                 percent_rank(jump_height_inches_imp_mom) * 100 +
+                 percent_rank(relative_peak_eccentric_force) * 100 +
+                 percent_rank(bodymass_relative_takeoff_power) * 100 +
+                 percent_rank(rsi_modified_imp_mom) * 100,
+               performance_score = percent_rank(calc_performance_score) * 100) %>%
+        group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+        ungroup() %>% select(-calc_performance_score)
+    }
+    
+    # Explicitly remove ALL temporary calculation columns before upload
+    temp_cols_to_remove <- c(
+      # Z-scores
+      "zscore_jump_height_inches_imp_mom", "zscore_relative_peak_concentric_force", 
+      "zscore_rsi_modified_imp_mom",
+      # Rolling statistics
+      "mean_30d_jh", "sd_30d_jh", "mean_30d_rpcf", "sd_30d_rpcf", 
+      "mean_30d_rsi", "sd_30d_rsi",
+      # CMJ baselines
+      "jh_cmj_mean_30d", "rsi_cmj_mean_30d", "epf_cmj_mean_30d",
+      # Helpers
+      "cmj_mask", "calc_performance_score"
+    )
+    fd <- fd %>% select(-any_of(temp_cols_to_remove))
+    
+    # Explicitly select only columns that exist in BigQuery vald_fd_jumps schema
+    bq_columns <- c("test_ID", "vald_id", "full_name", "team", "test_type", "date", "time",
+                    "countermovement_depth", "jump_height_inches_imp_mom", "bodymass_relative_takeoff_power",
+                    "mean_landing_power", "mean_eccentric_force", "mean_takeoff_acceleration", 
+                    "mean_ecc_con_ratio", "mean_takeoff_velocity", "peak_landing_velocity",
+                    "peak_takeoff_force", "peak_takeoff_velocity", "concentric_rfd_100",
+                    "start_to_peak_force_time", "contraction_time", "concentric_duration",
+                    "eccentric_concentric_duration_ratio", "flight_eccentric_time_ratio",
+                    "displacement_at_takeoff", "rsi_modified_imp_mom", "positive_takeoff_impulse",
+                    "positive_impulse", "concentric_impulse", "eccentric_braking_impulse",
+                    "total_work", "relative_peak_landing_force", "relative_peak_concentric_force",
+                    "relative_peak_eccentric_force", "bm_rel_force_at_zero_velocity",
+                    "landing_impulse", "force_at_zero_velocity", "cmj_stiffness",
+                    "braking_phase_duration", "takeoff_velocity", "eccentric_time",
+                    "peak_landing_acceleration", "peak_takeoff_acceleration", "concentric_rfd_200",
+                    "eccentric_peak_power", "jump_height_readiness", "rsi_readiness",
+                    "epf_readiness", "performance_score", "team_performance_score", "body_weight_lbs")
+    
+    fd <- fd %>% select(any_of(bq_columns))
+    
+    bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
+              partition_field="date", cluster_fields=c("team","test_type","vald_id"))
   }
-  }
-  bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
-            partition_field="date", cluster_fields=c("team","test_type","vald_id"))
-  }
-} else create_log_entry("No new CMJ-family tests - skipping CMJ section")
+} else {
+  create_log_entry("No new CMJ-family tests - skipping CMJ section")
+}
 
 # DJ: MERGE
 if ("DJ" %in% new_test_types) {
@@ -831,7 +857,9 @@ if ("DJ" %in% new_test_types) {
     )
   bq_upsert(dj_new, "vald_fd_dj", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new DJ tests - skipping DJ section")
+} else {
+  create_log_entry("No new DJ tests - skipping DJ section")
+}
 
 # RSI: MERGE
 if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
@@ -860,7 +888,9 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
     rename_with(~str_replace(.x, "_Right$", "_right"))
   bq_upsert(rsi_new, "vald_fd_rsi", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new RSI tests - skipping RSI section")
+} else {
+  create_log_entry("No new RSI tests - skipping RSI section")
+}
 
 # Rebound: MERGE
 if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
@@ -897,7 +927,9 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
     )
   bq_upsert(rebound_new, "vald_fd_rebound", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new Rebound tests - skipping Rebound section")
+} else {
+  create_log_entry("No new Rebound tests - skipping Rebound section")
+}
 
 # SLJ: MERGE
 if ("SLJ" %in% new_test_types) {
@@ -928,7 +960,9 @@ if ("SLJ" %in% new_test_types) {
     rename_with(~str_replace(.x, "_Right$", "_right"))
   bq_upsert(slj_new, "vald_fd_sl_jumps", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new SLJ tests - skipping SLJ section")
+} else {
+  create_log_entry("No new SLJ tests - skipping SLJ section")
+}
 
 # IMTP: MERGE
 if ("IMTP" %in% new_test_types) {
@@ -952,7 +986,9 @@ if ("IMTP" %in% new_test_types) {
   }
   bq_upsert(imtp_new, "vald_fd_imtp", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No new IMTP tests - skipping IMTP section")
+} else {
+  create_log_entry("No new IMTP tests - skipping IMTP section")
+}
 
 # Nordbord: MERGE (pull only if returned)
 create_log_entry("Fetching Nordbord data from VALD API...")
@@ -1025,7 +1061,9 @@ if (nrow(nord_tests) > 0) {
   }
   bq_upsert(nb, "vald_nord_all", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
-} else create_log_entry("No Nordbord tests - skipping Nordbord section")
+} else {
+  create_log_entry("No Nordbord tests - skipping Nordbord section")
+}
 
 # Dates & Tests
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
