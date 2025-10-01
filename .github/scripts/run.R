@@ -372,8 +372,8 @@ latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=
 count_tests_current <- nrow(tests_tbl)
 create_log_entry(glue("Current state - Latest date: {latest_date_current} Test count: {count_tests_current}"))
 
-# ---------- Backfill missing team/position data ----------
-create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
+# ---------- Read roster early for use in gate check and later processing ----------
+create_log_entry("=== READING ROSTER DATA ===")
 Vald_roster_backfill <- read_bq_table("vald_roster")
 
 if (nrow(Vald_roster_backfill) > 0) {
@@ -401,104 +401,6 @@ if (nrow(Vald_roster_backfill) > 0) {
   } else {
     create_log_entry("Warning: group_1 column not found in vald_roster", "WARN")
   }
-}
-
-total_backfilled <- 0
-
-if (nrow(Vald_roster_backfill) > 0) {
-  tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
-                       "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
-  
-  for (table_name in tables_to_check) {
-    tryCatch({
-      existing_data <- read_bq_table(table_name)
-      
-      if (nrow(existing_data) == 0) {
-        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
-        next
-      }
-      
-      # Check if required columns exist
-      has_test_id <- "test_ID" %in% names(existing_data)
-      has_vald_id <- "vald_id" %in% names(existing_data)
-      has_team <- "team" %in% names(existing_data)
-      has_position <- "position" %in% names(existing_data)
-      
-      if (!has_test_id || !has_vald_id) {
-        create_log_entry(glue("Skipping {table_name} - missing test_ID or vald_id columns"), "WARN")
-        next
-      }
-      
-      # Find records with missing team or position
-      # Use safe filtering that handles missing columns and various data types
-      missing_info <- existing_data %>%
-        mutate(
-          needs_team = if (has_team) {
-            is.na(team) | as.character(team) == "" | as.character(team) == "NA"
-          } else {
-            TRUE
-          },
-          needs_position = if (has_position) {
-            is.na(position) | as.character(position) == "" | as.character(position) == "NA"
-          } else {
-            TRUE
-          }
-        ) %>%
-        filter(needs_team | needs_position) %>%
-        select(test_ID, vald_id) %>%
-        distinct()
-      
-      if (nrow(missing_info) > 0) {
-        create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
-        
-        # Look up roster info for these vald_ids
-        roster_updates <- missing_info %>%
-          left_join(
-            Vald_roster_backfill %>% select(vald_id, team, position, sport), 
-            by = "vald_id"
-          ) %>%
-          filter(!is.na(team) | !is.na(position))
-        
-        if (nrow(roster_updates) > 0) {
-          create_log_entry(glue("Found roster data for {nrow(roster_updates)} records in {table_name}"))
-          
-          # Get full records and merge with roster data
-          records_to_update <- existing_data %>%
-            filter(test_ID %in% roster_updates$test_ID) %>%
-            select(-any_of(c("team", "position", "sport"))) %>%
-            left_join(
-              Vald_roster_backfill %>% select(vald_id, team, position, sport), 
-              by = "vald_id"
-            )
-          
-          if (nrow(records_to_update) > 0) {
-            create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
-            
-            bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
-                     partition_field = "date", cluster_fields = c("team", "vald_id"))
-            
-            create_log_entry(glue("Successfully backfilled {nrow(records_to_update)} records in {table_name}"))
-            total_backfilled <- total_backfilled + nrow(records_to_update)
-          }
-        } else {
-          create_log_entry(glue("No matching roster data found for {table_name} missing records"), "WARN")
-        }
-      } else {
-        create_log_entry(glue("All records in {table_name} have complete team/position data"))
-      }
-      
-    }, error = function(e) {
-      create_log_entry(glue("Error during backfill for {table_name}: {e$message}"), "WARN")
-    })
-  }
-  
-  if (total_backfilled > 0) {
-    create_log_entry(glue("=== BACKFILL COMPLETE: Updated {total_backfilled} total records across all tables ==="))
-  } else {
-    create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
-  }
-} else {
-  create_log_entry("No vald_roster found - skipping team/position backfill", "WARN")
 }
 
 # Reuse roster for processing
@@ -559,6 +461,98 @@ if (!date_mismatch && !count_mismatch) {
 }
 
 create_log_entry(glue("Changes detected - Running update (date_mismatch: {date_mismatch}, count_mismatch: {count_mismatch})"))
+
+# ---------- Backfill missing team/position data ----------
+create_log_entry("=== CHECKING FOR INCOMPLETE TEAM DATA ===")
+
+total_backfilled <- 0
+
+if (nrow(Vald_roster_backfill) > 0) {
+  tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
+                       "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
+  
+  for (table_name in tables_to_check) {
+    tryCatch({
+      existing_data <- read_bq_table(table_name)
+      
+      if (nrow(existing_data) == 0) {
+        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
+        next
+      }
+      
+      # Check if required columns exist
+      has_test_id <- "test_ID" %in% names(existing_data)
+      has_vald_id <- "vald_id" %in% names(existing_data)
+      has_team <- "team" %in% names(existing_data)
+      
+      if (!has_test_id || !has_vald_id) {
+        create_log_entry(glue("Skipping {table_name} - missing test_ID or vald_id columns"), "WARN")
+        next
+      }
+      
+      if (!has_team) {
+        create_log_entry(glue("Table {table_name} has no team column - skipping"), "INFO")
+        next
+      }
+      
+      # Find records with missing team
+      missing_info <- existing_data %>%
+        filter(is.na(team) | as.character(team) == "" | as.character(team) == "NA") %>%
+        select(test_ID, vald_id) %>%
+        distinct()
+      
+      if (nrow(missing_info) > 0) {
+        create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team"))
+        
+        # Look up team info for these vald_ids
+        roster_updates <- missing_info %>%
+          left_join(
+            Vald_roster_backfill %>% select(vald_id, team), 
+            by = "vald_id"
+          ) %>%
+          filter(!is.na(team))
+        
+        if (nrow(roster_updates) > 0) {
+          create_log_entry(glue("Found team data for {nrow(roster_updates)} records in {table_name}"))
+          
+          # Get full records and merge with team data
+          records_to_update <- existing_data %>%
+            filter(test_ID %in% roster_updates$test_ID) %>%
+            select(-team) %>%
+            left_join(
+              Vald_roster_backfill %>% select(vald_id, team), 
+              by = "vald_id"
+            )
+          
+          if (nrow(records_to_update) > 0) {
+            create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
+            
+            bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
+                     partition_field = "date", cluster_fields = c("team", "vald_id"))
+            
+            create_log_entry(glue("Successfully backfilled team for {nrow(records_to_update)} records in {table_name}"))
+            total_backfilled <- total_backfilled + nrow(records_to_update)
+          }
+        } else {
+          create_log_entry(glue("No matching team data found for {table_name} missing records"), "WARN")
+        }
+      } else {
+        create_log_entry(glue("All records in {table_name} have team data"))
+      }
+      
+    }, error = function(e) {
+      create_log_entry(glue("Error during backfill for {table_name}: {e$message}"), "WARN")
+    })
+  }
+  
+  if (total_backfilled > 0) {
+    create_log_entry(glue("=== BACKFILL COMPLETE: Updated {total_backfilled} total records across all tables ==="))
+  } else {
+    create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
+  }
+} else {
+  create_log_entry("No vald_roster found - skipping team backfill", "WARN")
+}
 
 # ---------- Overlap start date (latest - 1 day), then fetch ----------
 overlap_days <- 1L
@@ -638,11 +632,18 @@ forcedecks_raw <- mergable_trials %>%
   left_join(mergable_roster, by="vald_id") %>%
   mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
 
-bw <- forcedecks_raw %>%
-  select(vald_id, date, body_weight_lbs) %>%
-  filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
-  summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
-  arrange(vald_id, date)
+# Create body weight lookup table (only if column exists)
+if ("body_weight_lbs" %in% names(forcedecks_raw)) {
+  bw <- forcedecks_raw %>%
+    select(vald_id, date, body_weight_lbs) %>%
+    filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
+    summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
+    arrange(vald_id, date)
+  create_log_entry(glue("Created body weight lookup with {nrow(bw)} records"))
+} else {
+  bw <- tibble(vald_id = character(0), date = as.Date(character(0)), body_weight_lbs = numeric(0))
+  create_log_entry("No body_weight_lbs column in forcedecks_raw - creating empty lookup table", "WARN")
+}
 
 attach_bw <- function(df) {
   if (!all(c("vald_id","date") %in% names(df))) return(df)
@@ -663,7 +664,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
   cmj_new <- cmj_temp %>%
     select(any_of(c(
-      "test_ID","vald_id","full_name","position","team","test_type","date","time","body_weight_lbs",
+      "test_ID","vald_id","full_name","position","team","test_type","date","time",
       "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
       "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration","mean_ecc_con_ratio",
       "mean_takeoff_velocity","peak_landing_velocity","peak_takeoff_force","peak_takeoff_velocity",
