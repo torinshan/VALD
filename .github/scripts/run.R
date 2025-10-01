@@ -376,20 +376,33 @@ create_log_entry(glue("Current state - Latest date: {latest_date_current} Test c
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM/POSITION DATA ===")
 Vald_roster_backfill <- read_bq_table("vald_roster")
 
-# Rename columns from BigQuery schema to processing schema
 if (nrow(Vald_roster_backfill) > 0) {
-  if ("category_1" %in% names(Vald_roster_backfill)) {
-    Vald_roster_backfill <- Vald_roster_backfill %>% 
-      rename(team = category_1)
-    create_log_entry("Renamed category_1 to team in vald_roster")
+  # Remove existing team/position columns if they exist (we'll use category_1/group_1 instead)
+  if ("team" %in% names(Vald_roster_backfill)) {
+    Vald_roster_backfill <- Vald_roster_backfill %>% select(-team)
+    create_log_entry("Removed existing team column (will use category_1)")
   }
+  if ("position" %in% names(Vald_roster_backfill)) {
+    Vald_roster_backfill <- Vald_roster_backfill %>% select(-position)
+    create_log_entry("Removed existing position column (will use group_1)")
+  }
+  
+  # Now rename the source columns
+  if ("category_1" %in% names(Vald_roster_backfill)) {
+    Vald_roster_backfill <- Vald_roster_backfill %>% rename(team = category_1)
+    create_log_entry("Renamed category_1 to team in vald_roster")
+  } else {
+    create_log_entry("Warning: category_1 column not found in vald_roster", "WARN")
+  }
+  
   if ("group_1" %in% names(Vald_roster_backfill)) {
-    Vald_roster_backfill <- Vald_roster_backfill %>% 
-      rename(position = group_1)
+    Vald_roster_backfill <- Vald_roster_backfill %>% rename(position = group_1)
     create_log_entry("Renamed group_1 to position in vald_roster")
+  } else {
+    create_log_entry("Warning: group_1 column not found in vald_roster", "WARN")
   }
 }
-                                            
+
 total_backfilled <- 0
 
 if (nrow(Vald_roster_backfill) > 0) {
@@ -400,44 +413,82 @@ if (nrow(Vald_roster_backfill) > 0) {
     tryCatch({
       existing_data <- read_bq_table(table_name)
       
-      if (nrow(existing_data) > 0) {
-        missing_info <- existing_data %>%
-          filter(is.na(team) | is.na(position) | team == "" | position == "") %>%
-          select(test_ID, vald_id) %>%
-          distinct()
-        
-        if (nrow(missing_info) > 0) {
-          create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
-          
-          roster_updates <- missing_info %>%
-            left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id") %>%
-            filter(!is.na(team) | !is.na(position))
-          
-          if (nrow(roster_updates) > 0) {
-            create_log_entry(glue("Updating {nrow(roster_updates)} records in {table_name} with roster data"))
-            
-            records_to_update <- existing_data %>%
-              filter(test_ID %in% roster_updates$test_ID) %>%
-              select(-team, -position, -sport) %>%
-              left_join(Vald_roster_backfill %>% select(vald_id, team, position, sport), by = "vald_id")
-            
-            if (nrow(records_to_update) > 0) {
-              bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
-                       partition_field = "date", cluster_fields = c("team", "vald_id"))
-              create_log_entry(glue("Successfully backfilled team/position for {nrow(records_to_update)} records in {table_name}"))
-              total_backfilled <- total_backfilled + nrow(records_to_update)
-            }
+      if (nrow(existing_data) == 0) {
+        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
+        next
+      }
+      
+      # Check if required columns exist
+      has_test_id <- "test_ID" %in% names(existing_data)
+      has_vald_id <- "vald_id" %in% names(existing_data)
+      has_team <- "team" %in% names(existing_data)
+      has_position <- "position" %in% names(existing_data)
+      
+      if (!has_test_id || !has_vald_id) {
+        create_log_entry(glue("Skipping {table_name} - missing test_ID or vald_id columns"), "WARN")
+        next
+      }
+      
+      # Find records with missing team or position
+      # Use safe filtering that handles missing columns and various data types
+      missing_info <- existing_data %>%
+        mutate(
+          needs_team = if (has_team) {
+            is.na(team) | as.character(team) == "" | as.character(team) == "NA"
           } else {
-            create_log_entry(glue("No roster matches found for missing records in {table_name}"), "WARN")
+            TRUE
+          },
+          needs_position = if (has_position) {
+            is.na(position) | as.character(position) == "" | as.character(position) == "NA"
+          } else {
+            TRUE
+          }
+        ) %>%
+        filter(needs_team | needs_position) %>%
+        select(test_ID, vald_id) %>%
+        distinct()
+      
+      if (nrow(missing_info) > 0) {
+        create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team/position"))
+        
+        # Look up roster info for these vald_ids
+        roster_updates <- missing_info %>%
+          left_join(
+            Vald_roster_backfill %>% select(vald_id, team, position, sport), 
+            by = "vald_id"
+          ) %>%
+          filter(!is.na(team) | !is.na(position))
+        
+        if (nrow(roster_updates) > 0) {
+          create_log_entry(glue("Found roster data for {nrow(roster_updates)} records in {table_name}"))
+          
+          # Get full records and merge with roster data
+          records_to_update <- existing_data %>%
+            filter(test_ID %in% roster_updates$test_ID) %>%
+            select(-any_of(c("team", "position", "sport"))) %>%
+            left_join(
+              Vald_roster_backfill %>% select(vald_id, team, position, sport), 
+              by = "vald_id"
+            )
+          
+          if (nrow(records_to_update) > 0) {
+            create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
+            
+            bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
+                     partition_field = "date", cluster_fields = c("team", "vald_id"))
+            
+            create_log_entry(glue("Successfully backfilled {nrow(records_to_update)} records in {table_name}"))
+            total_backfilled <- total_backfilled + nrow(records_to_update)
           }
         } else {
-          create_log_entry(glue("All records in {table_name} have complete team/position data"))
+          create_log_entry(glue("No matching roster data found for {table_name} missing records"), "WARN")
         }
       } else {
-        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
+        create_log_entry(glue("All records in {table_name} have complete team/position data"))
       }
+      
     }, error = function(e) {
-      create_log_entry(glue("Error checking {table_name} for missing data: {e$message}"), "WARN")
+      create_log_entry(glue("Error during backfill for {table_name}: {e$message}"), "WARN")
     })
   }
   
@@ -576,7 +627,11 @@ mergable_trials <- trials_wider %>%
             athleteid = first(athleteid), .groups="drop") %>%
   mutate(vald_id = as.character(athleteid)) %>% select(-athleteid)
 
-mergable_roster <- roster %>% left_join(Vald_roster %>% select(vald_id, position, sport, team), by="vald_id")
+mergable_roster <- roster %>% 
+  left_join(
+    Vald_roster %>% select(any_of(c("vald_id", "position", "sport", "team"))), 
+    by = "vald_id"
+  )
 
 forcedecks_raw <- mergable_trials %>%
   left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
