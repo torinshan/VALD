@@ -632,29 +632,31 @@ forcedecks_raw <- mergable_trials %>%
   left_join(mergable_roster, by="vald_id") %>%
   mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
 
-# Create body weight lookup table (only if column exists)
+# Create body weight lookup table (gated - only if data exists)
 if ("body_weight_lbs" %in% names(forcedecks_raw)) {
+  create_log_entry("Processing body weight lookup table")
   bw <- forcedecks_raw %>%
     select(vald_id, date, body_weight_lbs) %>%
     filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
     summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
     arrange(vald_id, date)
   create_log_entry(glue("Created body weight lookup with {nrow(bw)} records"))
-} else {
-  bw <- tibble(vald_id = character(0), date = as.Date(character(0)), body_weight_lbs = numeric(0))
-  create_log_entry("No body_weight_lbs column in forcedecks_raw - creating empty lookup table", "WARN")
-}
-
-attach_bw <- function(df) {
-  if (!all(c("vald_id","date") %in% names(df))) return(df)
-  if (nrow(bw)==0) {
-    create_log_entry("No body weight data available for attachment", "WARN")
-    return(df)
+  
+  attach_bw <- function(df) {
+    if (!all(c("vald_id","date") %in% names(df))) return(df)
+    if (nrow(bw)==0) {
+      create_log_entry("No body weight data available for attachment", "WARN")
+      return(df)
+    }
+    dt <- as.data.table(df); bw_dt <- as.data.table(bw)
+    setkey(bw_dt, vald_id, date); setkey(dt, vald_id, date)
+    dt[bw_dt, body_weight_lbs := i.body_weight_lbs, roll=Inf, on=.(vald_id, date)]
+    as_tibble(dt)
   }
-  dt <- as.data.table(df); bw_dt <- as.data.table(bw)
-  setkey(bw_dt, vald_id, date); setkey(dt, vald_id, date)
-  dt[bw_dt, body_weight_lbs := i.body_weight_lbs, roll=Inf, on=.(vald_id, date)]
-  as_tibble(dt)
+} else {
+  create_log_entry("No body_weight_lbs column in forcedecks_raw - skipping body weight lookup creation")
+  # Define no-op function when body weight data doesn't exist
+  attach_bw <- function(df) { return(df) }
 }
 
 # -------- Sections (gated) --------
