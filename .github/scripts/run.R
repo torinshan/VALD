@@ -524,6 +524,9 @@ if (nrow(Vald_roster_backfill) > 0) {
               by = "vald_id"
             )
           
+          # Remove position column if it exists (not all tables have it)
+          records_to_update <- records_to_update %>% select(-any_of("position"))
+          
           if (nrow(records_to_update) > 0) {
             create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
             
