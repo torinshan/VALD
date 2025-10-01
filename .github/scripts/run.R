@@ -727,14 +727,14 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
 
   fd <- cmj_all %>% arrange(full_name, test_type, date) %>% group_by(full_name, test_type) %>%
     mutate(
-      mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
-      sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+      sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
       zscore_jump_height_inches_imp_mom = if_else(sd_30d_jh > 0, (jump_height_inches_imp_mom - mean_30d_jh)/sd_30d_jh, NA_real_),
-      mean_30d_rpcf = slide_index_dbl(relative_peak_concentric_force, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
-      sd_30d_rpcf   = slide_index_dbl(relative_peak_concentric_force, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      mean_30d_rpcf = slide_index_dbl(relative_peak_concentric_force, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+      sd_30d_rpcf   = slide_index_dbl(relative_peak_concentric_force, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
       zscore_relative_peak_concentric_force = if_else(sd_30d_rpcf > 0, (relative_peak_concentric_force - mean_30d_rpcf)/sd_30d_rpcf, NA_real_),
-      mean_30d_rsi = slide_index_dbl(rsi_modified_imp_mom, date, mean, .before = days(30), .complete = FALSE, .na_rm = TRUE),
-      sd_30d_rsi   = slide_index_dbl(rsi_modified_imp_mom, date, sd,   .before = days(30), .complete = FALSE, .na_rm = TRUE),
+      mean_30d_rsi = slide_index_dbl(rsi_modified_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
+      sd_30d_rsi   = slide_index_dbl(rsi_modified_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
       zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
     ) %>% ungroup() %>%
     group_by(full_name) %>%
