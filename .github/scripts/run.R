@@ -612,6 +612,16 @@ trials_wider <- as_tibble(trials) %>%
   select(-recordedUTC_parsed, -recordedUTC_local) %>%
   rename_with(tolower)
 
+# Convert metric columns to numeric (starting from start_of_movement onwards)
+if ("start_of_movement" %in% names(trials_wider)) {
+  start_col <- which(names(trials_wider) == "start_of_movement")
+  trials_wider <- trials_wider %>% 
+    mutate(across(all_of(start_col:ncol(.)), as.numeric))
+  create_log_entry(glue("Converted {ncol(trials_wider) - start_col + 1} metric columns to numeric"))
+} else {
+  create_log_entry("Warning: start_of_movement column not found - cannot identify metric columns", "WARN")
+}
+
 mergable_trials <- trials_wider %>%
   mutate(test_ID = as.character(testid)) %>%
   group_by(test_ID) %>%
