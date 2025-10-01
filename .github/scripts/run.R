@@ -281,6 +281,13 @@ bq_upsert <- function(data, table_name, key="test_ID",
                       partition_field="date",
                       cluster_fields=c("team","test_type","vald_id")) {
   mode <- match.arg(mode)
+  
+  # CRITICAL: Strip position column if it exists (not in any table schemas)
+  if ("position" %in% names(data)) {
+    data <- data %>% select(-position)
+    create_log_entry(glue("Removed position column before uploading to {table_name}"))
+  }
+  
   data <- standardize_data_types(data, table_name)
   tbl <- bq_table(ds, table_name)
 
