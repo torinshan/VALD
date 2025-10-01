@@ -725,7 +725,10 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   cmj_existing <- read_bq_table("vald_fd_jumps") %>% mutate(test_ID = as.character(test_ID))
   cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
-  fd <- cmj_all %>% arrange(full_name, test_type, date) %>% group_by(full_name, test_type) %>%
+  fd <- cmj_all %>% 
+    arrange(full_name, test_type, date) %>%  # Ensure sorted before grouping
+    group_by(full_name, test_type) %>%
+    arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each group
     mutate(
       mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
       sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
