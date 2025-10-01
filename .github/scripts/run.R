@@ -787,7 +787,8 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
     ungroup() %>%
     filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
     select(-starts_with("mean_30d_"), -starts_with("sd_30d_"), -cmj_mask,
-           -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"))
+           -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"),
+           -starts_with("zscore_"))  # Remove z-score columns (not in BigQuery schema)
 
   if (all(c("jump_height_inches_imp_mom","relative_peak_eccentric_force",
             "bodymass_relative_takeoff_power","rsi_modified_imp_mom") %in% names(fd))) {
