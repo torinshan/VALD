@@ -741,6 +741,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
       zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
     ) %>% ungroup() %>%
     group_by(full_name) %>%
+    arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each full_name group
     mutate(
       cmj_mask = (test_type == "CMJ"),
       jh_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, jump_height_inches_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
