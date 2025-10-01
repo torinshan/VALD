@@ -218,6 +218,13 @@ read_bq_table <- function(table_name) {
     result <- bind_rows(all_rows)
     
     create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows via REST API"))
+    
+    # CRITICAL: Remove position column if it exists (not in schema but may exist in data)
+    if ("position" %in% names(result)) {
+      result <- result %>% select(-position)
+      create_log_entry(paste("Removed position column from", table_name))
+    }
+    
     return(result)
     
   }, error = function(e) {
@@ -296,23 +303,33 @@ bq_upsert <- function(data, table_name, key="test_ID",
 
   # MERGE
   stage <- bq_table(ds, paste0(table_name, "_stage"))
-  if (bq_table_exists(stage)) bq_table_delete(stage)
-  bq_table_create(stage, fields = as_bq_fields(data))
-  bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
+  
+  tryCatch({
+    if (bq_table_exists(stage)) bq_table_delete(stage)
+    bq_table_create(stage, fields = as_bq_fields(data))
+    bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
 
-  cols <- names(data); if (!key %in% cols) stop(glue("Key {key} missing for {table_name}"))
-  up_cols <- setdiff(cols, key); if (length(up_cols)==0) stop(glue("No updatable cols for {table_name}"))
+    cols <- names(data); if (!key %in% cols) stop(glue("Key {key} missing for {table_name}"))
+    up_cols <- setdiff(cols, key); if (length(up_cols)==0) stop(glue("No updatable cols for {table_name}"))
 
-  set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
-  insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
-  insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
-  sql <- glue("MERGE `{project}.{dataset}.{table_name}` T
-               USING `{project}.{dataset}.{table_name}_stage` S
-               ON T.`{key}`=S.`{key}`
-               WHEN MATCHED THEN UPDATE SET {set_clause}
-               WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})")
-  DBI::dbExecute(con, sql)
-  bq_table_delete(stage)
+    set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
+    insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
+    insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
+    sql <- glue("MERGE `{project}.{dataset}.{table_name}` T
+                 USING `{project}.{dataset}.{table_name}_stage` S
+                 ON T.`{key}`=S.`{key}`
+                 WHEN MATCHED THEN UPDATE SET {set_clause}
+                 WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})")
+    DBI::dbExecute(con, sql)
+    
+  }, finally = {
+    # Always clean up staging table, even on error
+    if (bq_table_exists(stage)) {
+      bq_table_delete(stage)
+      create_log_entry(glue("Cleaned up staging table {table_name}_stage"))
+    }
+  })
+  
   meta <- bq_table_meta(tbl)
   create_log_entry(glue("MERGE complete; {table_name} now has {meta$numRows %||% NA} rows"))
   TRUE
@@ -725,7 +742,10 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
     ))) %>%
     filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
 
-  cmj_existing <- read_bq_table("vald_fd_jumps") %>% mutate(test_ID = as.character(test_ID))
+  cmj_existing <- read_bq_table("vald_fd_jumps") %>% 
+    mutate(test_ID = as.character(test_ID)) %>%
+    select(-any_of("position"))  # Remove position if it exists in old data
+  
   cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
   fd <- cmj_all %>% 
