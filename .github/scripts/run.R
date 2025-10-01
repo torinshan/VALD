@@ -632,6 +632,26 @@ forcedecks_raw <- mergable_trials %>%
   left_join(mergable_roster, by="vald_id") %>%
   mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
 
+# Clean column names to match BigQuery schema
+clean_column_names <- function(df) {
+  names(df) <- names(df) %>%
+    # Convert camelCase to snake_case
+    gsub("([a-z])([A-Z])", "\\1_\\2", .) %>%
+    # Lowercase everything
+    tolower() %>%
+    # Replace special characters with underscores
+    gsub("[^a-zA-Z0-9_]", "_", .) %>%
+    # Remove multiple consecutive underscores
+    gsub("_{2,}", "_", .) %>%
+    # Remove leading/trailing underscores
+    gsub("^_|_$", "", .)
+  return(df)
+}
+
+forcedecks_raw <- clean_column_names(forcedecks_raw)
+create_log_entry(paste("forcedecks_raw columns (first 50):", paste(head(names(forcedecks_raw), 50), collapse=", ")))
+create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
+
 # Create body weight lookup table (gated - only if data exists)
 if ("body_weight_lbs" %in% names(forcedecks_raw)) {
   create_log_entry("Processing body weight lookup table")
@@ -664,8 +684,19 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
 if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
-  cmj_new <- cmj_temp %>%
-    select(any_of(c(
+  
+  # Debug: Log available columns
+  create_log_entry(paste("cmj_temp row count:", nrow(cmj_temp)))
+  create_log_entry(paste("cmj_temp columns:", paste(names(cmj_temp), collapse=", ")))
+  
+  # Verify required columns exist in the new data
+  if (nrow(cmj_temp) == 0) {
+    create_log_entry("No CMJ test data found after filtering - skipping CMJ processing", "WARN")
+  } else if (!"jump_height_inches_imp_mom" %in% names(cmj_temp)) {
+    create_log_entry("CMJ data missing required column jump_height_inches_imp_mom - skipping CMJ processing", "WARN")
+  } else {
+    cmj_new <- cmj_temp %>%
+      select(any_of(c(
       "test_ID","vald_id","full_name","position","team","test_type","date","time",
       "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
       "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration","mean_ecc_con_ratio",
@@ -726,8 +757,10 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
       group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
       ungroup() %>% select(-calc_performance_score)
   }
+  }
   bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
             partition_field="date", cluster_fields=c("team","test_type","vald_id"))
+  }
 } else create_log_entry("No new CMJ-family tests - skipping CMJ section")
 
 # DJ: MERGE
