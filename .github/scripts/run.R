@@ -145,6 +145,7 @@ read_bq_table <- function(table_name) {
           } else if (field$type == "TIME") {
             return(hms::as_hms(val))
           } else if (field$type == "TIMESTAMP") {
+            # tabledata.list returns TIMESTAMP as string seconds (possibly fractional)
             return(as.POSIXct(as.numeric(as.character(val)), origin = "1970-01-01", tz = "UTC"))
           } else {
             return(as.character(val))
@@ -154,6 +155,7 @@ read_bq_table <- function(table_name) {
         as.data.frame(values, stringsAsFactors = FALSE)
       })
       all_rows[[page_num]] <- bind_rows(page_data)
+      # In responses, the next page token is nextPageToken
       page_token <- content$nextPageToken
       if (is.null(page_token)) break
       page_num <- page_num + 1
@@ -265,25 +267,19 @@ bq_upsert <- function(data, table_name, key="test_ID",
   existing <- read_bq_table(table_name)
 
   if (nrow(existing) == 0) {
-    # table exists but empty
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
   } else {
-    # Ensure both have the key as character to compare uniformly
     existing[[key]] <- as.character(existing[[key]])
     data[[key]]     <- as.character(data[[key]])
 
-    # Align columns: keep union of columns, fill missing with NA
+    # Align columns
     all_cols <- union(names(existing), names(data))
-    existing <- existing %>% mutate(across(.cols = everything(), .fns = identity))
-    data     <- data %>% mutate(across(.cols = everything(), .fns = identity))
     for (cn in setdiff(all_cols, names(existing))) existing[[cn]] <- NA
     for (cn in setdiff(all_cols, names(data)))     data[[cn]]     <- NA
     existing <- existing[, all_cols, drop=FALSE]
     data     <- data[, all_cols, drop=FALSE]
 
-    # Bind existing first, then new; keep last occurrence of each key (new wins)
-    combined <- bind_rows(existing, data)
-    combined <- combined %>%
+    combined <- bind_rows(existing, data) %>%
       mutate(.row_id = row_number()) %>%
       arrange(.row_id) %>%
       group_by(.data[[key]]) %>%
@@ -291,10 +287,7 @@ bq_upsert <- function(data, table_name, key="test_ID",
       ungroup() %>%
       select(-.row_id)
 
-    # Re-apply standardization (numeric conversions may introduce types)
     combined <- standardize_data_types(combined, table_name)
-
-    # Preserve partitioning/clustering by truncating into the same table
     bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
   }
 
@@ -319,7 +312,6 @@ fix_rsi_data_type <- function() {
     create_log_entry("body_weight_lbs column missing - skipping")
     return(invisible(TRUE))
   }
-  # If BigQuery schema says STRING, our REST reader will yield character
   current <- read_bq_table("vald_fd_rsi")
   if (!("body_weight_lbs" %in% names(current))) {
     create_log_entry("body_weight_lbs not present in data - skipping")
@@ -332,7 +324,6 @@ fix_rsi_data_type <- function() {
   create_log_entry("Converting body_weight_lbs STRING -> numeric locally, then WRITE_TRUNCATE")
   suppressWarnings(current$body_weight_lbs <- as.numeric(current$body_weight_lbs))
   current <- standardize_data_types(current, "vald_fd_rsi")
-  # Keep existing partitioning/clustering
   bq_table_upload(tbl, current, write_disposition = "WRITE_TRUNCATE")
   create_log_entry("Converted body_weight_lbs to numeric via load job")
   invisible(TRUE)
@@ -481,7 +472,6 @@ if (nrow(Vald_roster_backfill) > 0) {
             select(-any_of("position"))
           if (nrow(records_to_update) > 0) {
             create_log_entry(paste("Updating", nrow(records_to_update), "records in", table_name))
-            # DML-free "merge": only update those records' rows locally and overwrite table
             remaining <- existing_data %>% filter(!(test_ID %in% records_to_update$test_ID))
             new_table <- bind_rows(remaining, records_to_update)
             bq_upsert(new_table, table_name, key = "test_ID", mode = "TRUNCATE",
@@ -607,7 +597,14 @@ clean_column_names <- function(df) {
   df
 }
 
+# Clean column names and log the results
 forcedecks_raw <- clean_column_names(forcedecks_raw)
+
+# Normalize key name after cleaning (so downstream expects `test_ID`)
+if ("test_id" %in% names(forcedecks_raw) && !("test_ID" %in% names(forcedecks_raw))) {
+  forcedecks_raw <- forcedecks_raw %>% dplyr::rename(test_ID = test_id)
+}
+
 first_50_cols <- head(names(forcedecks_raw), 50)
 create_log_entry(paste("forcedecks_raw columns (first 50):", paste(first_50_cols, collapse = ", ")))
 create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
