@@ -29,38 +29,25 @@ GLOBAL_ACCESS_TOKEN <- NULL
 # ---------- Auth (Working Version) ----------
 tryCatch({
   cat("=== Authenticating to BigQuery ===\n")
-  
-  # Get access token from gcloud and store it globally
   access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
   GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
-  
   if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
     cat("Access token obtained from gcloud\n")
-    
-    # Create gargle token object
     token <- gargle::gargle2.0_token(
       scope = 'https://www.googleapis.com/auth/bigquery',
       client = gargle::gargle_client(),
       credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
     )
-    
-    # Set token for bigrquery
     bigrquery::bq_auth(token = token)
     cat("BigQuery authentication successful\n")
-    
-    # CRITICAL: Re-set Storage API options AFTER authentication
     options(bigrquery.use_bqstorage = FALSE)
     Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
-    
-    # Test authentication using bq_dataset_exists (REST API only, no Storage API)
     ds <- bigrquery::bq_dataset(project, dataset)
     invisible(bigrquery::bq_dataset_exists(ds))
     cat("Authentication test passed (dataset visible via REST)\n")
-    
   } else {
     stop("Could not obtain access token from gcloud")
   }
-  
 }, error = function(e) {
   cat("BigQuery authentication failed:", e$message, "\n")
   quit(status = 1)
@@ -113,46 +100,29 @@ read_bq_table <- function(table_name) {
     create_log_entry(paste("Table", table_name, "does not exist"), "INFO")
     return(data.frame())
   }
-  
   create_log_entry(paste("Reading table", table_name, "using REST API"), "INFO")
-  
   tryCatch({
-    # Get table schema first
     meta <- bq_table_meta(tbl)
     fields <- meta$schema$fields
-    
-    # Use tabledata.list REST API endpoint (no Storage API required)
     all_rows <- list()
     page_token <- NULL
     page_num <- 1
-    
     repeat {
-      # Build REST API URL
       url <- sprintf(
         "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data",
         project, dataset, table_name
       )
-      
-      # Add page token if we have one
       query_params <- list(maxResults = 10000)
-      if (!is.null(page_token)) {
-        query_params$pageToken <- page_token
-      }
-      
-      # Make REST API call with GLOBAL_ACCESS_TOKEN
+      if (!is.null(page_token)) query_params$pageToken <- page_token
       response <- httr::GET(
         url,
         httr::add_headers(Authorization = paste("Bearer", GLOBAL_ACCESS_TOKEN)),
         query = query_params
       )
-      
       if (httr::http_error(response)) {
         stop(paste("REST API error:", httr::content(response, "text")))
       }
-      
       content <- httr::content(response, "parsed")
-      
-      # Check if we have rows
       if (is.null(content$rows) || length(content$rows) == 0) {
         if (page_num == 1) {
           create_log_entry(paste("Table", table_name, "returned no data"), "INFO")
@@ -160,14 +130,10 @@ read_bq_table <- function(table_name) {
         }
         break
       }
-      
-      # Parse rows into data frame
       page_data <- lapply(content$rows, function(row) {
         values <- lapply(seq_along(fields), function(i) {
           val <- row$f[[i]]$v
           field <- fields[[i]]
-          
-          # Convert based on field type
           if (is.null(val)) {
             return(NA)
           } else if (field$type == "INTEGER" || field$type == "INT64") {
@@ -179,49 +145,33 @@ read_bq_table <- function(table_name) {
           } else if (field$type == "TIME") {
             return(hms::as_hms(val))
           } else if (field$type == "TIMESTAMP") {
-            # Be robust to string/decimal/scientific formats
             return(as.POSIXct(as.numeric(as.character(val)), origin = "1970-01-01", tz = "UTC"))
           } else {
             return(as.character(val))
           }
         })
         names(values) <- sapply(fields, function(f) f$name)
-        return(as.data.frame(values, stringsAsFactors = FALSE))
+        as.data.frame(values, stringsAsFactors = FALSE)
       })
-      
       all_rows[[page_num]] <- bind_rows(page_data)
-      
-      # Check for next page (response uses nextPageToken)
       page_token <- content$nextPageToken
       if (is.null(page_token)) break
-      
       page_num <- page_num + 1
-      
-      # Safety limit
       if (page_num > 100) {
         create_log_entry(paste("Warning: Hit page limit for", table_name), "WARN")
         break
       }
     }
-    
-    # Combine all pages
     result <- bind_rows(all_rows)
-    
-    rows_msg <- paste("Successfully read", table_name, ":", nrow(result), "rows via REST API")
-    create_log_entry(rows_msg)
-    
-    # CRITICAL: Remove position column if it exists (not in schema but may exist in data)
+    create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows via REST API"))
     if ("position" %in% names(result)) {
       result <- result %>% select(-position)
-      pos_msg <- paste("Removed position column from", table_name)
-      create_log_entry(pos_msg)
+      create_log_entry(paste("Removed position column from", table_name))
     }
-    
-    return(result)
-    
+    result
   }, error = function(e) {
     create_log_entry(paste("Error reading", table_name, ":", e$message), "ERROR")
-    return(data.frame())
+    data.frame()
   })
 }
 
@@ -233,16 +183,9 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   }
   cl <- intersect(cluster_fields, names(data))
   bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering = cl)
-  # Log the table creation with simplified message
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
-  if (length(cl) > 0) {
-    cluster_list <- paste(cl, collapse = ",")
-    cluster_info <- cluster_list
-  } else {
-    cluster_info <- "none"
-  }
-  log_message <- paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info)
-  create_log_entry(log_message)
+  cluster_info <- if (length(cl) > 0) paste(cl, collapse = ",") else "none"
+  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info))
   invisible(TRUE)
 }
 
@@ -277,26 +220,25 @@ standardize_data_types <- function(data, table_name) {
   data
 }
 
+# ---------- DML-FREE UPSERT ----------
+# Implements MERGE client-side to avoid BigQuery DML. Only load jobs (WRITE_TRUNCATE/APPEND).
 bq_upsert <- function(data, table_name, key="test_ID",
                       mode=c("MERGE","TRUNCATE"),
                       partition_field="date",
                       cluster_fields=c("team","test_type","vald_id")) {
   mode <- match.arg(mode)
-  
-  # CRITICAL: Strip position column if it exists (not in any table schemas)
+
   if ("position" %in% names(data)) {
     data <- data %>% select(-position)
-    msg <- paste("Removed position column before uploading to", table_name)
-    create_log_entry(msg)
+    create_log_entry(paste("Removed position column before uploading to", table_name))
   }
-  
+
   data <- standardize_data_types(data, table_name)
   tbl <- bq_table(ds, table_name)
 
-  if (nrow(data) == 0) { 
-    msg <- paste("No rows to upload for", table_name)
-    create_log_entry(msg)
-    return(TRUE) 
+  if (nrow(data) == 0) {
+    create_log_entry(paste("No rows to upload for", table_name))
+    return(TRUE)
   }
 
   if (!bq_table_exists(tbl)) {
@@ -304,8 +246,7 @@ bq_upsert <- function(data, table_name, key="test_ID",
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
     num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
-    msg <- paste("Uploaded", num_rows, "rows to new table", table_name)
-    create_log_entry(msg)
+    create_log_entry(paste("Uploaded", num_rows, "rows to new table", table_name))
     return(TRUE)
   }
 
@@ -313,99 +254,88 @@ bq_upsert <- function(data, table_name, key="test_ID",
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
     num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
-    msg <- paste("Truncated+uploaded;", table_name, "now has", num_rows, "rows")
-    create_log_entry(msg)
+    create_log_entry(paste("Truncated+uploaded;", table_name, "now has", num_rows, "rows"))
     return(TRUE)
   }
 
-  # MERGE
-  stage <- bq_table(ds, paste0(table_name, "_stage"))
-  
-  tryCatch({
-    if (bq_table_exists(stage)) bq_table_delete(stage)
-    bq_table_create(stage, fields = as_bq_fields(data))
-    bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
+  # MERGE (client-side): read existing, combine, de-dupe by key favoring NEW
+  if (!(key %in% names(data))) {
+    stop(paste("Key", key, "missing for", table_name))
+  }
+  existing <- read_bq_table(table_name)
 
-    cols <- names(data)
-    if (!key %in% cols) {
-      msg <- paste("Key", key, "missing for", table_name)
-      stop(msg)
-    }
-    up_cols <- setdiff(cols, key)
-    if (length(up_cols)==0) {
-      msg <- paste("No updatable cols for", table_name)
-      stop(msg)
-    }
+  if (nrow(existing) == 0) {
+    # table exists but empty
+    bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
+  } else {
+    # Ensure both have the key as character to compare uniformly
+    existing[[key]] <- as.character(existing[[key]])
+    data[[key]]     <- as.character(data[[key]])
 
-    set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
-    insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
-    insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
-    
-    # Build SQL query
-    sql_query <- paste0(
-      "MERGE `", project, ".", dataset, ".", table_name, "` T ",
-      "USING `", project, ".", dataset, ".", table_name, "_stage` S ",
-      "ON T.`", key, "`=S.`", key, "` ",
-      "WHEN MATCHED THEN UPDATE SET ", set_clause, " ",
-      "WHEN NOT MATCHED THEN INSERT (", insert_cols, ") VALUES (", insert_vals, ")"
-    )
-    DBI::dbExecute(con, sql_query)
-    
-  }, finally = {
-    # Always clean up staging table, even on error
-    if (bq_table_exists(stage)) {
-      bq_table_delete(stage)
-      msg <- paste("Cleaned up staging table", table_name, "_stage")
-      create_log_entry(msg)
-    }
-  })
-  
+    # Align columns: keep union of columns, fill missing with NA
+    all_cols <- union(names(existing), names(data))
+    existing <- existing %>% mutate(across(.cols = everything(), .fns = identity))
+    data     <- data %>% mutate(across(.cols = everything(), .fns = identity))
+    for (cn in setdiff(all_cols, names(existing))) existing[[cn]] <- NA
+    for (cn in setdiff(all_cols, names(data)))     data[[cn]]     <- NA
+    existing <- existing[, all_cols, drop=FALSE]
+    data     <- data[, all_cols, drop=FALSE]
+
+    # Bind existing first, then new; keep last occurrence of each key (new wins)
+    combined <- bind_rows(existing, data)
+    combined <- combined %>%
+      mutate(.row_id = row_number()) %>%
+      arrange(.row_id) %>%
+      group_by(.data[[key]]) %>%
+      slice_tail(n = 1) %>%
+      ungroup() %>%
+      select(-.row_id)
+
+    # Re-apply standardization (numeric conversions may introduce types)
+    combined <- standardize_data_types(combined, table_name)
+
+    # Preserve partitioning/clustering by truncating into the same table
+    bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
+  }
+
   meta <- bq_table_meta(tbl)
   num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
-  msg <- paste("MERGE complete;", table_name, "now has", num_rows, "rows")
-  create_log_entry(msg)
+  create_log_entry(paste("MERGE (client-side) complete;", table_name, "now has", num_rows, "rows"))
   TRUE
 }
 
+# Fix RSI data type without DDL/DML: read -> convert -> WRITE_TRUNCATE
 fix_rsi_data_type <- function() {
-  create_log_entry("Checking body_weight_lbs type in vald_fd_rsi")
-  
-  tryCatch({
-    # Check if table exists first
-    tbl <- bq_table(ds, "vald_fd_rsi")
-    if (!bq_table_exists(tbl)) {
-      create_log_entry("Table vald_fd_rsi does not exist yet - skipping type fix")
-      return(invisible(TRUE))
-    }
-    
-    # Get table metadata to check column type
-    meta <- bq_table_meta(tbl)
-    fields <- meta$schema$fields
-    bw_field <- fields[sapply(fields, function(f) f$name == "body_weight_lbs")]
-    
-    if (length(bw_field) > 0 && bw_field[[1]]$type == "STRING") {
-      create_log_entry("Converting body_weight_lbs STRING -> FLOAT64")
-      
-      # Use DBI for ALTER statements (DML operations don't trigger Storage API reads)
-      sql1 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64")
-      DBI::dbExecute(con, sql1)
-      
-      sql2 <- paste0("UPDATE `", project, ".", dataset, ".vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64) WHERE TRUE")
-      DBI::dbExecute(con, sql2)
-      
-      sql3 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` DROP COLUMN body_weight_lbs")
-      DBI::dbExecute(con, sql3)
-      
-      sql4 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs")
-      DBI::dbExecute(con, sql4)
-      
-      create_log_entry("Converted body_weight_lbs to FLOAT64")
-    } else {
-      create_log_entry("body_weight_lbs already FLOAT64 or column missing")
-    }
-  }, error=function(e){ 
-    create_log_entry(paste("RSI type fix:", e$message), "WARN") 
-  })
+  create_log_entry("Checking body_weight_lbs type in vald_fd_rsi (DML-free)")
+  tbl <- bq_table(ds, "vald_fd_rsi")
+  if (!bq_table_exists(tbl)) {
+    create_log_entry("Table vald_fd_rsi does not exist yet - skipping type fix")
+    return(invisible(TRUE))
+  }
+  meta <- bq_table_meta(tbl)
+  fields <- meta$schema$fields
+  bw_field <- fields[sapply(fields, function(f) f$name == "body_weight_lbs")]
+  if (length(bw_field) == 0) {
+    create_log_entry("body_weight_lbs column missing - skipping")
+    return(invisible(TRUE))
+  }
+  # If BigQuery schema says STRING, our REST reader will yield character
+  current <- read_bq_table("vald_fd_rsi")
+  if (!("body_weight_lbs" %in% names(current))) {
+    create_log_entry("body_weight_lbs not present in data - skipping")
+    return(invisible(TRUE))
+  }
+  if (!is.character(current$body_weight_lbs)) {
+    create_log_entry("body_weight_lbs already numeric (or coerced) - no change")
+    return(invisible(TRUE))
+  }
+  create_log_entry("Converting body_weight_lbs STRING -> numeric locally, then WRITE_TRUNCATE")
+  suppressWarnings(current$body_weight_lbs <- as.numeric(current$body_weight_lbs))
+  current <- standardize_data_types(current, "vald_fd_rsi")
+  # Keep existing partitioning/clustering
+  bq_table_upload(tbl, current, write_disposition = "WRITE_TRUNCATE")
+  create_log_entry("Converted body_weight_lbs to numeric via load job")
+  invisible(TRUE)
 }
 
 # ---------- Current BQ state ----------
@@ -426,15 +356,13 @@ if (nrow(tests_tbl) > 0) {
 
 latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=TRUE) else as.Date("1900-01-01")
 count_tests_current <- nrow(tests_tbl)
-log_msg <- paste("Current state - Latest date:", latest_date_current, "Test count:", count_tests_current)
-create_log_entry(log_msg)
+create_log_entry(paste("Current state - Latest date:", latest_date_current, "Test count:", count_tests_current))
 
 # ---------- Read roster early for use in gate check and later processing ----------
 create_log_entry("=== READING ROSTER DATA ===")
 Vald_roster_backfill <- read_bq_table("vald_roster")
 
 if (nrow(Vald_roster_backfill) > 0) {
-  # Remove existing team/position columns if they exist (we'll use category_1/group_1 instead)
   if ("team" %in% names(Vald_roster_backfill)) {
     Vald_roster_backfill <- Vald_roster_backfill %>% select(-team)
     create_log_entry("Removed existing team column (will use category_1)")
@@ -443,15 +371,12 @@ if (nrow(Vald_roster_backfill) > 0) {
     Vald_roster_backfill <- Vald_roster_backfill %>% select(-position)
     create_log_entry("Removed existing position column (will use group_1)")
   }
-  
-  # Now rename the source columns
   if ("category_1" %in% names(Vald_roster_backfill)) {
     Vald_roster_backfill <- Vald_roster_backfill %>% rename(team = category_1)
     create_log_entry("Renamed category_1 to team in vald_roster")
   } else {
     create_log_entry("Warning: category_1 column not found in vald_roster", "WARN")
   }
-  
   if ("group_1" %in% names(Vald_roster_backfill)) {
     Vald_roster_backfill <- Vald_roster_backfill %>% rename(position = group_1)
     create_log_entry("Renamed group_1 to position in vald_roster")
@@ -460,7 +385,6 @@ if (nrow(Vald_roster_backfill) > 0) {
   }
 }
 
-# Reuse roster for processing
 Vald_roster <- Vald_roster_backfill
 if (nrow(Vald_roster)==0) create_log_entry("No vald_roster in BQ; proceeding without team/position", "WARN")
 
@@ -471,14 +395,11 @@ tryCatch({
   client_secret <- Sys.getenv("VALD_CLIENT_SECRET")
   tenant_id <- Sys.getenv("VALD_TENANT_ID")
   region <- Sys.getenv("VALD_REGION", "use")
-
   if (client_id == "" || client_secret == "" || tenant_id == "") {
     stop("Missing required VALD API credentials")
   }
-
   set_credentials(client_id, client_secret, tenant_id, region)
   set_start_date("2024-01-01T00:00:00Z")
-  
   create_log_entry("VALD API credentials configured successfully")
 }, error = function(e) {
   create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
@@ -517,108 +438,69 @@ if (!date_mismatch && !count_mismatch) {
   upload_logs_to_bigquery(); try(DBI::dbDisconnect(con), silent=TRUE); quit(status=0)
 }
 
-changes_msg <- paste("Changes detected - Running update (date_mismatch:", date_mismatch, ", count_mismatch:", count_mismatch, ")")
-create_log_entry(changes_msg)
+create_log_entry(paste("Changes detected - Running update (date_mismatch:", date_mismatch, ", count_mismatch:", count_mismatch, ")"))
 
 # ---------- Backfill missing team data ----------
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM DATA ===")
-
 total_backfilled <- 0
-
 if (nrow(Vald_roster_backfill) > 0) {
   tables_to_check <- c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", "vald_fd_rebound", 
                        "vald_fd_sl_jumps", "vald_fd_imtp", "vald_nord_all")
-  
   for (table_name in tables_to_check) {
     tryCatch({
       existing_data <- read_bq_table(table_name)
-      
       if (nrow(existing_data) == 0) {
-        msg <- paste("Table", table_name, "is empty - skipping backfill check")
-        create_log_entry(msg)
+        create_log_entry(paste("Table", table_name, "is empty - skipping backfill check"))
         next
       }
-      
-      # Check if required columns exist
       has_test_id <- "test_ID" %in% names(existing_data)
       has_vald_id <- "vald_id" %in% names(existing_data)
       has_team <- "team" %in% names(existing_data)
-      
       if (!has_test_id || !has_vald_id) {
-        msg <- paste("Skipping", table_name, "- missing test_ID or vald_id columns")
-        create_log_entry(msg, "WARN")
+        create_log_entry(paste("Skipping", table_name, "- missing test_ID or vald_id columns"), "WARN")
         next
       }
-      
       if (!has_team) {
-        msg <- paste("Table", table_name, "has no team column - skipping")
-        create_log_entry(msg, "INFO")
+        create_log_entry(paste("Table", table_name, "has no team column - skipping"), "INFO")
         next
       }
-      
-      # Find records with missing team
       missing_info <- existing_data %>%
         filter(is.na(team) | as.character(team) == "" | as.character(team) == "NA") %>%
-        select(test_ID, vald_id) %>%
-        distinct()
-      
+        select(test_ID, vald_id) %>% distinct()
       if (nrow(missing_info) > 0) {
-        msg <- paste("Found", nrow(missing_info), "records in", table_name, "missing team")
-        create_log_entry(msg)
-        
-        # Look up team info for these vald_ids
+        create_log_entry(paste("Found", nrow(missing_info), "records in", table_name, "missing team"))
         roster_updates <- missing_info %>%
-          left_join(
-            Vald_roster_backfill %>% select(vald_id, team), 
-            by = "vald_id"
-          ) %>%
+          left_join(Vald_roster_backfill %>% select(vald_id, team), by = "vald_id") %>%
           filter(!is.na(team))
-        
         if (nrow(roster_updates) > 0) {
-          msg <- paste("Found team data for", nrow(roster_updates), "records in", table_name)
-          create_log_entry(msg)
-          
-          # Get full records and merge with team data
+          create_log_entry(paste("Found team data for", nrow(roster_updates), "records in", table_name))
           records_to_update <- existing_data %>%
             filter(test_ID %in% roster_updates$test_ID) %>%
             select(-team) %>%
-            left_join(
-              Vald_roster_backfill %>% select(vald_id, team), 
-              by = "vald_id"
-            )
-          
-          # Remove position column if it exists (not all tables have it)
-          records_to_update <- records_to_update %>% select(-any_of("position"))
-          
+            left_join(Vald_roster_backfill %>% select(vald_id, team), by = "vald_id") %>%
+            select(-any_of("position"))
           if (nrow(records_to_update) > 0) {
-            msg <- paste("Updating", nrow(records_to_update), "records in", table_name)
-            create_log_entry(msg)
-            
-            bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
-                     partition_field = "date", cluster_fields = c("team", "vald_id"))
-            
-            msg <- paste("Successfully backfilled team for", nrow(records_to_update), "records in", table_name)
-            create_log_entry(msg)
+            create_log_entry(paste("Updating", nrow(records_to_update), "records in", table_name))
+            # DML-free "merge": only update those records' rows locally and overwrite table
+            remaining <- existing_data %>% filter(!(test_ID %in% records_to_update$test_ID))
+            new_table <- bind_rows(remaining, records_to_update)
+            bq_upsert(new_table, table_name, key = "test_ID", mode = "TRUNCATE",
+                      partition_field = "date", cluster_fields = c("team", "vald_id"))
+            create_log_entry(paste("Successfully backfilled team for", nrow(records_to_update), "records in", table_name))
             total_backfilled <- total_backfilled + nrow(records_to_update)
           }
         } else {
-          msg <- paste("No matching team data found for", table_name, "missing records")
-          create_log_entry(msg, "WARN")
+          create_log_entry(paste("No matching team data found for", table_name, "missing records"), "WARN")
         }
       } else {
-        msg <- paste("All records in", table_name, "have team data")
-        create_log_entry(msg)
+        create_log_entry(paste("All records in", table_name, "have team data"))
       }
-      
     }, error = function(e) {
-      msg <- paste("Error during backfill for", table_name, ":", e$message)
-      create_log_entry(msg, "WARN")
+      create_log_entry(paste("Error during backfill for", table_name, ":", e$message), "WARN")
     })
   }
-  
   if (total_backfilled > 0) {
-    msg <- paste("=== BACKFILL COMPLETE: Updated", total_backfilled, "total records across all tables ===")
-    create_log_entry(msg)
+    create_log_entry(paste("=== BACKFILL COMPLETE: Updated", total_backfilled, "total records across all tables ==="))
   } else {
     create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
   }
@@ -630,8 +512,7 @@ if (nrow(Vald_roster_backfill) > 0) {
 overlap_days <- 1L
 start_dt <- latest_date_current - lubridate::days(overlap_days)
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
-start_msg <- paste("Running with overlap start:", start_dt, "T00:00:00Z")
-create_log_entry(start_msg)
+create_log_entry(paste("Running with overlap start:", start_dt, "T00:00:00Z"))
 
 create_log_entry("Fetching ForceDecks data from VALD API...")
 injest_fd <- get_forcedecks_data()
@@ -666,9 +547,7 @@ tests_processed <- as_tibble(tests) %>%
          -recordedDateOffset, -recordedDateTimezone, -recordingId)
 
 new_test_types <- sort(unique(tests_processed$test_type))
-# Create string of test types
-test_types_list <- paste(new_test_types, collapse = ", ")
-create_log_entry(paste("New ForceDecks test types present:", test_types_list))
+create_log_entry(paste("New ForceDecks test types present:", paste(new_test_types, collapse = ", ")))
 
 trials_wider <- as_tibble(trials) %>%
   tidyr::pivot_wider(
@@ -690,13 +569,9 @@ trials_wider <- as_tibble(trials) %>%
 # Convert metric columns to numeric (starting from start_of_movement onwards)
 if ("start_of_movement" %in% names(trials_wider)) {
   start_col <- which(names(trials_wider) == "start_of_movement")
-  # Convert index range to names, then use all_of(names)
   num_cols <- names(trials_wider)[start_col:ncol(trials_wider)]
-  trials_wider <- trials_wider %>% 
-    mutate(across(all_of(num_cols), as.numeric))
-  num_converted <- ncol(trials_wider) - start_col + 1
-  msg <- paste("Converted", num_converted, "metric columns to numeric")
-  create_log_entry(msg)
+  trials_wider <- trials_wider %>% mutate(across(all_of(num_cols), as.numeric))
+  create_log_entry(paste("Converted", ncol(trials_wider) - start_col + 1, "metric columns to numeric"))
 } else {
   create_log_entry("Warning: start_of_movement column not found - cannot identify metric columns", "WARN")
 }
@@ -724,30 +599,20 @@ forcedecks_raw <- mergable_trials %>%
 # Clean column names to match BigQuery schema
 clean_column_names <- function(df) {
   names(df) <- names(df) %>%
-    # Convert camelCase to snake_case
     gsub("([a-z])([A-Z])", "\\1_\\2", .) %>%
-    # Lowercase everything
     tolower() %>%
-    # Replace special characters with underscores
     gsub("[^a-zA-Z0-9_]", "_", .) %>%
-    # Remove multiple consecutive underscores
     gsub("_{2,}", "_", .) %>%
-    # Remove leading/trailing underscores
     gsub("^_|_$", "", .)
-  return(df)
+  df
 }
 
-# Clean column names and log the results
 forcedecks_raw <- clean_column_names(forcedecks_raw)
-# Get first 50 column names
 first_50_cols <- head(names(forcedecks_raw), 50)
-cols_preview <- paste(first_50_cols, collapse = ", ")
-create_log_entry(paste("forcedecks_raw columns (first 50):", cols_preview))
-# Log total column count
-total_cols <- length(names(forcedecks_raw))
-create_log_entry(paste("forcedecks_raw total columns:", total_cols))
+create_log_entry(paste("forcedecks_raw columns (first 50):", paste(first_50_cols, collapse = ", ")))
+create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
 
-# Create body weight lookup table (gated - only if data exists)
+# Body weight lookup (if available)
 if ("body_weight_lbs" %in% names(forcedecks_raw)) {
   create_log_entry("Processing body weight lookup table")
   bw <- forcedecks_raw %>%
@@ -755,9 +620,7 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
     filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
     summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
     arrange(vald_id, date)
-  bw_msg <- paste("Created body weight lookup with", nrow(bw), "records")
-  create_log_entry(bw_msg)
-  
+  create_log_entry(paste("Created body weight lookup with", nrow(bw), "records"))
   attach_bw <- function(df) {
     if (!all(c("vald_id","date") %in% names(df))) return(df)
     if (nrow(bw)==0) {
@@ -771,25 +634,16 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
   }
 } else {
   create_log_entry("No body_weight_lbs column in forcedecks_raw - skipping body weight lookup creation")
-  # Define no-op function when body weight data doesn't exist
-  attach_bw <- function(df) { return(df) }
+  attach_bw <- function(df) df
 }
 
 # -------- Sections (gated) --------
-# CMJ: TRUNCATE
+# CMJ: TRUNCATE (OK in sandbox)
 if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
-  
-  # Debug: Log available columns
-  cmj_row_count <- nrow(cmj_temp)
-  create_log_entry(paste("cmj_temp row count:", cmj_row_count))
-  # Get column names and create string
-  cmj_col_names <- names(cmj_temp)
-  cmj_cols <- paste(cmj_col_names, collapse = ", ")
-  create_log_entry(paste("cmj_temp columns:", cmj_cols))
-  
-  # Verify required columns exist in the new data
+  create_log_entry(paste("cmj_temp row count:", nrow(cmj_temp)))
+  create_log_entry(paste("cmj_temp columns:", paste(names(cmj_temp), collapse = ", ")))
   if (nrow(cmj_temp) == 0) {
     create_log_entry("No CMJ test data found after filtering - skipping CMJ processing", "WARN")
   } else if (!"jump_height_inches_imp_mom" %in% names(cmj_temp)) {
@@ -814,14 +668,14 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
 
     cmj_existing <- read_bq_table("vald_fd_jumps") %>% 
       mutate(test_ID = as.character(test_ID)) %>%
-      select(-any_of("position"))  # Remove position if it exists in old data
-    
+      select(-any_of("position"))
+
     cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
     fd <- cmj_all %>% 
-      arrange(full_name, test_type, date) %>%  # Ensure sorted before grouping
+      arrange(full_name, test_type, date) %>%
       group_by(full_name, test_type) %>%
-      arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each group
+      arrange(date, .by_group = TRUE) %>%
       mutate(
         mean_30d_jh = slide_index_dbl(jump_height_inches_imp_mom, date, ~mean(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
         sd_30d_jh   = slide_index_dbl(jump_height_inches_imp_mom, date, ~sd(.x, na.rm = TRUE), .before = days(30), .complete = FALSE),
@@ -834,7 +688,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
         zscore_rsi_modified_imp_mom = if_else(sd_30d_rsi > 0, (rsi_modified_imp_mom - mean_30d_rsi)/sd_30d_rsi, NA_real_)
       ) %>% ungroup() %>%
       group_by(full_name) %>%
-      arrange(date, .by_group = TRUE) %>%  # Ensure date is ascending within each full_name group
+      arrange(date, .by_group = TRUE) %>%
       mutate(
         cmj_mask = (test_type == "CMJ"),
         jh_cmj_mean_30d = slide_index_dbl(if_else(cmj_mask, jump_height_inches_imp_mom, NA_real_), date, ~mean(.x, na.rm=TRUE), .before = days(30)),
@@ -851,7 +705,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
       filter(between(jump_height_inches_imp_mom, 5, 28)) %>%
       select(-starts_with("mean_30d_"), -starts_with("sd_30d_"), -cmj_mask,
              -starts_with("jh_cmj_"), -starts_with("rsi_cmj_"), -starts_with("epf_cmj_"),
-             -starts_with("zscore_"))  # Remove z-score columns (not in BigQuery schema)
+             -starts_with("zscore_"))
 
     if (all(c("jump_height_inches_imp_mom","relative_peak_eccentric_force",
               "bodymass_relative_takeoff_power","rsi_modified_imp_mom") %in% names(fd))) {
@@ -865,42 +719,32 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
         group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
         ungroup() %>% select(-calc_performance_score)
     }
-    
-    # Explicitly remove ALL temporary calculation columns before upload
+
     temp_cols_to_remove <- c(
-      # Z-scores
-      "zscore_jump_height_inches_imp_mom", "zscore_relative_peak_concentric_force", 
-      "zscore_rsi_modified_imp_mom",
-      # Rolling statistics
-      "mean_30d_jh", "sd_30d_jh", "mean_30d_rpcf", "sd_30d_rpcf", 
-      "mean_30d_rsi", "sd_30d_rsi",
-      # CMJ baselines
-      "jh_cmj_mean_30d", "rsi_cmj_mean_30d", "epf_cmj_mean_30d",
-      # Helpers
-      "cmj_mask", "calc_performance_score"
+      "zscore_jump_height_inches_imp_mom","zscore_relative_peak_concentric_force","zscore_rsi_modified_imp_mom",
+      "mean_30d_jh","sd_30d_jh","mean_30d_rpcf","sd_30d_rpcf","mean_30d_rsi","sd_30d_rsi",
+      "jh_cmj_mean_30d","rsi_cmj_mean_30d","epf_cmj_mean_30d","cmj_mask","calc_performance_score"
     )
     fd <- fd %>% select(-any_of(temp_cols_to_remove))
-    
-    # Explicitly select only columns that exist in BigQuery vald_fd_jumps schema
-    bq_columns <- c("test_ID", "vald_id", "full_name", "team", "test_type", "date", "time",
-                    "countermovement_depth", "jump_height_inches_imp_mom", "bodymass_relative_takeoff_power",
-                    "mean_landing_power", "mean_eccentric_force", "mean_takeoff_acceleration", 
-                    "mean_ecc_con_ratio", "mean_takeoff_velocity", "peak_landing_velocity",
-                    "peak_takeoff_force", "peak_takeoff_velocity", "concentric_rfd_100",
-                    "start_to_peak_force_time", "contraction_time", "concentric_duration",
-                    "eccentric_concentric_duration_ratio", "flight_eccentric_time_ratio",
-                    "displacement_at_takeoff", "rsi_modified_imp_mom", "positive_takeoff_impulse",
-                    "positive_impulse", "concentric_impulse", "eccentric_braking_impulse",
-                    "total_work", "relative_peak_landing_force", "relative_peak_concentric_force",
-                    "relative_peak_eccentric_force", "bm_rel_force_at_zero_velocity",
-                    "landing_impulse", "force_at_zero_velocity", "cmj_stiffness",
-                    "braking_phase_duration", "takeoff_velocity", "eccentric_time",
-                    "peak_landing_acceleration", "peak_takeoff_acceleration", "concentric_rfd_200",
-                    "eccentric_peak_power", "jump_height_readiness", "rsi_readiness",
-                    "epf_readiness", "performance_score", "team_performance_score", "body_weight_lbs")
-    
+
+    bq_columns <- c("test_ID","vald_id","full_name","team","test_type","date","time",
+                    "countermovement_depth","jump_height_inches_imp_mom","bodymass_relative_takeoff_power",
+                    "mean_landing_power","mean_eccentric_force","mean_takeoff_acceleration",
+                    "mean_ecc_con_ratio","mean_takeoff_velocity","peak_landing_velocity",
+                    "peak_takeoff_force","peak_takeoff_velocity","concentric_rfd_100",
+                    "start_to_peak_force_time","contraction_time","concentric_duration",
+                    "eccentric_concentric_duration_ratio","flight_eccentric_time_ratio",
+                    "displacement_at_takeoff","rsi_modified_imp_mom","positive_takeoff_impulse",
+                    "positive_impulse","concentric_impulse","eccentric_braking_impulse",
+                    "total_work","relative_peak_landing_force","relative_peak_concentric_force",
+                    "relative_peak_eccentric_force","bm_rel_force_at_zero_velocity",
+                    "landing_impulse","force_at_zero_velocity","cmj_stiffness",
+                    "braking_phase_duration","takeoff_velocity","eccentric_time",
+                    "peak_landing_acceleration","peak_takeoff_acceleration","concentric_rfd_200",
+                    "eccentric_peak_power","jump_height_readiness","rsi_readiness",
+                    "epf_readiness","performance_score","team_performance_score","body_weight_lbs")
     fd <- fd %>% select(any_of(bq_columns))
-    
+
     bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
               partition_field="date", cluster_fields=c("team","test_type","vald_id"))
   }
@@ -908,7 +752,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("No new CMJ-family tests - skipping CMJ section")
 }
 
-# DJ: MERGE
+# DJ: MERGE (client-side)
 if ("DJ" %in% new_test_types) {
   create_log_entry("Processing DJ")
   dj_new <- forcedecks_raw %>% filter(test_type=="DJ") %>%
@@ -935,7 +779,7 @@ if ("DJ" %in% new_test_types) {
   create_log_entry("No new DJ tests - skipping DJ section")
 }
 
-# RSI: MERGE
+# RSI: MERGE (client-side)
 if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
   create_log_entry("Processing RSI")
   rsi_new <- trials_wider %>%
@@ -966,7 +810,7 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
   create_log_entry("No new RSI tests - skipping RSI section")
 }
 
-# Rebound: MERGE
+# Rebound: MERGE (client-side)
 if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
   create_log_entry("Processing Rebound")
   rebound_new <- trials_wider %>%
@@ -1005,7 +849,7 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
   create_log_entry("No new Rebound tests - skipping Rebound section")
 }
 
-# SLJ: MERGE
+# SLJ: MERGE (client-side)
 if ("SLJ" %in% new_test_types) {
   create_log_entry("Processing SLJ")
   slj_new <- trials_wider %>%
@@ -1038,7 +882,7 @@ if ("SLJ" %in% new_test_types) {
   create_log_entry("No new SLJ tests - skipping SLJ section")
 }
 
-# IMTP: MERGE
+# IMTP: MERGE (client-side)
 if ("IMTP" %in% new_test_types) {
   create_log_entry("Processing IMTP")
   imtp_new <- forcedecks_raw %>% filter(test_type=="IMTP") %>%
@@ -1064,13 +908,12 @@ if ("IMTP" %in% new_test_types) {
   create_log_entry("No new IMTP tests - skipping IMTP section")
 }
 
-# Nordbord: MERGE (pull only if returned)
+# Nordbord: MERGE (client-side)
 create_log_entry("Fetching Nordbord data from VALD API...")
 injest_nord <- get_nordbord_data()
 nord_tests <- injest_nord$tests
 if (nrow(nord_tests) > 0) {
-  nord_msg <- paste("Processing Nordbord (", nrow(nord_tests), " tests)")
-  create_log_entry(nord_msg)
+  create_log_entry(paste("Processing Nordbord (", nrow(nord_tests), " tests)"))
   nb <- as_tibble(nord_tests) %>%
     select(-any_of(c("device","notes","testTypeId"))) %>%
     mutate(
@@ -1140,13 +983,13 @@ if (nrow(nord_tests) > 0) {
   create_log_entry("No Nordbord tests - skipping Nordbord section")
 }
 
-# Dates & Tests
+# Dates & Tests (MERGE client-side handled in bq_upsert)
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
 tests_delta <- forcedecks_raw %>% select(test_ID) %>% distinct()
 bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
 bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = character())
 
-# RSI fix (non-destructive)
+# RSI fix (non-destructive, DML-free)
 fix_rsi_data_type()
 
 create_log_entry("=== SCRIPT EXECUTION SUMMARY ===")
