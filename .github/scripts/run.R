@@ -674,6 +674,7 @@ clean_column_names <- function(df) {
   return(df)
 }
 
+# Fix: Add newline between these two statements
 forcedecks_raw <- clean_column_names(forcedecks_raw)
 create_log_entry(paste("forcedecks_raw columns (first 50):", paste(head(names(forcedecks_raw), 50), collapse=", ")))
 create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
