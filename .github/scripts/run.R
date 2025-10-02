@@ -1,4 +1,3 @@
-#!/usr/bin/env Rscript
 
 tryCatch({
   suppressPackageStartupMessages({
@@ -279,9 +278,9 @@ bq_upsert <- function(data, table_name, key="test_ID",
   
   data <- standardize_data_types(data, table_name)
   tbl <- bq_table(ds, table_name)
-
+  
   if (nrow(data) == 0) { create_log_entry(paste("No rows to upload for", table_name)); return(TRUE) }
-
+  
   if (!bq_table_exists(tbl)) {
     ensure_table(tbl, data, partition_field, cluster_fields)
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
@@ -289,14 +288,14 @@ bq_upsert <- function(data, table_name, key="test_ID",
     create_log_entry(glue("Uploaded {meta$numRows %||% NA} rows to new table {table_name}"))
     return(TRUE)
   }
-
+  
   if (mode == "TRUNCATE") {
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
     create_log_entry(glue("Truncated+uploaded; {table_name} now has {meta$numRows %||% NA} rows"))
     return(TRUE)
   }
-
+  
   # MERGE
   stage <- bq_table(ds, paste0(table_name, "_stage"))
   
@@ -304,10 +303,10 @@ bq_upsert <- function(data, table_name, key="test_ID",
     if (bq_table_exists(stage)) bq_table_delete(stage)
     bq_table_create(stage, fields = as_bq_fields(data))
     bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
-
+    
     cols <- names(data); if (!key %in% cols) stop(glue("Key {key} missing for {table_name}"))
     up_cols <- setdiff(cols, key); if (length(up_cols)==0) stop(glue("No updatable cols for {table_name}"))
-
+    
     set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
     insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
     insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
@@ -427,11 +426,11 @@ tryCatch({
   client_secret <- Sys.getenv("VALD_CLIENT_SECRET")
   tenant_id <- Sys.getenv("VALD_TENANT_ID")
   region <- Sys.getenv("VALD_REGION", "use")
-
+  
   if (client_id == "" || client_secret == "" || tenant_id == "") {
     stop("Missing required VALD API credentials")
   }
-
+  
   set_credentials(client_id, client_secret, tenant_id, region)
   set_start_date("2024-01-01T00:00:00Z")
   
@@ -544,7 +543,7 @@ if (nrow(Vald_roster_backfill) > 0) {
             create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
             
             bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
-                     partition_field = "date", cluster_fields = c("team", "vald_id"))
+                      partition_field = "date", cluster_fields = c("team", "vald_id"))
             
             create_log_entry(glue("Successfully backfilled team for {nrow(records_to_update)} records in {table_name}"))
             total_backfilled <- total_backfilled + nrow(records_to_update)
@@ -674,9 +673,10 @@ clean_column_names <- function(df) {
   return(df)
 }
 
-# Fix: Add newline between these two statements
+# Fix: Add newline between these two statements and simplify log entries
 forcedecks_raw <- clean_column_names(forcedecks_raw)
-create_log_entry(paste("forcedecks_raw columns (first 50):", paste(head(names(forcedecks_raw), 50), collapse=", ")))
+cols_preview <- paste(head(names(forcedecks_raw), 50), collapse=", ")
+create_log_entry(paste("forcedecks_raw columns (first 50):", cols_preview))
 create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
 
 # Create body weight lookup table (gated - only if data exists)
@@ -714,7 +714,8 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   
   # Debug: Log available columns
   create_log_entry(paste("cmj_temp row count:", nrow(cmj_temp)))
-  create_log_entry(paste("cmj_temp columns:", paste(names(cmj_temp), collapse=", ")))
+  cmj_cols <- paste(names(cmj_temp), collapse=", ")
+  create_log_entry(paste("cmj_temp columns:", cmj_cols))
   
   # Verify required columns exist in the new data
   if (nrow(cmj_temp) == 0) {
