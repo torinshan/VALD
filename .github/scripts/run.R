@@ -179,7 +179,8 @@ read_bq_table <- function(table_name) {
           } else if (field$type == "TIME") {
             return(hms::as_hms(val))
           } else if (field$type == "TIMESTAMP") {
-            return(as.POSIXct(as.numeric(val), origin = "1970-01-01", tz = "UTC"))
+            # Be robust to string/decimal/scientific formats
+            return(as.POSIXct(as.numeric(as.character(val)), origin = "1970-01-01", tz = "UTC"))
           } else {
             return(as.character(val))
           }
@@ -190,8 +191,8 @@ read_bq_table <- function(table_name) {
       
       all_rows[[page_num]] <- bind_rows(page_data)
       
-      # Check for next page
-      page_token <- content$pageToken
+      # Check for next page (response uses nextPageToken)
+      page_token <- content$nextPageToken
       if (is.null(page_token)) break
       
       page_num <- page_num + 1
@@ -206,12 +207,14 @@ read_bq_table <- function(table_name) {
     # Combine all pages
     result <- bind_rows(all_rows)
     
-    create_log_entry(paste("Successfully read", table_name, ":", nrow(result), "rows via REST API"))
+    rows_msg <- paste("Successfully read", table_name, ":", nrow(result), "rows via REST API")
+    create_log_entry(rows_msg)
     
     # CRITICAL: Remove position column if it exists (not in schema but may exist in data)
     if ("position" %in% names(result)) {
       result <- result %>% select(-position)
-      create_log_entry(paste("Removed position column from", table_name))
+      pos_msg <- paste("Removed position column from", table_name)
+      create_log_entry(pos_msg)
     }
     
     return(result)
@@ -232,8 +235,14 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering = cl)
   # Log the table creation with simplified message
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
-  cluster_info <- ifelse(length(cl) > 0, paste(cl, collapse = ","), "none")
-  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info))
+  if (length(cl) > 0) {
+    cluster_list <- paste(cl, collapse = ",")
+    cluster_info <- cluster_list
+  } else {
+    cluster_info <- "none"
+  }
+  log_message <- paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info)
+  create_log_entry(log_message)
   invisible(TRUE)
 }
 
@@ -277,26 +286,35 @@ bq_upsert <- function(data, table_name, key="test_ID",
   # CRITICAL: Strip position column if it exists (not in any table schemas)
   if ("position" %in% names(data)) {
     data <- data %>% select(-position)
-    create_log_entry(glue("Removed position column before uploading to {table_name}"))
+    msg <- paste("Removed position column before uploading to", table_name)
+    create_log_entry(msg)
   }
   
   data <- standardize_data_types(data, table_name)
   tbl <- bq_table(ds, table_name)
 
-  if (nrow(data) == 0) { create_log_entry(paste("No rows to upload for", table_name)); return(TRUE) }
+  if (nrow(data) == 0) { 
+    msg <- paste("No rows to upload for", table_name)
+    create_log_entry(msg)
+    return(TRUE) 
+  }
 
   if (!bq_table_exists(tbl)) {
     ensure_table(tbl, data, partition_field, cluster_fields)
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
-    create_log_entry(glue("Uploaded {meta$numRows %||% NA} rows to new table {table_name}"))
+    num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
+    msg <- paste("Uploaded", num_rows, "rows to new table", table_name)
+    create_log_entry(msg)
     return(TRUE)
   }
 
   if (mode == "TRUNCATE") {
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
-    create_log_entry(glue("Truncated+uploaded; {table_name} now has {meta$numRows %||% NA} rows"))
+    num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
+    msg <- paste("Truncated+uploaded;", table_name, "now has", num_rows, "rows")
+    create_log_entry(msg)
     return(TRUE)
   }
 
@@ -308,29 +326,44 @@ bq_upsert <- function(data, table_name, key="test_ID",
     bq_table_create(stage, fields = as_bq_fields(data))
     bq_table_upload(stage, data, write_disposition = "WRITE_TRUNCATE")
 
-    cols <- names(data); if (!key %in% cols) stop(glue("Key {key} missing for {table_name}"))
-    up_cols <- setdiff(cols, key); if (length(up_cols)==0) stop(glue("No updatable cols for {table_name}"))
+    cols <- names(data)
+    if (!key %in% cols) {
+      msg <- paste("Key", key, "missing for", table_name)
+      stop(msg)
+    }
+    up_cols <- setdiff(cols, key)
+    if (length(up_cols)==0) {
+      msg <- paste("No updatable cols for", table_name)
+      stop(msg)
+    }
 
     set_clause   <- paste(sprintf("T.`%s`=S.`%s`", up_cols, up_cols), collapse=", ")
     insert_cols  <- paste(sprintf("`%s`", cols), collapse=", ")
     insert_vals  <- paste(sprintf("S.`%s`", cols), collapse=", ")
-    sql <- glue("MERGE `{project}.{dataset}.{table_name}` T
-                 USING `{project}.{dataset}.{table_name}_stage` S
-                 ON T.`{key}`=S.`{key}`
-                 WHEN MATCHED THEN UPDATE SET {set_clause}
-                 WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})")
-    DBI::dbExecute(con, sql)
+    
+    # Build SQL query
+    sql_query <- paste0(
+      "MERGE `", project, ".", dataset, ".", table_name, "` T ",
+      "USING `", project, ".", dataset, ".", table_name, "_stage` S ",
+      "ON T.`", key, "`=S.`", key, "` ",
+      "WHEN MATCHED THEN UPDATE SET ", set_clause, " ",
+      "WHEN NOT MATCHED THEN INSERT (", insert_cols, ") VALUES (", insert_vals, ")"
+    )
+    DBI::dbExecute(con, sql_query)
     
   }, finally = {
     # Always clean up staging table, even on error
     if (bq_table_exists(stage)) {
       bq_table_delete(stage)
-      create_log_entry(glue("Cleaned up staging table {table_name}_stage"))
+      msg <- paste("Cleaned up staging table", table_name, "_stage")
+      create_log_entry(msg)
     }
   })
   
   meta <- bq_table_meta(tbl)
-  create_log_entry(glue("MERGE complete; {table_name} now has {meta$numRows %||% NA} rows"))
+  num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
+  msg <- paste("MERGE complete;", table_name, "now has", num_rows, "rows")
+  create_log_entry(msg)
   TRUE
 }
 
@@ -354,10 +387,17 @@ fix_rsi_data_type <- function() {
       create_log_entry("Converting body_weight_lbs STRING -> FLOAT64")
       
       # Use DBI for ALTER statements (DML operations don't trigger Storage API reads)
-      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64", project, dataset))
-      DBI::dbExecute(con, sprintf("UPDATE `%s.%s.vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64) WHERE TRUE", project, dataset))
-      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` DROP COLUMN body_weight_lbs", project, dataset))
-      DBI::dbExecute(con, sprintf("ALTER TABLE `%s.%s.vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs", project, dataset))
+      sql1 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` ADD COLUMN body_weight_lbs__tmp FLOAT64")
+      DBI::dbExecute(con, sql1)
+      
+      sql2 <- paste0("UPDATE `", project, ".", dataset, ".vald_fd_rsi` SET body_weight_lbs__tmp = SAFE_CAST(body_weight_lbs AS FLOAT64) WHERE TRUE")
+      DBI::dbExecute(con, sql2)
+      
+      sql3 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` DROP COLUMN body_weight_lbs")
+      DBI::dbExecute(con, sql3)
+      
+      sql4 <- paste0("ALTER TABLE `", project, ".", dataset, ".vald_fd_rsi` RENAME COLUMN body_weight_lbs__tmp TO body_weight_lbs")
+      DBI::dbExecute(con, sql4)
       
       create_log_entry("Converted body_weight_lbs to FLOAT64")
     } else {
@@ -386,7 +426,8 @@ if (nrow(tests_tbl) > 0) {
 
 latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=TRUE) else as.Date("1900-01-01")
 count_tests_current <- nrow(tests_tbl)
-create_log_entry(glue("Current state - Latest date: {latest_date_current} Test count: {count_tests_current}"))
+log_msg <- paste("Current state - Latest date:", latest_date_current, "Test count:", count_tests_current)
+create_log_entry(log_msg)
 
 # ---------- Read roster early for use in gate check and later processing ----------
 create_log_entry("=== READING ROSTER DATA ===")
@@ -464,11 +505,11 @@ probe_df <- as_tibble(all_tests_probe) %>%
 api_latest_date <- suppressWarnings(max(probe_df$date, na.rm = TRUE))
 api_test_count <- dplyr::n_distinct(probe_df$test_ID)
 
-create_log_entry(glue("API data - Latest date: {api_latest_date} Test count: {api_test_count}"))
+create_log_entry(paste("API data - Latest date:", api_latest_date, "Test count:", api_test_count))
 date_mismatch  <- !identical(api_latest_date, latest_date_current)
 count_mismatch <- api_test_count != count_tests_current
-create_log_entry(glue("date_mismatch: {date_mismatch}"))
-create_log_entry(glue("count_mismatch: {count_mismatch}"))
+create_log_entry(paste("date_mismatch:", date_mismatch))
+create_log_entry(paste("count_mismatch:", count_mismatch))
 
 if (!date_mismatch && !count_mismatch) {
   create_log_entry("No changes detected - date and count both match. Exiting.")
@@ -476,7 +517,8 @@ if (!date_mismatch && !count_mismatch) {
   upload_logs_to_bigquery(); try(DBI::dbDisconnect(con), silent=TRUE); quit(status=0)
 }
 
-create_log_entry(glue("Changes detected - Running update (date_mismatch: {date_mismatch}, count_mismatch: {count_mismatch})"))
+changes_msg <- paste("Changes detected - Running update (date_mismatch:", date_mismatch, ", count_mismatch:", count_mismatch, ")")
+create_log_entry(changes_msg)
 
 # ---------- Backfill missing team data ----------
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM DATA ===")
@@ -492,7 +534,8 @@ if (nrow(Vald_roster_backfill) > 0) {
       existing_data <- read_bq_table(table_name)
       
       if (nrow(existing_data) == 0) {
-        create_log_entry(glue("Table {table_name} is empty - skipping backfill check"))
+        msg <- paste("Table", table_name, "is empty - skipping backfill check")
+        create_log_entry(msg)
         next
       }
       
@@ -502,12 +545,14 @@ if (nrow(Vald_roster_backfill) > 0) {
       has_team <- "team" %in% names(existing_data)
       
       if (!has_test_id || !has_vald_id) {
-        create_log_entry(glue("Skipping {table_name} - missing test_ID or vald_id columns"), "WARN")
+        msg <- paste("Skipping", table_name, "- missing test_ID or vald_id columns")
+        create_log_entry(msg, "WARN")
         next
       }
       
       if (!has_team) {
-        create_log_entry(glue("Table {table_name} has no team column - skipping"), "INFO")
+        msg <- paste("Table", table_name, "has no team column - skipping")
+        create_log_entry(msg, "INFO")
         next
       }
       
@@ -518,7 +563,8 @@ if (nrow(Vald_roster_backfill) > 0) {
         distinct()
       
       if (nrow(missing_info) > 0) {
-        create_log_entry(glue("Found {nrow(missing_info)} records in {table_name} missing team"))
+        msg <- paste("Found", nrow(missing_info), "records in", table_name, "missing team")
+        create_log_entry(msg)
         
         # Look up team info for these vald_ids
         roster_updates <- missing_info %>%
@@ -529,7 +575,8 @@ if (nrow(Vald_roster_backfill) > 0) {
           filter(!is.na(team))
         
         if (nrow(roster_updates) > 0) {
-          create_log_entry(glue("Found team data for {nrow(roster_updates)} records in {table_name}"))
+          msg <- paste("Found team data for", nrow(roster_updates), "records in", table_name)
+          create_log_entry(msg)
           
           # Get full records and merge with team data
           records_to_update <- existing_data %>%
@@ -544,28 +591,34 @@ if (nrow(Vald_roster_backfill) > 0) {
           records_to_update <- records_to_update %>% select(-any_of("position"))
           
           if (nrow(records_to_update) > 0) {
-            create_log_entry(glue("Updating {nrow(records_to_update)} records in {table_name}"))
+            msg <- paste("Updating", nrow(records_to_update), "records in", table_name)
+            create_log_entry(msg)
             
             bq_upsert(records_to_update, table_name, key = "test_ID", mode = "MERGE",
                      partition_field = "date", cluster_fields = c("team", "vald_id"))
             
-            create_log_entry(glue("Successfully backfilled team for {nrow(records_to_update)} records in {table_name}"))
+            msg <- paste("Successfully backfilled team for", nrow(records_to_update), "records in", table_name)
+            create_log_entry(msg)
             total_backfilled <- total_backfilled + nrow(records_to_update)
           }
         } else {
-          create_log_entry(glue("No matching team data found for {table_name} missing records"), "WARN")
+          msg <- paste("No matching team data found for", table_name, "missing records")
+          create_log_entry(msg, "WARN")
         }
       } else {
-        create_log_entry(glue("All records in {table_name} have team data"))
+        msg <- paste("All records in", table_name, "have team data")
+        create_log_entry(msg)
       }
       
     }, error = function(e) {
-      create_log_entry(glue("Error during backfill for {table_name}: {e$message}"), "WARN")
+      msg <- paste("Error during backfill for", table_name, ":", e$message)
+      create_log_entry(msg, "WARN")
     })
   }
   
   if (total_backfilled > 0) {
-    create_log_entry(glue("=== BACKFILL COMPLETE: Updated {total_backfilled} total records across all tables ==="))
+    msg <- paste("=== BACKFILL COMPLETE: Updated", total_backfilled, "total records across all tables ===")
+    create_log_entry(msg)
   } else {
     create_log_entry("=== BACKFILL COMPLETE: No records needed updating ===")
   }
@@ -577,7 +630,8 @@ if (nrow(Vald_roster_backfill) > 0) {
 overlap_days <- 1L
 start_dt <- latest_date_current - lubridate::days(overlap_days)
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
-create_log_entry(glue("Running with overlap start: {start_dt}T00:00:00Z"))
+start_msg <- paste("Running with overlap start:", start_dt, "T00:00:00Z")
+create_log_entry(start_msg)
 
 create_log_entry("Fetching ForceDecks data from VALD API...")
 injest_fd <- get_forcedecks_data()
@@ -612,8 +666,9 @@ tests_processed <- as_tibble(tests) %>%
          -recordedDateOffset, -recordedDateTimezone, -recordingId)
 
 new_test_types <- sort(unique(tests_processed$test_type))
-test_types_str <- paste(new_test_types, collapse = ", ")
-create_log_entry(paste("New ForceDecks test types present:", test_types_str))
+# Create string of test types
+test_types_list <- paste(new_test_types, collapse = ", ")
+create_log_entry(paste("New ForceDecks test types present:", test_types_list))
 
 trials_wider <- as_tibble(trials) %>%
   tidyr::pivot_wider(
@@ -635,9 +690,13 @@ trials_wider <- as_tibble(trials) %>%
 # Convert metric columns to numeric (starting from start_of_movement onwards)
 if ("start_of_movement" %in% names(trials_wider)) {
   start_col <- which(names(trials_wider) == "start_of_movement")
+  # Convert index range to names, then use all_of(names)
+  num_cols <- names(trials_wider)[start_col:ncol(trials_wider)]
   trials_wider <- trials_wider %>% 
-    mutate(across(all_of(start_col:ncol(.)), as.numeric))
-  create_log_entry(glue("Converted {ncol(trials_wider) - start_col + 1} metric columns to numeric"))
+    mutate(across(all_of(num_cols), as.numeric))
+  num_converted <- ncol(trials_wider) - start_col + 1
+  msg <- paste("Converted", num_converted, "metric columns to numeric")
+  create_log_entry(msg)
 } else {
   create_log_entry("Warning: start_of_movement column not found - cannot identify metric columns", "WARN")
 }
@@ -674,16 +733,19 @@ clean_column_names <- function(df) {
     # Remove multiple consecutive underscores
     gsub("_{2,}", "_", .) %>%
     # Remove leading/trailing underscores
-    gsub("^_|_$", "", .")
+    gsub("^_|_$", "", .)
   return(df)
 }
 
-# Fix: Add newline between these two statements and simplify log entries
+# Clean column names and log the results
 forcedecks_raw <- clean_column_names(forcedecks_raw)
-cols_preview <- paste(head(names(forcedecks_raw), 50), collapse = ", ")
+# Get first 50 column names
+first_50_cols <- head(names(forcedecks_raw), 50)
+cols_preview <- paste(first_50_cols, collapse = ", ")
 create_log_entry(paste("forcedecks_raw columns (first 50):", cols_preview))
-cols_count <- length(names(forcedecks_raw))
-create_log_entry(paste("forcedecks_raw total columns:", cols_count))
+# Log total column count
+total_cols <- length(names(forcedecks_raw))
+create_log_entry(paste("forcedecks_raw total columns:", total_cols))
 
 # Create body weight lookup table (gated - only if data exists)
 if ("body_weight_lbs" %in% names(forcedecks_raw)) {
@@ -693,7 +755,8 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
     filter(!is.na(body_weight_lbs)) %>% group_by(vald_id, date) %>%
     summarise(body_weight_lbs = mean(body_weight_lbs, na.rm=TRUE), .groups="drop") %>%
     arrange(vald_id, date)
-  create_log_entry(glue("Created body weight lookup with {nrow(bw)} records"))
+  bw_msg <- paste("Created body weight lookup with", nrow(bw), "records")
+  create_log_entry(bw_msg)
   
   attach_bw <- function(df) {
     if (!all(c("vald_id","date") %in% names(df))) return(df)
@@ -721,7 +784,9 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   # Debug: Log available columns
   cmj_row_count <- nrow(cmj_temp)
   create_log_entry(paste("cmj_temp row count:", cmj_row_count))
-  cmj_cols <- paste(names(cmj_temp), collapse = ", ")
+  # Get column names and create string
+  cmj_col_names <- names(cmj_temp)
+  cmj_cols <- paste(cmj_col_names, collapse = ", ")
   create_log_entry(paste("cmj_temp columns:", cmj_cols))
   
   # Verify required columns exist in the new data
@@ -1004,7 +1069,8 @@ create_log_entry("Fetching Nordbord data from VALD API...")
 injest_nord <- get_nordbord_data()
 nord_tests <- injest_nord$tests
 if (nrow(nord_tests) > 0) {
-  create_log_entry(glue("Processing Nordbord ({nrow(nord_tests)} tests)"))
+  nord_msg <- paste("Processing Nordbord (", nrow(nord_tests), " tests)")
+  create_log_entry(nord_msg)
   nb <- as_tibble(nord_tests) %>%
     select(-any_of(c("device","notes","testTypeId"))) %>%
     mutate(
