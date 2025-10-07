@@ -8,7 +8,7 @@ tryCatch({
     library(hms); library(lubridate)
     library(httr); library(jsonlite); library(xml2); library(curl)
     library(valdr); library(gargle); library(rlang); library(lifecycle)
-    library(glue); library(slider)
+    library(glue); library(slider); library(R.utils)
   })
 }, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
 
@@ -25,6 +25,69 @@ cat("BQ Location:", location, "\n")
 
 # Global variable to store access token for REST API calls
 GLOBAL_ACCESS_TOKEN <- NULL
+
+# ---------- VALD API Pagination Safety ----------
+# Known problematic timestamps that cause API pagination loops
+PROBLEMATIC_TIMESTAMPS <- c(
+  "2025-10-06T20:45:34.816Z"
+)
+
+safe_vald_fetch <- function(fetch_function, description = "VALD API", timeout_seconds = 600, ...) {
+  create_log_entry(paste("Starting", description, "fetch with", timeout_seconds, "second timeout"))
+  
+  result <- NULL
+  timed_out <- FALSE
+  
+  tryCatch({
+    result <- withTimeout({
+      fetch_function(...)
+    }, timeout = timeout_seconds, onTimeout = "error")
+  }, TimeoutException = function(e) {
+    timed_out <<- TRUE
+    create_log_entry(paste(description, "fetch TIMEOUT after", timeout_seconds, "seconds"), "ERROR")
+    create_log_entry("This likely indicates a VALD API pagination bug at a specific timestamp", "ERROR")
+    create_log_entry("Problematic timestamp will be logged if detected", "ERROR")
+  }, error = function(e) {
+    if (!timed_out) {
+      create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
+    }
+  })
+  
+  if (timed_out || is.null(result)) {
+    create_log_entry("=== VALD API FETCH FAILED ===", "ERROR")
+    create_log_entry(paste("Known problematic timestamps:", paste(PROBLEMATIC_TIMESTAMPS, collapse = ", ")), "ERROR")
+    upload_logs_to_bigquery()
+    quit(status = 1)
+  }
+  
+  result
+}
+
+check_and_skip_problematic_date <- function(start_date) {
+  # Convert problematic timestamps to dates
+  problematic_dates <- as.Date(sapply(PROBLEMATIC_TIMESTAMPS, function(ts) {
+    substr(ts, 1, 10)
+  }))
+  
+  # Check if our start date is within 2 days of any problematic date
+  for (prob_date in problematic_dates) {
+    days_diff <- abs(difftime(start_date, prob_date, units = "days"))
+    
+    if (days_diff < 2) {
+      create_log_entry(paste("Start date", start_date, "is within 2 days of problematic date", prob_date), "WARN")
+      create_log_entry("Adjusting start date to skip problematic timestamp area", "WARN")
+      
+      # Skip to day after problematic date
+      adjusted_date <- prob_date + lubridate::days(1)
+      create_log_entry(paste("Adjusted start date:", adjusted_date), "WARN")
+      
+      return(adjusted_date)
+    }
+  }
+  
+  # No adjustment needed
+  return(start_date)
+}
 
 # ---------- Auth (Working Version) ----------
 tryCatch({
@@ -145,7 +208,6 @@ read_bq_table <- function(table_name) {
           } else if (field$type == "TIME") {
             return(hms::as_hms(val))
           } else if (field$type == "TIMESTAMP") {
-            # tabledata.list returns TIMESTAMP as string seconds (possibly fractional)
             return(as.POSIXct(as.numeric(as.character(val)), origin = "1970-01-01", tz = "UTC"))
           } else {
             return(as.character(val))
@@ -155,7 +217,6 @@ read_bq_table <- function(table_name) {
         as.data.frame(values, stringsAsFactors = FALSE)
       })
       all_rows[[page_num]] <- bind_rows(page_data)
-      # In responses, the next page token is nextPageToken
       page_token <- content$nextPageToken
       if (is.null(page_token)) break
       page_num <- page_num + 1
@@ -223,7 +284,6 @@ standardize_data_types <- function(data, table_name) {
 }
 
 # ---------- DML-FREE UPSERT ----------
-# Implements MERGE client-side to avoid BigQuery DML. Only load jobs (WRITE_TRUNCATE/APPEND).
 bq_upsert <- function(data, table_name, key="test_ID",
                       mode=c("MERGE","TRUNCATE"),
                       partition_field="date",
@@ -260,7 +320,7 @@ bq_upsert <- function(data, table_name, key="test_ID",
     return(TRUE)
   }
 
-  # MERGE (client-side): read existing, combine, de-dupe by key favoring NEW
+  # MERGE (client-side)
   if (!(key %in% names(data))) {
     stop(paste("Key", key, "missing for", table_name))
   }
@@ -272,7 +332,6 @@ bq_upsert <- function(data, table_name, key="test_ID",
     existing[[key]] <- as.character(existing[[key]])
     data[[key]]     <- as.character(data[[key]])
 
-    # Align columns
     all_cols <- union(names(existing), names(data))
     for (cn in setdiff(all_cols, names(existing))) existing[[cn]] <- NA
     for (cn in setdiff(all_cols, names(data)))     data[[cn]]     <- NA
@@ -297,7 +356,7 @@ bq_upsert <- function(data, table_name, key="test_ID",
   TRUE
 }
 
-# Fix RSI data type without DDL/DML: read -> convert -> WRITE_TRUNCATE
+# Fix RSI data type without DDL/DML
 fix_rsi_data_type <- function() {
   create_log_entry("Checking body_weight_lbs type in vald_fd_rsi (DML-free)")
   tbl <- bq_table(ds, "vald_fd_rsi")
@@ -400,7 +459,14 @@ tryCatch({
 
 # ---------- Gate: run only if EITHER date OR count differ ----------
 create_log_entry("Probing VALD API for tests-only to compare date & count")
-all_tests_probe <- get_forcedecks_tests_only(start_date = NULL)
+
+# Use safe fetch with timeout protection
+all_tests_probe <- safe_vald_fetch(
+  fetch_function = get_forcedecks_tests_only,
+  description = "ForceDecks tests probe",
+  timeout_seconds = 600,
+  start_date = NULL
+)
 
 probe_df <- as_tibble(all_tests_probe) %>%
   mutate(
@@ -501,11 +567,21 @@ if (nrow(Vald_roster_backfill) > 0) {
 # ---------- Overlap start date (latest - 1 day), then fetch ----------
 overlap_days <- 1L
 start_dt <- latest_date_current - lubridate::days(overlap_days)
+
+# Check if we need to skip problematic timestamps
+start_dt <- check_and_skip_problematic_date(start_dt)
+
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
 create_log_entry(paste("Running with overlap start:", start_dt, "T00:00:00Z"))
 
 create_log_entry("Fetching ForceDecks data from VALD API...")
-injest_fd <- get_forcedecks_data()
+
+# Use safe fetch with timeout protection
+injest_fd <- safe_vald_fetch(
+  fetch_function = get_forcedecks_data,
+  description = "ForceDecks full data",
+  timeout_seconds = 900
+)
 
 profiles <- as.data.table(injest_fd$profiles)
 definitions <- as.data.table(injest_fd$result_definitions)
@@ -556,7 +632,6 @@ trials_wider <- as_tibble(trials) %>%
   select(-recordedUTC_parsed, -recordedUTC_local) %>%
   rename_with(tolower)
 
-# Convert metric columns to numeric (starting from start_of_movement onwards)
 if ("start_of_movement" %in% names(trials_wider)) {
   start_col <- which(names(trials_wider) == "start_of_movement")
   num_cols <- names(trials_wider)[start_col:ncol(trials_wider)]
@@ -586,7 +661,6 @@ forcedecks_raw <- mergable_trials %>%
   left_join(mergable_roster, by="vald_id") %>%
   mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
 
-# Clean column names to match BigQuery schema
 clean_column_names <- function(df) {
   names(df) <- names(df) %>%
     gsub("([a-z])([A-Z])", "\\1_\\2", .) %>%
@@ -597,10 +671,8 @@ clean_column_names <- function(df) {
   df
 }
 
-# Clean column names and log the results
 forcedecks_raw <- clean_column_names(forcedecks_raw)
 
-# Normalize key name after cleaning (so downstream expects `test_ID`)
 if ("test_id" %in% names(forcedecks_raw) && !("test_ID" %in% names(forcedecks_raw))) {
   forcedecks_raw <- forcedecks_raw %>% dplyr::rename(test_ID = test_id)
 }
@@ -609,7 +681,6 @@ first_50_cols <- head(names(forcedecks_raw), 50)
 create_log_entry(paste("forcedecks_raw columns (first 50):", paste(first_50_cols, collapse = ", ")))
 create_log_entry(paste("forcedecks_raw total columns:", length(names(forcedecks_raw))))
 
-# Body weight lookup (if available)
 if ("body_weight_lbs" %in% names(forcedecks_raw)) {
   create_log_entry("Processing body weight lookup table")
   bw <- forcedecks_raw %>%
@@ -635,7 +706,7 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
 }
 
 # -------- Sections (gated) --------
-# CMJ: TRUNCATE (OK in sandbox)
+# CMJ: TRUNCATE
 if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
@@ -663,9 +734,12 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
       ))) %>%
       filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
 
-    cmj_existing <- read_bq_table("vald_fd_jumps") %>% 
-      mutate(test_ID = as.character(test_ID)) %>%
-      select(-any_of("position"))
+    cmj_existing <- read_bq_table("vald_fd_jumps")
+    if (nrow(cmj_existing) > 0) {
+      cmj_existing <- cmj_existing %>%
+        mutate(test_ID = as.character(test_ID)) %>%
+        select(-any_of("position"))
+    }
 
     cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
@@ -749,7 +823,7 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("No new CMJ-family tests - skipping CMJ section")
 }
 
-# DJ: MERGE (client-side)
+# DJ: MERGE
 if ("DJ" %in% new_test_types) {
   create_log_entry("Processing DJ")
   dj_new <- forcedecks_raw %>% filter(test_type=="DJ") %>%
@@ -776,7 +850,7 @@ if ("DJ" %in% new_test_types) {
   create_log_entry("No new DJ tests - skipping DJ section")
 }
 
-# RSI: MERGE (client-side)
+# RSI: MERGE
 if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
   create_log_entry("Processing RSI")
   rsi_new <- trials_wider %>%
@@ -807,7 +881,7 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
   create_log_entry("No new RSI tests - skipping RSI section")
 }
 
-# Rebound: MERGE (client-side)
+# Rebound: MERGE
 if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
   create_log_entry("Processing Rebound")
   rebound_new <- trials_wider %>%
@@ -846,7 +920,7 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
   create_log_entry("No new Rebound tests - skipping Rebound section")
 }
 
-# SLJ: MERGE (client-side)
+# SLJ: MERGE
 if ("SLJ" %in% new_test_types) {
   create_log_entry("Processing SLJ")
   slj_new <- trials_wider %>%
@@ -879,7 +953,7 @@ if ("SLJ" %in% new_test_types) {
   create_log_entry("No new SLJ tests - skipping SLJ section")
 }
 
-# IMTP: MERGE (client-side)
+# IMTP: MERGE
 if ("IMTP" %in% new_test_types) {
   create_log_entry("Processing IMTP")
   imtp_new <- forcedecks_raw %>% filter(test_type=="IMTP") %>%
@@ -905,9 +979,16 @@ if ("IMTP" %in% new_test_types) {
   create_log_entry("No new IMTP tests - skipping IMTP section")
 }
 
-# Nordbord: MERGE (client-side)
+# Nordbord: MERGE
 create_log_entry("Fetching Nordbord data from VALD API...")
-injest_nord <- get_nordbord_data()
+
+# Use safe fetch with timeout protection
+injest_nord <- safe_vald_fetch(
+  fetch_function = get_nordbord_data,
+  description = "Nordbord data",
+  timeout_seconds = 300
+)
+
 nord_tests <- injest_nord$tests
 if (nrow(nord_tests) > 0) {
   create_log_entry(paste("Processing Nordbord (", nrow(nord_tests), " tests)"))
@@ -980,13 +1061,13 @@ if (nrow(nord_tests) > 0) {
   create_log_entry("No Nordbord tests - skipping Nordbord section")
 }
 
-# Dates & Tests (MERGE client-side handled in bq_upsert)
+# Dates & Tests (MERGE)
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
 tests_delta <- forcedecks_raw %>% select(test_ID) %>% distinct()
 bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
 bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = character())
 
-# RSI fix (non-destructive, DML-free)
+# RSI fix
 fix_rsi_data_type()
 
 create_log_entry("=== SCRIPT EXECUTION SUMMARY ===")
