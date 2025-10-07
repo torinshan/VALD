@@ -26,13 +26,13 @@ jobs:
         echo "LA  now: $(TZ=America/Los_Angeles date)"
 
         '
-    - name: "Gate to 06:00\u201319:59 PT"
+    - name: "Gate to 06:00–19:59 PT"
       id: gate
       shell: bash
       run: "LA_HOUR=$(TZ=America/Los_Angeles date +%H)\nif [ \"$LA_HOUR\" -ge 6 ]\
         \ && [ \"$LA_HOUR\" -lt 20 ]; then\n  echo \"ok=true\" >> \"$GITHUB_OUTPUT\"\
-        \n  echo \"Proceeding (within 06:00\u201319:59 PT).\"\nelse\n  echo \"ok=false\"\
-        \ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00\u201319:59 PT \u2014 skipping.\"\
+        \n  echo \"Proceeding (within 06:00–19:59 PT).\"\nelse\n  echo \"ok=false\"\
+        \ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00–19:59 PT — skipping.\"\
         \nfi\n"
     - name: Stop if gate says skip
       if: steps.gate.outputs.ok != 'true'
@@ -90,7 +90,8 @@ jobs:
           rlang
           lifecycle
           glue
-          slider'
+          slider
+          R.utils'
         cache: true
     - name: System libs
       if: steps.gate.outputs.ok == 'true'
@@ -137,7 +138,7 @@ jobs:
         server_port: 587
         username: your-email@gmail.com
         password: your-app-password-here
-        subject: "VALD q15 FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
+        subject: "VALD q15 FAILED – run #${{ github.run_number }} on ${{ github.ref_name }}"
         to: "torinshan@gmail.com, torin.shanahan@csus.edu"
         from: VALD Bot <vald-bot@example.com>
         html_body: |
