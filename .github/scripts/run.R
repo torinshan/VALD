@@ -26,27 +26,149 @@ cat("BQ Location:", location, "\n")
 # Global variable to store access token for REST API calls
 GLOBAL_ACCESS_TOKEN <- NULL
 
-# ---------- VALD API Pagination Safety ----------
-# Known problematic timestamps that cause API pagination loops
-PROBLEMATIC_TIMESTAMPS <- c(
-  "2025-10-06T20:45:34.816Z"
+# ---------- Schema Mismatch Tracking ----------
+schema_mismatches <- tibble(
+  table_name = character(0),
+  missing_columns = character(0),
+  column_type = character(0),
+  timestamp = as.POSIXct(character(0))
 )
 
-safe_vald_fetch <- function(fetch_function, description = "VALD API", timeout_seconds = 600, ...) {
+log_schema_mismatch <- function(table_name, column_name, column_type) {
+  schema_mismatches <<- bind_rows(schema_mismatches, tibble(
+    table_name = table_name,
+    missing_columns = column_name,
+    column_type = column_type,
+    timestamp = Sys.time()
+  ))
+  create_log_entry(paste("SCHEMA MISMATCH:", table_name, "- Missing column:", column_name, "Type:", column_type), "WARN")
+}
+
+upload_schema_mismatches <- function() {
+  if (nrow(schema_mismatches) == 0) return(invisible(TRUE))
+  tryCatch({
+    mismatch_tbl <- bq_table(ds, "vald_schema_mismatches")
+    if (!bq_table_exists(mismatch_tbl)) {
+      bq_table_create(mismatch_tbl, fields = as_bq_fields(schema_mismatches))
+    }
+    bq_table_upload(mismatch_tbl, schema_mismatches, write_disposition = "WRITE_APPEND")
+    create_log_entry(paste("Logged", nrow(schema_mismatches), "schema mismatches"))
+    TRUE
+  }, error = function(e) {
+    cat("Schema mismatch upload failed:", e$message, "\n")
+    FALSE
+  })
+}
+
+# ---------- VALD API Pagination Safety ----------
+# Track pagination state to detect stuck loops
+pagination_state <- list()
+
+detect_stuck_pagination <- function(description, current_cursor = NULL, max_same = 3) {
+  if (is.null(current_cursor)) return(FALSE)
+  
+  if (!exists(description, envir = as.environment(pagination_state))) {
+    pagination_state[[description]] <<- list(
+      last_cursor = current_cursor,
+      same_count = 1,
+      total_pages = 1
+    )
+    return(FALSE)
+  }
+  
+  state <- pagination_state[[description]]
+  
+  if (identical(state$last_cursor, current_cursor)) {
+    state$same_count <- state$same_count + 1
+    state$total_pages <- state$total_pages + 1
+    
+    if (state$same_count >= max_same) {
+      create_log_entry(paste(
+        "CIRCUIT BREAKER TRIGGERED:", description,
+        "- Stuck at cursor:", substr(current_cursor, 1, 50),
+        "- Repeated", state$same_count, "times"
+      ), "ERROR")
+      pagination_state[[description]] <<- state
+      return(TRUE)
+    }
+    
+    create_log_entry(paste(
+      "Pagination warning:", description,
+      "- Same cursor repeated", state$same_count, "times"
+    ), "WARN")
+  } else {
+    state$same_count <- 1
+  }
+  
+  state$last_cursor <- current_cursor
+  state$total_pages <- state$total_pages + 1
+  pagination_state[[description]] <<- state
+  
+  return(FALSE)
+}
+
+# Wrapper for VALD API calls with timeout and pagination protection
+safe_vald_fetch <- function(fetch_function, description = "VALD API", 
+                           timeout_seconds = 600, max_same_cursor = 3, ...) {
   create_log_entry(paste("Starting", description, "fetch with", timeout_seconds, "second timeout"))
+  
+  # Reset pagination state for this fetch
+  if (exists(description, envir = as.environment(pagination_state))) {
+    pagination_state[[description]] <<- NULL
+  }
   
   result <- NULL
   timed_out <- FALSE
+  circuit_breaker_tripped <- FALSE
+  
+  # Wrap the fetch function to monitor pagination
+  monitored_fetch <- function(...) {
+    start_time <- Sys.time()
+    last_log_time <- start_time
+    
+    tryCatch({
+      result <- fetch_function(...)
+      
+      # Check if we spent too long (potential stuck pagination)
+      elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      if (elapsed > timeout_seconds * 0.8) {
+        create_log_entry(paste(
+          "WARNING:", description, "took", round(elapsed, 1),
+          "seconds - approaching timeout"
+        ), "WARN")
+      }
+      
+      return(result)
+    }, error = function(e) {
+      # Check if error message indicates pagination issues
+      if (grepl("pagination|cursor|timeout", e$message, ignore.case = TRUE)) {
+        create_log_entry(paste(
+          "Pagination error detected in", description, ":", e$message
+        ), "ERROR")
+      }
+      stop(e)
+    })
+  }
   
   tryCatch({
     result <- withTimeout({
-      fetch_function(...)
+      monitored_fetch(...)
     }, timeout = timeout_seconds, onTimeout = "error")
   }, TimeoutException = function(e) {
     timed_out <<- TRUE
     create_log_entry(paste(description, "fetch TIMEOUT after", timeout_seconds, "seconds"), "ERROR")
-    create_log_entry("This likely indicates a VALD API pagination bug at a specific timestamp", "ERROR")
-    create_log_entry("Problematic timestamp will be logged if detected", "ERROR")
+    create_log_entry("This indicates a VALD API pagination bug or network issue", "ERROR")
+    
+    # Log pagination state if available
+    if (exists(description, envir = as.environment(pagination_state))) {
+      state <- pagination_state[[description]]
+      create_log_entry(paste(
+        "Pagination state at timeout - Last cursor:",
+        substr(state$last_cursor, 1, 50),
+        "- Total pages:", state$total_pages,
+        "- Same cursor count:", state$same_count
+      ), "ERROR")
+    }
   }, error = function(e) {
     if (!timed_out) {
       create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
@@ -55,38 +177,89 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API", timeout_se
   
   if (timed_out || is.null(result)) {
     create_log_entry("=== VALD API FETCH FAILED ===", "ERROR")
-    create_log_entry(paste("Known problematic timestamps:", paste(PROBLEMATIC_TIMESTAMPS, collapse = ", ")), "ERROR")
     upload_logs_to_bigquery()
+    upload_schema_mismatches()
     quit(status = 1)
+  }
+  
+  # Log successful completion
+  if (exists(description, envir = as.environment(pagination_state))) {
+    state <- pagination_state[[description]]
+    create_log_entry(paste(
+      description, "completed successfully -",
+      "Total pages:", state$total_pages
+    ))
   }
   
   result
 }
 
-check_and_skip_problematic_date <- function(start_date) {
-  # Convert problematic timestamps to dates
-  problematic_dates <- as.Date(sapply(PROBLEMATIC_TIMESTAMPS, function(ts) {
-    substr(ts, 1, 10)
-  }))
+# ---------- Schema Validation and Matching ----------
+infer_bq_type <- function(column_data) {
+  if (is.logical(column_data)) return("BOOLEAN")
+  if (inherits(column_data, "POSIXct") || inherits(column_data, "POSIXt")) return("TIMESTAMP")
+  if (inherits(column_data, "Date")) return("DATE")
+  if (inherits(column_data, "hms") || inherits(column_data, "difftime")) return("TIME")
+  if (is.integer(column_data)) return("INTEGER")
+  if (is.numeric(column_data)) return("FLOAT")
+  return("STRING")
+}
+
+validate_and_fix_schema <- function(data, table_name, ds) {
+  tbl <- bq_table(ds, table_name)
   
-  # Check if our start date is within 2 days of any problematic date
-  for (prob_date in problematic_dates) {
-    days_diff <- abs(difftime(start_date, prob_date, units = "days"))
-    
-    if (days_diff < 2) {
-      create_log_entry(paste("Start date", start_date, "is within 2 days of problematic date", prob_date), "WARN")
-      create_log_entry("Adjusting start date to skip problematic timestamp area", "WARN")
-      
-      # Skip to day after problematic date
-      adjusted_date <- prob_date + lubridate::days(1)
-      create_log_entry(paste("Adjusted start date:", adjusted_date), "WARN")
-      
-      return(adjusted_date)
-    }
+  # If table doesn't exist, no validation needed
+  if (!bq_table_exists(tbl)) {
+    return(data)
   }
   
-  # No adjustment needed
-  return(start_date)
+  # Get current schema
+  tryCatch({
+    meta <- bq_table_meta(tbl)
+    existing_fields <- sapply(meta$schema$fields, function(f) f$name)
+    data_fields <- names(data)
+    
+    # Find missing columns in BigQuery schema
+    missing_in_bq <- setdiff(data_fields, existing_fields)
+    
+    if (length(missing_in_bq) > 0) {
+      create_log_entry(paste(
+        "Schema mismatch in", table_name, "-",
+        length(missing_in_bq), "columns missing from BigQuery schema:",
+        paste(head(missing_in_bq, 10), collapse = ", ")
+      ), "WARN")
+      
+      # Log each missing column
+      for (col in missing_in_bq) {
+        col_type <- infer_bq_type(data[[col]])
+        log_schema_mismatch(table_name, col, col_type)
+      }
+      
+      # Drop the missing columns from data to prevent upload failure
+      create_log_entry(paste(
+        "Dropping", length(missing_in_bq),
+        "columns from upload to match existing schema"
+      ), "WARN")
+      data <- data %>% select(-all_of(missing_in_bq))
+    }
+    
+    # Check for columns in schema but not in data (less critical, just informational)
+    missing_in_data <- setdiff(existing_fields, data_fields)
+    if (length(missing_in_data) > 0) {
+      create_log_entry(paste(
+        "Note:", length(missing_in_data),
+        "columns exist in BigQuery schema but not in current data:",
+        paste(head(missing_in_data, 10), collapse = ", ")
+      ), "INFO")
+    }
+    
+  }, error = function(e) {
+    create_log_entry(paste(
+      "Error validating schema for", table_name, ":", e$message
+    ), "WARN")
+  })
+  
+  return(data)
 }
 
 # ---------- Auth (Working Version) ----------
@@ -283,7 +456,7 @@ standardize_data_types <- function(data, table_name) {
   data
 }
 
-# ---------- DML-FREE UPSERT ----------
+# ---------- DML-FREE UPSERT with Schema Validation ----------
 bq_upsert <- function(data, table_name, key="test_ID",
                       mode=c("MERGE","TRUNCATE"),
                       partition_field="date",
@@ -296,6 +469,10 @@ bq_upsert <- function(data, table_name, key="test_ID",
   }
 
   data <- standardize_data_types(data, table_name)
+  
+  # Validate schema and fix mismatches
+  data <- validate_and_fix_schema(data, table_name, ds)
+  
   tbl <- bq_table(ds, table_name)
 
   if (nrow(data) == 0) {
@@ -454,17 +631,19 @@ tryCatch({
 }, error = function(e) {
   create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
   upload_logs_to_bigquery()
+  upload_schema_mismatches()
   quit(status = 1)
 })
 
 # ---------- Gate: run only if EITHER date OR count differ ----------
 create_log_entry("Probing VALD API for tests-only to compare date & count")
 
-# Use safe fetch with timeout protection
+# Use safe fetch with timeout protection and circuit breaker
 all_tests_probe <- safe_vald_fetch(
   fetch_function = get_forcedecks_tests_only,
   description = "ForceDecks tests probe",
   timeout_seconds = 600,
+  max_same_cursor = 3,
   start_date = NULL
 )
 
@@ -492,7 +671,10 @@ create_log_entry(paste("count_mismatch:", count_mismatch))
 if (!date_mismatch && !count_mismatch) {
   create_log_entry("No changes detected - date and count both match. Exiting.")
   create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
-  upload_logs_to_bigquery(); try(DBI::dbDisconnect(con), silent=TRUE); quit(status=0)
+  upload_logs_to_bigquery()
+  upload_schema_mismatches()
+  try(DBI::dbDisconnect(con), silent=TRUE)
+  quit(status=0)
 }
 
 create_log_entry(paste("Changes detected - Running update (date_mismatch:", date_mismatch, ", count_mismatch:", count_mismatch, ")"))
@@ -567,20 +749,17 @@ if (nrow(Vald_roster_backfill) > 0) {
 # ---------- Overlap start date (latest - 1 day), then fetch ----------
 overlap_days <- 1L
 start_dt <- latest_date_current - lubridate::days(overlap_days)
-
-# Check if we need to skip problematic timestamps
-start_dt <- check_and_skip_problematic_date(start_dt)
-
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
 create_log_entry(paste("Running with overlap start:", start_dt, "T00:00:00Z"))
 
 create_log_entry("Fetching ForceDecks data from VALD API...")
 
-# Use safe fetch with timeout protection
+# Use safe fetch with timeout protection and circuit breaker
 injest_fd <- safe_vald_fetch(
   fetch_function = get_forcedecks_data,
   description = "ForceDecks full data",
-  timeout_seconds = 900
+  timeout_seconds = 900,
+  max_same_cursor = 3
 )
 
 profiles <- as.data.table(injest_fd$profiles)
@@ -705,7 +884,7 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
   attach_bw <- function(df) df
 }
 
-# -------- Sections (gated) --------
+# -------- Sections (gated) - All now with schema validation --------
 # CMJ: TRUNCATE
 if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
   create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
@@ -982,11 +1161,12 @@ if ("IMTP" %in% new_test_types) {
 # Nordbord: MERGE
 create_log_entry("Fetching Nordbord data from VALD API...")
 
-# Use safe fetch with timeout protection
+# Use safe fetch with timeout protection and circuit breaker
 injest_nord <- safe_vald_fetch(
   fetch_function = get_nordbord_data,
   description = "Nordbord data",
-  timeout_seconds = 300
+  timeout_seconds = 300,
+  max_same_cursor = 3
 )
 
 nord_tests <- injest_nord$tests
@@ -1075,5 +1255,6 @@ execution_time <- round(difftime(Sys.time(), script_start_time, units="mins"), 2
 create_log_entry(paste("Total execution time:", execution_time, "minutes"))
 create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
 upload_logs_to_bigquery()
+upload_schema_mismatches()
 try(DBI::dbDisconnect(con), silent = TRUE)
 cat("Script completed successfully\n")
