@@ -23,6 +23,145 @@ cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
 cat("BQ Location:", location, "\n")
 
+# ---------- CMJ validation helpers (added) ----------
+# Session id: per-athlete, group contiguous tests ≤ 2 hours apart
+create_session_ids <- function(vald_id, dt) {
+  dplyr::coalesce(
+    paste0(vald_id, "_",
+           cumsum(dplyr::if_else(
+             is.na(dt) | dplyr::lag(is.na(dt), default = TRUE),
+             TRUE,
+             as.numeric(dt - dplyr::lag(dt)) > (2*60*60)
+           ))),
+    paste0(vald_id, "_", seq_along(dt))
+  )
+}
+
+# Adaptive z-score using rolling “look-back” windows: 30 → 60 → 90 → all history
+adaptive_z <- function(x, t, windows = c(30, 60, 90, Inf)) {
+  n <- length(x); out <- rep(NA_real_, n)
+  for (i in seq_len(n)) {
+    hist <- t < t[i]
+    picked <- NULL
+    for (w in windows) {
+      mask <- if (is.infinite(w)) hist else hist & (t >= t[i] - lubridate::days(w))
+      if (sum(!is.na(x[mask])) >= 4) { picked <- mask; break }
+    }
+    if (!is.null(picked)) {
+      m <- mean(x[picked], na.rm=TRUE); s <- stats::sd(x[picked], na.rm=TRUE)
+      out[i] <- if (isTRUE(s>0)) (x[i]-m)/s else NA_real_
+    }
+  }
+  out
+}
+
+# Robust z using MAD
+robust_z <- function(r) {
+  med <- stats::median(r, na.rm = TRUE)
+  mad <- stats::mad(r, center = med, constant = 1.4826, na.rm = TRUE)
+  if (!is.finite(mad) || mad == 0) return(rep(NA_real_, length(r)))
+  (r - med)/mad
+}
+
+# Layer 1 — Quick guardrails
+apply_layer1 <- function(df) {
+  g <- 9.80665
+  df %>%
+    dplyr::arrange(vald_id, event_datetime) %>%
+    dplyr::group_by(vald_id) %>%
+    dplyr::mutate(
+      bw_med_30d = slider::slide_index_dbl(body_weight_lbs, date, ~stats::median(.x, na.rm=TRUE),
+                                           .before = lubridate::days(30), .complete = FALSE),
+      bw_delta_pct = dplyr::if_else(is.finite(bw_med_30d) & bw_med_30d>0,
+                                    abs(body_weight_lbs - bw_med_30d)/bw_med_30d, NA_real_),
+      flag_bw_delta = !is.na(bw_delta_pct) & bw_delta_pct > 0.15,
+      v_expected = sqrt(2*g*jump_height_m),
+      v_ratio = dplyr::if_else(is.finite(v_expected) & v_expected>0, takeoff_v_ms / v_expected, NA_real_),
+      flag_physics_violation = !is.na(v_ratio) & (v_ratio < 0.80 | v_ratio > 1.25)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(session_id) %>%
+    dplyr::mutate(
+      session_extreme = sum(flag_physics_violation, na.rm = TRUE),
+      flag_session_contamination = !is.na(session_id) & session_extreme > 10
+    ) %>%
+    dplyr::ungroup()
+}
+
+# Layer 2 — Progressive z-scores (adaptive windows)
+apply_layer2 <- function(df) {
+  df %>%
+    dplyr::arrange(vald_id, date, time) %>%
+    dplyr::group_by(vald_id) %>%
+    dplyr::mutate(
+      z_jh  = adaptive_z(jump_height_inches_imp_mom, date),
+      z_bw  = adaptive_z(body_weight_lbs, date),
+      z_rsi = adaptive_z(rsi_modified_imp_mom, date),
+      z_v   = adaptive_z(takeoff_v_ms, date),
+      total_tests = dplyr::n(),
+      z_threshold = dplyr::case_when(total_tests <= 7 ~ 5, total_tests <= 12 ~ 4, TRUE ~ 3),
+      extreme_count = (abs(z_jh) > 4) + (abs(z_bw) > 4) + (abs(z_rsi) > 4) + (abs(z_v) > 4),
+      flag_multiple_extremes = extreme_count >= 3
+    ) %>% dplyr::ungroup()
+}
+
+# Layer 3 — Physics consistency
+apply_layer3 <- function(df) {
+  g <- 9.80665
+  df %>%
+    dplyr::mutate(
+      h_from_v = (takeoff_v_ms^2) / (2*g),
+      ape_h = dplyr::if_else(jump_height_m > 0, abs(jump_height_m - h_from_v)/jump_height_m, NA_real_),
+      v_residual = takeoff_v_ms - sqrt(pmax(0, 2*g*jump_height_m)),
+      z_resid = robust_z(v_residual),
+      physics_flag = dplyr::case_when(
+        jump_height_m < 0.10 ~ "SKIP",
+        !is.na(v_ratio) & (v_ratio < 0.80 | v_ratio > 1.25) ~ "RED",
+        !is.na(v_ratio) & (v_ratio < 0.90 | v_ratio > 1.15) ~ "AMBER",
+        !is.na(ape_h)   & ape_h > 0.35 ~ "RED",
+        !is.na(ape_h)   & ape_h > 0.15 ~ "AMBER",
+        !is.na(z_resid) & abs(z_resid) > 4 ~ "RED",
+        !is.na(z_resid) & abs(z_resid) > 3 ~ "AMBER",
+        TRUE ~ "GREEN"
+      )
+    )
+}
+
+# Layer 4 — mRSI reasonableness
+apply_layer4 <- function(df) {
+  df %>%
+    dplyr::group_by(vald_id) %>%
+    dplyr::arrange(date, time, .by_group = TRUE) %>%
+    dplyr::mutate(
+      z30_mrsi = adaptive_z(rsi_modified_imp_mom, date, windows = c(30, 60, 90, Inf)),
+      z30_jh   = adaptive_z(jump_height_inches_imp_mom, date, windows = c(30, 60, 90, Inf)),
+      z30_ct   = adaptive_z(contraction_time, date, windows = c(30, 60, 90, Inf)),
+      mrsi_invalid = (!is.na(z30_mrsi) & z30_mrsi >= 2) & (!is.na(z30_jh) & z30_jh <= 1),
+      rsi_modified_imp_mom_clean = dplyr::if_else(mrsi_invalid, NA_real_, rsi_modified_imp_mom)
+    ) %>% dplyr::ungroup()
+}
+
+# Final classification + clean metrics
+apply_final_and_clean <- function(df) {
+  df %>%
+    dplyr::mutate(
+      coherence_flag = dplyr::case_when(
+        z_jh >  2 & z_v >  1 ~ TRUE,
+        z_jh < -2 & z_v < -1 ~ TRUE,
+        abs(z_jh) > 2 & abs(z_v) < 1 ~ FALSE,
+        TRUE ~ TRUE
+      ),
+      final_classification = dplyr::case_when(
+        physics_flag == "RED" & (flag_bw_delta | flag_session_contamination | !coherence_flag) ~ "LIKELY_INACCURATE_MEASUREMENT",
+        physics_flag %in% c("AMBER","RED") & coherence_flag & total_tests >= 5 ~ "VALID_BUT_OUTLIER",
+        physics_flag == "GREEN" & coherence_flag & abs(z_jh) > 3 ~ "VALID_EXTREME",
+        TRUE ~ "LIKELY_VALID"
+      ),
+      jump_height_clean_inches = dplyr::if_else(final_classification == "LIKELY_INACCURATE_MEASUREMENT", NA_real_, jump_height_inches_imp_mom),
+      takeoff_v_ms_clean = dplyr::if_else(final_classification == "LIKELY_INACCURATE_MEASUREMENT", NA_real_, takeoff_v_ms)
+    )
+}
+
 # Global variable to store access token for REST API calls
 GLOBAL_ACCESS_TOKEN <- NULL
 
@@ -885,9 +1024,9 @@ if ("body_weight_lbs" %in% names(forcedecks_raw)) {
 }
 
 # -------- Sections (gated) - All now with schema validation --------
-# CMJ: TRUNCATE
+# CMJ: TRUNCATE + 4-layer validation (added)
 if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
-  create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ")
+  create_log_entry("Processing CMJ/LCMJ/SJ/ABCMJ with 4-layer validation")
   cmj_temp <- forcedecks_raw %>% filter(test_type %in% c("CMJ","LCMJ","SJ","ABCMJ"))
   create_log_entry(paste("cmj_temp row count:", nrow(cmj_temp)))
   create_log_entry(paste("cmj_temp columns:", paste(names(cmj_temp), collapse = ", ")))
@@ -905,11 +1044,10 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
         "concentric_rfd_100","start_to_peak_force_time","contraction_time","concentric_duration",
         "eccentric_concentric_duration_ratio","flight_eccentric_time_ratio","displacement_at_takeoff",
         "rsi_modified_imp_mom","positive_takeoff_impulse","positive_impulse","concentric_impulse",
-        "eccentric_braking_impulse","total_work","relative_peak_landing_force",
-        "relative_peak_concentric_force","relative_peak_eccentric_force","bm_rel_force_at_zero_velocity",
-        "landing_impulse","force_at_zero_velocity","cmj_stiffness","braking_phase_duration",
-        "takeoff_velocity","eccentric_time","peak_landing_acceleration","peak_takeoff_acceleration",
-        "concentric_rfd_200","eccentric_peak_power"
+        "eccentric_braking_impulse","total_work","relative_peak_landing_force","relative_peak_concentric_force",
+        "relative_peak_eccentric_force","bm_rel_force_at_zero_velocity","landing_impulse","force_at_zero_velocity",
+        "cmj_stiffness","braking_phase_duration","takeoff_velocity","eccentric_time","peak_landing_acceleration",
+        "peak_takeoff_acceleration","concentric_rfd_200","eccentric_peak_power","body_weight_lbs"
       ))) %>%
       filter(!is.na(jump_height_inches_imp_mom)) %>% arrange(full_name, test_type, date)
 
@@ -922,6 +1060,27 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
 
     cmj_all <- bind_rows(cmj_existing, cmj_new) %>% distinct(test_ID, .keep_all = TRUE) %>% arrange(full_name, test_type, date)
 
+    # --- 4-layer validation pipeline on combined history (before 5-28in filter) ---
+    cmj_all_enh <- cmj_all %>%
+      mutate(
+        event_datetime = as.POSIXct(paste(as.character(date), time), tz = "America/Los_Angeles"),
+        jump_height_m  = jump_height_inches_imp_mom * 0.0254,
+        takeoff_v_ms   = dplyr::coalesce(peak_takeoff_velocity, takeoff_velocity)
+      ) %>%
+      group_by(vald_id) %>% arrange(date, time, .by_group = TRUE) %>%
+      mutate(session_id = dplyr::if_else(is.na(vald_id) | is.na(event_datetime),
+                                         NA_character_,
+                                         create_session_ids(vald_id, event_datetime))) %>%
+      ungroup()
+
+    cmj_all_qc <- cmj_all_enh %>%
+      apply_layer1() %>%
+      apply_layer2() %>%
+      apply_layer3() %>%
+      apply_layer4() %>%
+      apply_final_and_clean()
+
+    # --- Preserve existing readiness/performance calculations and range filter ---
     fd <- cmj_all %>% 
       arrange(full_name, test_type, date) %>%
       group_by(full_name, test_type) %>%
@@ -995,8 +1154,26 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
                     "epf_readiness","performance_score","team_performance_score","body_weight_lbs")
     fd <- fd %>% select(any_of(bq_columns))
 
+    # Upload primary table unchanged (backward compatible)
     bq_upsert(fd, "vald_fd_jumps", key="test_ID", mode="TRUNCATE",
               partition_field="date", cluster_fields=c("team","test_type","vald_id"))
+
+    # Upload QC companion table with new validation columns
+    qc_cols <- c(
+      "test_ID","vald_id","team","test_type","date","session_id",
+      "flag_bw_delta","flag_physics_violation","flag_session_contamination","flag_multiple_extremes",
+      "z_jh","z_bw","z_rsi","z_v","z_resid","physics_flag","final_classification",
+      "jump_height_clean_inches","takeoff_v_ms_clean","rsi_modified_imp_mom_clean"
+    )
+    cmj_qc <- cmj_all_qc %>% dplyr::select(dplyr::any_of(qc_cols)) %>% dplyr::distinct(test_ID, .keep_all = TRUE)
+
+    bq_upsert(cmj_qc, "vald_fd_jumps_qc", key="test_ID", mode="MERGE",
+              partition_field="date", cluster_fields=c("team","test_type","vald_id"))
+
+    validation_summary <- cmj_qc %>% group_by(final_classification) %>% summarise(count = n(), .groups = "drop") %>%
+      mutate(pct = round(100*count/sum(count), 1))
+    create_log_entry(paste("Validation results:", 
+      paste(paste0(validation_summary$final_classification, " ", validation_summary$pct, "%"), collapse = ", ")))
   }
 } else {
   create_log_entry("No new CMJ-family tests - skipping CMJ section")
