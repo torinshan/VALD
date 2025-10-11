@@ -552,10 +552,22 @@ read_bq_table <- function(table_name) {
 
 ensure_table <- function(tbl, data, partition_field="date", cluster_fields=character()) {
   if (bq_table_exists(tbl)) return(invisible(TRUE))
+
+  # Build time partitioning object in a way that's compatible with different bigrquery versions
   tp <- NULL
   if (!is.null(partition_field) && partition_field %in% names(data)) {
-    tp <- bq_time_partition("DAY", field = partition_field)
+    # Prefer modern helper if available
+    if ("bq_time_partitioning" %in% getNamespaceExports("bigrquery")) {
+      tp <- bigrquery::bq_time_partitioning(type = "DAY", field = partition_field)
+    } else if ("bq_time_partition" %in% getNamespaceExports("bigrquery")) {
+      # Back-compat with older bigrquery releases
+      tp <- bigrquery::bq_time_partition("DAY", field = partition_field)
+    } else {
+      # Fallback: let API infer default daily partitioning on field
+      tp <- list(type = "DAY", field = partition_field)
+    }
   }
+
   cl <- intersect(cluster_fields, names(data))
   bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering = cl)
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
