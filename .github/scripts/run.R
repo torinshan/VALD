@@ -556,22 +556,28 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   # Build time partitioning object in a way that's compatible with different bigrquery versions
   tp <- NULL
   if (!is.null(partition_field) && partition_field %in% names(data)) {
-    # Prefer modern helper if available
     if ("bq_time_partitioning" %in% getNamespaceExports("bigrquery")) {
       tp <- bigrquery::bq_time_partitioning(type = "DAY", field = partition_field)
     } else if ("bq_time_partition" %in% getNamespaceExports("bigrquery")) {
-      # Back-compat with older bigrquery releases
       tp <- bigrquery::bq_time_partition("DAY", field = partition_field)
     } else {
-      # Fallback: let API infer default daily partitioning on field
       tp <- list(type = "DAY", field = partition_field)
     }
   }
 
   cl <- intersect(cluster_fields, names(data))
-  bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering = cl)
+  if (length(cl) == 0) cl <- NULL
+
+  # NOTE: some bigrquery versions expect `clustering_fields` (not `clustering`).
+  bq_table_create(
+    tbl,
+    fields = as_bq_fields(data),
+    time_partitioning = tp,
+    clustering_fields = cl
+  )
+
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
-  cluster_info <- if (length(cl) > 0) paste(cl, collapse = ",") else "none"
+  cluster_info <- if (is.null(cl)) "none" else paste(cl, collapse = ",")
   create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info))
   invisible(TRUE)
 }
