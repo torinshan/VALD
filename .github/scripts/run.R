@@ -37,7 +37,7 @@ create_session_ids <- function(vald_id, dt) {
   )
 }
 
-# Adaptive z-score using rolling “look-back” windows: 30 → 60 → 90 → all history
+# Adaptive z-score using rolling "look-back" windows: 30 → 60 → 90 → all history
 adaptive_z <- function(x, t, windows = c(30, 60, 90, Inf)) {
   n <- length(x); out <- rep(NA_real_, n)
   for (i in seq_len(n)) {
@@ -1305,6 +1305,7 @@ if ("SLJ" %in% new_test_types) {
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
       "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "jump_height_inches_imp_mom",
       "peak_landing_force","peak_landing_velocity","peak_takeoff_velocity","time_to_peak_force",
       "weight_relative_peak_takeoff_force","weight_relative_peak_landing_force",
       "relative_peak_concentric_force","relative_peak_eccentric_force","lower_limb_stiffness",
