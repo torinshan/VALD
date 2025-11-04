@@ -724,6 +724,8 @@ fix_rsi_data_type <- function() {
 
 # ---------- Current BQ state ----------
 create_log_entry("=== READING CURRENT DATA STATE FROM BIGQUERY ===")
+
+# Read dates table
 current_dates <- read_bq_table("dates")
 if (nrow(current_dates) > 0) {
   current_dates <- current_dates %>% select(date) %>% distinct() %>% mutate(date = as.Date(date))
@@ -731,6 +733,7 @@ if (nrow(current_dates) > 0) {
   current_dates <- tibble(date = as.Date(character(0)))
 }
 
+# Read tests table
 tests_tbl <- read_bq_table("tests")
 if (nrow(tests_tbl) > 0) {
   tests_tbl <- tests_tbl %>% mutate(test_ID = as.character(test_ID)) %>% distinct()
@@ -738,9 +741,24 @@ if (nrow(tests_tbl) > 0) {
   tests_tbl <- tibble(test_ID = character(0))
 }
 
+# Read Nordbord table for gate check
+nordbord_tbl <- read_bq_table("vald_nord_all")
+if (nrow(nordbord_tbl) > 0) {
+  nordbord_tbl <- nordbord_tbl %>% 
+    select(any_of(c("test_ID", "date"))) %>% 
+    mutate(test_ID = as.character(test_ID), date = as.Date(date)) %>% 
+    distinct()
+} else {
+  nordbord_tbl <- tibble(test_ID = character(0), date = as.Date(character(0)))
+}
+
 latest_date_current <- if (nrow(current_dates)>0) max(current_dates$date, na.rm=TRUE) else as.Date("1900-01-01")
 count_tests_current <- nrow(tests_tbl)
-create_log_entry(paste("Current state - Latest date:", latest_date_current, "Test count:", count_tests_current))
+latest_nord_date_current <- if (nrow(nordbord_tbl)>0) max(nordbord_tbl$date, na.rm=TRUE) else as.Date("1900-01-01")
+count_nord_tests_current <- nrow(nordbord_tbl)
+
+create_log_entry(paste("Current ForceDecks state - Latest date:", latest_date_current, "Test count:", count_tests_current))
+create_log_entry(paste("Current Nordbord state - Latest date:", latest_nord_date_current, "Test count:", count_nord_tests_current))
 
 # ---------- Read roster early for use in gate check and later processing ----------
 create_log_entry("=== READING ROSTER DATA ===")
@@ -792,10 +810,11 @@ tryCatch({
   quit(status = 1)
 })
 
-# ---------- Gate: run only if EITHER date OR count differ ----------
-create_log_entry("Probing VALD API for tests-only to compare date & count")
+# ---------- Gate: run only if EITHER ForceDecks OR Nordbord data changed ----------
+create_log_entry("=== PROBING VALD APIs FOR CHANGES ===")
 
-# Use safe fetch with timeout protection and circuit breaker
+# Probe ForceDecks API
+create_log_entry("Probing ForceDecks API for tests-only to compare date & count")
 all_tests_probe <- safe_vald_fetch(
   fetch_function = get_forcedecks_tests_only,
   description = "ForceDecks tests probe",
@@ -819,14 +838,59 @@ probe_df <- as_tibble(all_tests_probe) %>%
 api_latest_date <- suppressWarnings(max(probe_df$date, na.rm = TRUE))
 api_test_count <- dplyr::n_distinct(probe_df$test_ID)
 
-create_log_entry(paste("API data - Latest date:", api_latest_date, "Test count:", api_test_count))
-date_mismatch  <- !identical(api_latest_date, latest_date_current)
-count_mismatch <- api_test_count != count_tests_current
-create_log_entry(paste("date_mismatch:", date_mismatch))
-create_log_entry(paste("count_mismatch:", count_mismatch))
+create_log_entry(paste("ForceDecks API - Latest date:", api_latest_date, "Test count:", api_test_count))
 
-if (!date_mismatch && !count_mismatch) {
-  create_log_entry("No changes detected - date and count both match. Exiting.")
+fd_date_mismatch  <- !identical(api_latest_date, latest_date_current)
+fd_count_mismatch <- api_test_count != count_tests_current
+
+create_log_entry(paste("ForceDecks - date_mismatch:", fd_date_mismatch, "count_mismatch:", fd_count_mismatch))
+
+# Probe Nordbord API
+create_log_entry("Probing Nordbord API for tests to compare date & count")
+nordbord_probe <- safe_vald_fetch(
+  fetch_function = function() {
+    result <- get_nordbord_data(start_date = NULL)
+    return(result$tests)
+  },
+  description = "Nordbord tests probe",
+  timeout_seconds = 300,
+  max_same_cursor = 3
+)
+
+if (nrow(nordbord_probe) > 0) {
+  nordbord_probe_df <- as_tibble(nordbord_probe) %>%
+    mutate(
+      modifiedDateUtc_chr = as.character(modifiedDateUtc),
+      modifiedDateUtc_parsed = coalesce(
+        ymd_hms(modifiedDateUtc_chr, tz="UTC", quiet=TRUE),
+        ymd_hm(modifiedDateUtc_chr,  tz="UTC", quiet=TRUE),
+        ymd_h(modifiedDateUtc_chr,   tz="UTC", quiet=TRUE),
+        ymd(modifiedDateUtc_chr,     tz="UTC")
+      ),
+      modifiedDateUtc_local = with_tz(modifiedDateUtc_parsed, "America/Los_Angeles"),
+      date = as.Date(modifiedDateUtc_local),
+      test_ID = as.character(testId)
+    )
+  
+  nord_api_latest_date <- suppressWarnings(max(nordbord_probe_df$date, na.rm = TRUE))
+  nord_api_test_count <- dplyr::n_distinct(nordbord_probe_df$test_ID)
+} else {
+  nord_api_latest_date <- as.Date("1900-01-01")
+  nord_api_test_count <- 0
+}
+
+create_log_entry(paste("Nordbord API - Latest date:", nord_api_latest_date, "Test count:", nord_api_test_count))
+
+nord_date_mismatch  <- !identical(nord_api_latest_date, latest_nord_date_current)
+nord_count_mismatch <- nord_api_test_count != count_nord_tests_current
+
+create_log_entry(paste("Nordbord - date_mismatch:", nord_date_mismatch, "count_mismatch:", nord_count_mismatch))
+
+# Decide whether to proceed
+any_changes <- fd_date_mismatch || fd_count_mismatch || nord_date_mismatch || nord_count_mismatch
+
+if (!any_changes) {
+  create_log_entry("No changes detected in ForceDecks or Nordbord - all dates and counts match. Exiting.")
   create_log_entry("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
   upload_logs_to_bigquery()
   upload_schema_mismatches()
@@ -834,7 +898,9 @@ if (!date_mismatch && !count_mismatch) {
   quit(status=0)
 }
 
-create_log_entry(paste("Changes detected - Running update (date_mismatch:", date_mismatch, ", count_mismatch:", count_mismatch, ")"))
+create_log_entry(paste("Changes detected - Running update"))
+create_log_entry(paste("  ForceDecks changes:", fd_date_mismatch || fd_count_mismatch))
+create_log_entry(paste("  Nordbord changes:", nord_date_mismatch || nord_count_mismatch))
 
 # ---------- Backfill missing team data ----------
 create_log_entry("=== CHECKING FOR INCOMPLETE TEAM DATA ===")
@@ -903,9 +969,9 @@ if (nrow(Vald_roster_backfill) > 0) {
   create_log_entry("No vald_roster found - skipping team backfill", "WARN")
 }
 
-# ---------- Overlap start date (latest - 1 day), then fetch ----------
+# ---------- Overlap start date (earliest date across both sources - 1 day), then fetch ----------
 overlap_days <- 1L
-start_dt <- latest_date_current - lubridate::days(overlap_days)
+start_dt <- min(latest_date_current, latest_nord_date_current) - lubridate::days(overlap_days)
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
 create_log_entry(paste("Running with overlap start:", start_dt, "T00:00:00Z"))
 
