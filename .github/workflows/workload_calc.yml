@@ -2,7 +2,7 @@ name: Workload ingest (every 15 min)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -10,52 +10,46 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ---- GCP / BigQuery (your script reads these) ----
+      # ---- GCP / BigQuery (read by your R script) ----
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}          # e.g. sac-vald-hub
       BQ_DATASET:  ${{ vars.BQ_DATASET || 'analytics' }}
       BQ_LOCATION: ${{ vars.BQ_LOCATION || 'US' }}
       BQ_TABLE:    ${{ vars.BQ_TABLE    || 'workload_daily' }}
-      BQ_WRITE_MODE: ${{ vars.BQ_WRITE_MODE || 'MERGE' }}  # MERGE or TRUNCATE
+      BQ_WRITE_MODE: ${{ vars.BQ_WRITE_MODE || 'MERGE' }}
 
       # ---- Azure / OneDrive (Graph app creds) ----
       AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
       AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 
-      # Choose ONE source for the CSV path resolution:
-      SHAREPOINT_SITE_URL: ${{ vars.SHAREPOINT_SITE_URL }}  # e.g., https://contoso.sharepoint.com/sites/DataTeam
-      # ONEDRIVE_UPN:        ${{ vars.ONEDRIVE_UPN }}       # alternative: user drive
-
-      # Path within the drive/library (required)
-      ONEDRIVE_ITEM_PATH:  ${{ vars.ONEDRIVE_ITEM_PATH }}   # e.g., Shared Documents/GPS/CSV_Clean/Clean_Activities_GPS.csv
-
-      # Optional: debug local file instead of Graph
-      # LOCAL_FILE_PATH: path/to/Clean_Activities_GPS.csv
+      # File location in SharePoint / OneDrive for Business
+      SHAREPOINT_SITE_URL: ${{ vars.SHAREPOINT_SITE_URL }}         # e.g. https://contoso.sharepoint.com/sites/DataTeam
+      ONEDRIVE_ITEM_PATH:  ${{ vars.ONEDRIVE_ITEM_PATH }}          # e.g. Shared Documents/GPS/CSV_Clean/Clean_Activities_GPS.csv
+      # Optional debug: LOCAL_FILE_PATH: path/to/Clean_Activities_GPS.csv
 
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Google auth (creates ADC env for BigQuery) ----
-      - name: Auth to Google Cloud
+      # === SAME GOOGLE AUTH METHOD AS YOUR EXISTING JOBS ===
+      - name: Auth to Google Cloud (service account JSON)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          create_credentials_file: true           # sets GOOGLE_APPLICATION_CREDENTIALS
-          export_environment_variables: true      # exports ADC env vars
+          credentials_json: ${{ secrets.GCP_SA_KEY }}  # EXACTLY one input; must be a valid SA JSON
+          create_credentials_file: true
+          export_environment_variables: true
 
-      - name: Setup gcloud (for gcloud access token used by your R script)
+      - name: Setup gcloud (so R can run `gcloud auth print-access-token`)
         uses: google-github-actions/setup-gcloud@v2
 
-      # ---- R + deps with caching (pak-backed; super fast) ----
+      # R + cached dependencies (pak-backed)
       - name: Setup R
         uses: r-lib/actions/setup-r@v2
 
-      - name: Install R package dependencies (with cache)
+      - name: Install R deps (cached)
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           use-public-rspm: true
           cache-version: 1
-          # List all packages your script uses; pak resolves and caches them.
           extra-packages: |
             any::bigrquery
             any::DBI
@@ -76,12 +70,10 @@ jobs:
             any::slider
             any::janitor
 
-      # Some system libs help curl/openssl/xml; cheap to ensure
       - name: System libs
         run: |
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
-      # ---- Run your script ----
       - name: Run workload ingest
         run: Rscript workload_ingest.R
