@@ -8,7 +8,7 @@ tryCatch({
     library(purrr); library(tibble); library(data.table)
     library(hms); library(lubridate)
     library(httr); library(jsonlite); library(curl)
-    library(gargle); library(glue); library(slider)
+    library(gargle); library(glue); library(slider); library(janitor)
   })
 }, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
 
@@ -23,15 +23,8 @@ location  <- Sys.getenv("BQ_LOCATION", "US")
 table_out <- Sys.getenv("BQ_TABLE",    "workload_daily")
 write_mode <- toupper(Sys.getenv("BQ_WRITE_MODE", "MERGE"))  # MERGE or TRUNCATE
 
-# OneDrive / SharePoint (app-only)
-tenant_id     <- Sys.getenv("AZURE_TENANT_ID")
-client_id     <- Sys.getenv("AZURE_CLIENT_ID")
-client_secret <- Sys.getenv("AZURE_CLIENT_SECRET")
-sharepoint_site_url <- Sys.getenv("SHAREPOINT_SITE_URL")  # e.g. https://contoso.sharepoint.com/sites/DataTeam
-onedrive_upn        <- Sys.getenv("ONEDRIVE_UPN")         # e.g. dataops@contoso.com
-item_path           <- Sys.getenv("ONEDRIVE_ITEM_PATH")   # e.g. Shared Documents/GPS/CSV_Clean/Clean_Activities_GPS.csv
-
-# Optional: read from local path instead of Graph
+# OneDrive public link OR local path (debug)
+public_url <- Sys.getenv("ONEDRIVE_PUBLIC_URL", "")
 local_file <- Sys.getenv("LOCAL_FILE_PATH", "")
 
 cat("GCP Project:", project, "\n")
@@ -40,7 +33,7 @@ cat("BQ Location:", location, "\n")
 cat("BQ Table:", table_out, "\n")
 cat("Write mode:", write_mode, "\n")
 
-# ===== Logging (matches your BQ log style) =====
+# ===== Logging (BQ log table) =====
 log_entries <- tibble(
   timestamp = as.POSIXct(character(0)),
   level = character(0),
@@ -90,44 +83,25 @@ tryCatch({
   upload_logs_to_bigquery(); quit(status=1)
 })
 
-# ===== OneDrive/SharePoint download (app credentials) =====
-get_graph_token <- function() {
-  if (any(c(tenant_id, client_id, client_secret) == "")) stop("Missing AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET")
-  url <- paste0("https://login.microsoftonline.com/", tenant_id, "/oauth2/v2.0/token")
-  r <- httr::POST(url, body=list(
-    client_id=client_id, client_secret=client_secret,
-    scope="https://graph.microsoft.com/.default", grant_type="client_credentials"
-  ), encode="form")
-  httr::stop_for_status(r); httr::content(r, "parsed")$access_token
-}
-graph_get  <- function(url, query=NULL, token) httr::content(httr::GET(url, add_headers(Authorization=paste("Bearer", token)), query=query), "parsed")
-graph_download <- function(url, destfile, token) {
-  h <- httr::GET(url, add_headers(Authorization=paste("Bearer", token)), httr::write_disk(destfile, overwrite=TRUE))
-  httr::stop_for_status(h); invisible(destfile)
-}
-download_from_graph <- function(item_path, sharepoint_site_url=NULL, onedrive_upn=NULL) {
-  token <- get_graph_token()
-  out <- tempfile(fileext = tools::file_ext(item_path) |> { if (.=="") ".csv" else paste0(".",.) })
-  if (nzchar(sharepoint_site_url)) {
-    u <- httr::parse_url(sharepoint_site_url)
-    site_api <- paste0("https://graph.microsoft.com/v1.0/sites/", u$hostname, ":/sites/", gsub("^/","", paste(u$path, collapse="/")))
-    site <- graph_get(site_api, token=token); site_id <- site$id
-    dl <- paste0("https://graph.microsoft.com/v1.0/sites/", site_id, "/drive/root:", if(!startsWith(item_path,"/")) paste0("/",item_path) else item_path, ":/content")
-    create_log_entry(glue("Downloading from SharePoint: {item_path}"))
-    graph_download(dl, out, token)
-    return(out)
+# ======= OneDrive Public-Link Download (no Microsoft auth) =======
+download_public_onedrive <- function(url) {
+  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
+  # Try forcing direct download
+  dl1 <- if (grepl("\\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
+  tf <- tempfile(fileext = ".csv")
+  # First attempt
+  r1 <- httr::GET(dl1, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
+  if (httr::http_error(r1)) stop(httr::http_status(r1)$message)
+  # If file looks too small (html) try the raw URL without the param (short links often bounce)
+  too_small <- file.info(tf)$size < 50
+  if (too_small) {
+    r2 <- httr::GET(url, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
+    if (httr::http_error(r2)) stop(httr::http_status(r2)$message)
   }
-  if (nzchar(onedrive_upn)) {
-    dl <- paste0("https://graph.microsoft.com/v1.0/users/", utils::URLencode(onedrive_upn, reserved=TRUE),
-                 "/drive/root:", if(!startsWith(item_path,"/")) paste0("/",item_path) else item_path, ":/content")
-    create_log_entry(glue("Downloading from OneDrive user drive: {item_path}"))
-    graph_download(dl, out, token)
-    return(out)
-  }
-  stop("Provide SHAREPOINT_SITE_URL or ONEDRIVE_UPN")
+  tf
 }
 
-# ===== Helpers (your workload transforms) =====
+# ===== Helpers for transforms (same logic you provided) =====
 monotony_roll <- function(x, idx, window_days) {
   slider::slide_index_dbl(
     x, idx,
@@ -156,12 +130,14 @@ parse_date_robust <- function(x) {
 # ===== Read CSV =====
 csv_path <- NULL
 tryCatch({
-  if (nzchar(local_file)) {
+  if (nzchar(public_url)) {
+    create_log_entry("Downloading CSV via public OneDrive/SharePoint link (no auth)")
+    csv_path <- download_public_onedrive(public_url)
+  } else if (nzchar(local_file)) {
     create_log_entry(glue("Reading local file: {local_file}"))
     csv_path <- local_file
   } else {
-    stopifnot(nzchar(item_path))
-    csv_path <- download_from_graph(item_path, sharepoint_site_url, onedrive_upn)
+    stop("Provide ONEDRIVE_PUBLIC_URL (or LOCAL_FILE_PATH).")
   }
 }, error = function(e) {
   create_log_entry(paste("CSV fetch failed:", e$message), "ERROR")
@@ -175,15 +151,13 @@ raw <- tryCatch({
   upload_logs_to_bigquery(); quit(status=1)
 })
 
-# ===== Transform exactly as requested =====
-# Expecting columns like: Name, Date, roster_name, Distance_yd_, Mechanical_Load, High_Speed_Distance, Decel_4
+# ===== Transform (your workload pipeline) =====
 work_data0 <- raw %>%
   dplyr::select(any_of(c("Name","Date","roster_name","Distance_yd_","Mechanical_Load","High_Speed_Distance","Decel_4"))) %>%
   janitor::clean_names() %>%
   mutate(date = parse_date_robust(date)) %>%
   filter(!is.na(roster_name), !is.na(date))
 
-# 1) sum to roster_name × date
 daily_sum <- work_data0 %>%
   group_by(roster_name, date) %>%
   summarise(
@@ -191,10 +165,7 @@ daily_sum <- work_data0 %>%
     hsd_sum      = sum(high_speed_distance, na.rm = TRUE),
     ml_sum       = sum(mechanical_load,     na.rm = TRUE),
     .groups = "drop"
-  )
-
-# 2) fill gaps per athlete with zeros
-daily_sum <- daily_sum %>%
+  ) %>%
   group_by(roster_name) %>%
   tidyr::complete(
     date = seq(min(date), max(date), by="1 day"),
@@ -202,7 +173,6 @@ daily_sum <- daily_sum %>%
   ) %>%
   ungroup()
 
-# 3) rolling features + prev-day values
 roll_features <- daily_sum %>%
   group_by(roster_name) %>%
   arrange(date, .by_group = TRUE) %>%
@@ -247,7 +217,7 @@ work_data <- roll_features %>%
 
 create_log_entry(glue("Rows after transform: {nrow(work_data)}"))
 
-# ===== DML-free upsert helpers =====
+# ===== DML-free upsert helpers (unchanged) =====
 read_bq_table_rest <- function(tbl) {
   if (!bq_table_exists(tbl)) return(tibble())
   meta <- bq_table_meta(tbl); fields <- meta$schema$fields
@@ -266,9 +236,6 @@ read_bq_table_rest <- function(tbl) {
       vals <- lapply(seq_along(fields), function(j) {
         v <- r$f[[j]]$v; f <- fields[[j]]
         if (is.null(v)) return(NA)
-        switch(f$type,
-               "INTEGER"="INT64","INT64"="INT64","FLOAT"="FLOAT64","FLOAT64"="FLOAT64",
-               "DATE"="DATE","TIMESTAMP"="TIMESTAMP","TIME"="TIME","STRING"="STRING")
         if (f$type %in% c("INTEGER","INT64")) return(as.integer(v))
         if (f$type %in% c("FLOAT","FLOAT64")) return(as.numeric(v))
         if (f$type == "DATE") return(as.Date(v))
@@ -309,10 +276,7 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
   if (nrow(df)==0) { create_log_entry(glue("No rows to upload for {table_name}")); return(TRUE) }
 
-  # composite key
   df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
-
-  # ensure table / schema
   ensure_table(tbl, df, partition_field="date", cluster_fields=c("roster_name"))
   df <- validate_against_schema(df, tbl)
 
@@ -323,14 +287,12 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
     return(TRUE)
   }
 
-  # MERGE (client-side, last-write-wins)
   existing <- read_bq_table_rest(tbl)
   if (nrow(existing)==0) {
     bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
     create_log_entry(glue("Initial upload to {table_name}"))
     return(TRUE)
   }
-  # align columns
   df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
   allc <- union(names(existing), names(df))
   for (c in setdiff(allc, names(existing))) existing[[c]] <- NA
@@ -354,7 +316,6 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
 
 # ===== Upload to BQ =====
 tryCatch({
-  # final column order (only what you said you need)
   out <- work_data %>%
     select(roster_name, date, distance, high_speed_distance, mechanical_load,
            distance_7d, distance_28d, distance_monotony_7d,
