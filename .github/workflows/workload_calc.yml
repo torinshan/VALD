@@ -71,5 +71,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
+      - name: Show working directory (debug)
+        run: |
+          pwd
+          ls -R .github/scripts
+
       - name: Run workload ingest
-        run: Rscript workload_ingest.R
+        run: Rscript ".github/scripts/workload_ingest.R"
