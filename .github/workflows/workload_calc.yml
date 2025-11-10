@@ -10,31 +10,27 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ---- GCP / BigQuery (read by your R script) ----
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}          # e.g. sac-vald-hub
-      BQ_DATASET:  ${{ vars.BQ_DATASET || 'analytics' }}
-      BQ_LOCATION: ${{ vars.BQ_LOCATION || 'US' }}
-      BQ_TABLE:    ${{ vars.BQ_TABLE    || 'workload_daily' }}
-      BQ_WRITE_MODE: ${{ vars.BQ_WRITE_MODE || 'MERGE' }}
+      # ---- GCP / BigQuery ----
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      BQ_DATASET:  ${{ secrets.BQ_DATASET }}   # you stored BQ_* as secrets; that's fine
+      BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+      BQ_TABLE:    ${{ secrets.BQ_TABLE }}
+      BQ_WRITE_MODE: ${{ secrets.BQ_WRITE_MODE }}
 
-      # ---- Azure / OneDrive (Graph app creds) ----
-      AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      # ---- OneDrive public link (no auth) ----
+      ONEDRIVE_PUBLIC_URL: ${{ vars.ONEDRIVE_PUBLIC_URL }}  # the repo variable you added
 
-      # File location in SharePoint / OneDrive for Business
-      SHAREPOINT_SITE_URL: ${{ vars.SHAREPOINT_SITE_URL }}         # e.g. https://contoso.sharepoint.com/sites/DataTeam
-      ONEDRIVE_ITEM_PATH:  ${{ vars.ONEDRIVE_ITEM_PATH }}          # e.g. Shared Documents/GPS/CSV_Clean/Clean_Activities_GPS.csv
-      # Optional debug: LOCAL_FILE_PATH: path/to/Clean_Activities_GPS.csv
+      # Optional: debug local file instead of URL
+      # LOCAL_FILE_PATH: path/to/Clean_Activities_GPS.csv
 
     steps:
       - uses: actions/checkout@v4
 
-      # === SAME GOOGLE AUTH METHOD AS YOUR EXISTING JOBS ===
+      # === SAME GOOGLE AUTH METHOD YOU ALREADY USE ===
       - name: Auth to Google Cloud (service account JSON)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}  # EXACTLY one input; must be a valid SA JSON
+          credentials_json: ${{ secrets.GCP_SA_KEY }}  # must exist and be the full SA JSON
           create_credentials_file: true
           export_environment_variables: true
 
