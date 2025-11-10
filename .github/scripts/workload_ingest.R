@@ -83,6 +83,24 @@ tryCatch({
   upload_logs_to_bigquery(); quit(status=1)
 })
 
+# ===== FIX #4: Token Refresh Function =====
+refresh_token_if_needed <- function() {
+  tryCatch({
+    tok <- system("gcloud auth print-access-token", intern = TRUE)
+    if (nzchar(tok[1]) && tok[1] != GLOBAL_ACCESS_TOKEN) {
+      GLOBAL_ACCESS_TOKEN <<- tok[1]
+      bq_auth(token = gargle::gargle2.0_token(
+        scope = 'https://www.googleapis.com/auth/bigquery',
+        client = gargle::gargle_client(),
+        credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+      ))
+      create_log_entry("Token refreshed", "INFO")
+    }
+  }, error = function(e) {
+    create_log_entry(paste("Token refresh warning:", e$message), "WARN")
+  })
+}
+
 # ======= OneDrive Public-Link Download (no Microsoft auth) =======
 download_public_onedrive <- function(url) {
   if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
@@ -217,8 +235,11 @@ work_data <- roll_features %>%
 
 create_log_entry(glue("Rows after transform: {nrow(work_data)}"))
 
-# ===== DML-free upsert helpers (unchanged) =====
+# ===== DML-free upsert helpers =====
 read_bq_table_rest <- function(tbl) {
+  # Refresh token before reading large table
+  refresh_token_if_needed()
+  
   if (!bq_table_exists(tbl)) return(tibble())
   meta <- bq_table_meta(tbl); fields <- meta$schema$fields
   out <- list(); pageToken <- NULL; i <- 0
@@ -252,14 +273,18 @@ read_bq_table_rest <- function(tbl) {
   }
   bind_rows(out)
 }
+
+# ===== FIX #1: Use list() instead of bq_time_partitioning() =====
 ensure_table <- function(tbl, data, partition_field="date", cluster_fields=c("roster_name")) {
   if (bq_table_exists(tbl)) return(invisible(TRUE))
+  # FIX: Use list directly instead of bq_time_partitioning()
   tp <- if (!is.null(partition_field) && partition_field %in% names(data))
-          bigrquery::bq_time_partitioning(type="DAY", field=partition_field) else NULL
+          list(type="DAY", field=partition_field) else NULL
   cl <- intersect(cluster_fields, names(data)); if (length(cl)==0) cl <- NULL
   bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering_fields = cl)
   create_log_entry(glue("Created {tbl$table} (partition={partition_field}; cluster={paste(cl, collapse=',')} )"))
 }
+
 validate_against_schema <- function(data, tbl) {
   if (!bq_table_exists(tbl)) return(data)
   ex <- bq_table_meta(tbl)
@@ -271,17 +296,27 @@ validate_against_schema <- function(data, tbl) {
   }
   data
 }
+
+# ===== FIX #2: Remove pk column before upload =====
 bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   mode <- match.arg(mode)
   ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
   if (nrow(df)==0) { create_log_entry(glue("No rows to upload for {table_name}")); return(TRUE) }
 
+  # Create pk for merge logic
   df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
-  ensure_table(tbl, df, partition_field="date", cluster_fields=c("roster_name"))
-  df <- validate_against_schema(df, tbl)
+  
+  # Ensure table exists BEFORE adding pk (so schema doesn't include pk)
+  df_no_pk <- df %>% select(-pk)
+  ensure_table(tbl, df_no_pk, partition_field="date", cluster_fields=c("roster_name"))
+  
+  # Validate against schema (without pk)
+  df_no_pk <- validate_against_schema(df_no_pk, tbl)
 
   if (mode == "TRUNCATE" || !bq_table_exists(tbl) || isTRUE(bq_table_meta(tbl)$numRows == "0")) {
-    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
+    # Refresh token before upload
+    refresh_token_if_needed()
+    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
     nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
     create_log_entry(glue("TRUNCATE upload complete; {table_name} rows: {nr}"))
     return(TRUE)
@@ -289,10 +324,16 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
 
   existing <- read_bq_table_rest(tbl)
   if (nrow(existing)==0) {
-    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
+    # Refresh token before upload
+    refresh_token_if_needed()
+    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
     create_log_entry(glue("Initial upload to {table_name}"))
     return(TRUE)
   }
+  
+  # Add pk to existing data for merge
+  existing <- existing %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
+  
   df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
   allc <- union(names(existing), names(df))
   for (c in setdiff(allc, names(existing))) existing[[c]] <- NA
@@ -306,8 +347,10 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
     group_by(pk) %>%
     slice_tail(n=1) %>%
     ungroup() %>%
-    select(-.row_id)
+    select(-.row_id, -pk)  # FIX: Remove both .row_id AND pk before upload
 
+  # Refresh token before final upload
+  refresh_token_if_needed()
   bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
   nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
   create_log_entry(glue("MERGE complete; {table_name} rows: {nr}"))
