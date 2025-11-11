@@ -328,6 +328,43 @@ safe_runner <- function(name, fun, ...) {
   )
 }
 
+parse_date_robust <- function(vec) {
+  # If this gets a function by accident, fail fast with a clear message
+  if (is.function(vec)) stop("parse_date_robust() received a function instead of a vector. Pass the column explicitly, e.g. .data[['date']].")
+
+  # already date-like?
+  if (inherits(vec, "Date"))    return(vec)
+  if (inherits(vec, "POSIXt"))  return(as.Date(vec))
+
+  # numeric: often Excel serial days (Windows origin)
+  if (is.numeric(vec)) {
+    # Typical Excel origin for OneDrive/Windows: 1899-12-30
+    out <- as.Date(vec, origin = "1899-12-30")
+    return(out)
+  }
+
+  # character: try multiple formats
+  if (is.character(vec)) {
+    v <- trimws(vec)
+    v[nchar(v) == 0] <- NA_character_
+
+    suppressWarnings({
+      # try ISO first
+      d <- as.Date(v, format = "%Y-%m-%d")
+      # fallback: m/d/Y or m-d-Y
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m/%d/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m-%d-%Y")
+      # fallback: d/m/Y or d-m-Y
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d/%m/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d-%m-%Y")
+    })
+    return(d)
+  }
+
+  # anything else -> NA
+  rep(as.Date(NA), length(vec))
+}
+                 
 ################################################################################
 # FIX 3.3: CONFIGURATION AUDIT TRAIL
 ################################################################################
