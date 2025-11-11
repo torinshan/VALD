@@ -1,0 +1,273 @@
+name: Workload & Model Pipeline (Every 15 min)
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      skip_training:
+        description: 'Skip model training (ingest only)'
+        required: false
+        type: boolean
+        default: false
+      start_date:
+        description: 'Model training start date (YYYY-MM-DD)'
+        required: false
+        default: '2025-06-01'
+      end_date:
+        description: 'Model training end date (YYYY-MM-DD)'
+        required: false
+        default: '2025-12-31'
+
+jobs:
+  # ============================================================================
+  # JOB 1: WORKLOAD INGEST (runs every time)
+  # ============================================================================
+  ingest:
+    runs-on: ubuntu-latest
+    env:
+      # ---- GCP / BigQuery ----
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
+      BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+      BQ_TABLE:    ${{ secrets.BQ_TABLE }}
+      BQ_WRITE_MODE: ${{ secrets.BQ_WRITE_MODE }}
+      # ---- OneDrive public link ----
+      ONEDRIVE_PUBLIC_URL: ${{ vars.ONEDRIVE_PUBLIC_URL }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+      
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+      
+      - name: Install R deps (cached)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          use-public-rspm: true
+          cache-version: 1
+          extra-packages: |
+            any::bigrquery
+            any::DBI
+            any::dplyr
+            any::tidyr
+            any::readr
+            any::stringr
+            any::purrr
+            any::tibble
+            any::data.table
+            any::hms
+            any::lubridate
+            any::httr
+            any::jsonlite
+            any::curl
+            any::gargle
+            any::glue
+            any::slider
+            any::janitor
+      
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      
+      - name: Run workload ingest
+        run: Rscript ".github/scripts/workload_ingest.R"
+      
+      - name: Check ingest success
+        id: ingest_check
+        run: |
+          if [ $? -eq 0 ]; then
+            echo "✅ Workload ingest completed successfully"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Workload ingest failed"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+    
+    outputs:
+      status: ${{ steps.ingest_check.outputs.status }}
+
+  # ============================================================================
+  # JOB 2: MODEL TRAINING (runs only if ingest succeeds)
+  # ============================================================================
+  train-models:
+    runs-on: ubuntu-latest
+    needs: ingest
+    # Only run if ingest succeeded AND user didn't skip training
+    if: needs.ingest.outputs.status == 'success' && github.event.inputs.skip_training != 'true'
+    
+    env:
+      # ---- GCP / BigQuery ----
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
+      BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+      GCS_BUCKET:  ${{ secrets.GCS_BUCKET }}
+      TEAM_NAME:   ${{ vars.TEAM_NAME }}
+      
+      # ---- Table names ----
+      WORKLOAD_TABLE:    ${{ vars.WORKLOAD_TABLE }}
+      READINESS_TABLE:   ${{ vars.READINESS_TABLE }}
+      ROSTER_TABLE:      ${{ vars.ROSTER_TABLE }}
+      PREDICTIONS_TABLE: ${{ vars.PREDICTIONS_TABLE }}
+      
+      # ---- Model training config ----
+      START_DATE:     ${{ github.event.inputs.start_date || '2025-06-01' }}
+      END_DATE:       ${{ github.event.inputs.end_date || '2025-12-31' }}
+      TRAIN_FRACTION: '0.80'
+      MIN_TRAIN_OBS:  '3'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+      
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install scikit-learn==1.5.1 numpy==1.26.4
+      
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+      
+      - name: Install R deps (cached)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          use-public-rspm: true
+          cache-version: 1
+          extra-packages: |
+            any::bigrquery
+            any::DBI
+            any::dplyr
+            any::tidyr
+            any::data.table
+            any::lubridate
+            any::slider
+            any::stringr
+            any::gargle
+            any::glue
+            any::digest
+            any::googleCloudStorageR
+            any::glmnet
+            any::bnlearn
+            any::reticulate
+      
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      
+      - name: Run model training
+        run: Rscript ".github/scripts/readiness_models.R"
+      
+      - name: Check training success
+        if: success()
+        run: |
+          echo "✅ Model training completed successfully"
+          
+          # Query recent results
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          
+          echo ""
+          echo "📊 Model Training Summary:"
+          bq query --use_legacy_sql=false --max_rows=10 \
+            "SELECT 
+               athlete_id,
+               roster_name,
+               model_type,
+               ROUND(primary_rmse, 3) as rmse,
+               n_train,
+               FORMAT_TIMESTAMP('%H:%M', trained_at) as time
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()
+             ORDER BY trained_at DESC
+             LIMIT 10" || echo "No training results yet"
+          
+          echo ""
+          echo "📈 Today's Stats:"
+          bq query --use_legacy_sql=false \
+            "SELECT 
+               COUNT(DISTINCT athlete_id) as athletes_trained,
+               COUNT(*) as total_models,
+               ROUND(AVG(primary_rmse), 3) as avg_rmse,
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
+      
+      - name: Check for failures
+        if: failure()
+        run: |
+          echo "❌ Model training failed"
+          echo "Check logs in BigQuery: ${GCP_PROJECT}.${BQ_DATASET}.model_training_log"
+          
+          # Try to show recent errors
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS || true
+          bq query --use_legacy_sql=false --max_rows=10 \
+            "SELECT 
+               FORMAT_TIMESTAMP('%H:%M:%S', timestamp) as time,
+               level, 
+               message
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_log\`
+             WHERE level = 'ERROR' 
+               AND DATE(timestamp) = CURRENT_DATE()
+             ORDER BY timestamp DESC
+             LIMIT 10" || echo "Could not query error logs"
+
+  # ============================================================================
+  # JOB 3: SUMMARY (runs after both jobs, always)
+  # ============================================================================
+  summary:
+    runs-on: ubuntu-latest
+    needs: [ingest, train-models]
+    if: always()
+    
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "═══════════════════════════════════════════════════════"
+          echo "    WORKLOAD & MODEL PIPELINE SUMMARY"
+          echo "═══════════════════════════════════════════════════════"
+          echo ""
+          echo "🔹 Workload Ingest: ${{ needs.ingest.result }}"
+          echo "🔹 Model Training:  ${{ needs.train-models.result }}"
+          echo ""
+          
+          if [ "${{ needs.ingest.result }}" == "success" ] && \
+             [ "${{ needs.train-models.result }}" == "success" ]; then
+            echo "✅ PIPELINE COMPLETE - Both jobs succeeded"
+            exit 0
+          elif [ "${{ needs.ingest.result }}" == "success" ] && \
+               [ "${{ needs.train-models.result }}" == "skipped" ]; then
+            echo "✅ INGEST COMPLETE - Training skipped (no new data or manual skip)"
+            exit 0
+          elif [ "${{ needs.ingest.result }}" == "success" ] && \
+               [ "${{ needs.train-models.result }}" == "failure" ]; then
+            echo "⚠️  PARTIAL SUCCESS - Ingest succeeded but training failed"
+            exit 0
+          else
+            echo "❌ PIPELINE FAILED - Check logs above"
+            exit 1
+          fi
