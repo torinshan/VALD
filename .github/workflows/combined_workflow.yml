@@ -78,14 +78,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
 
-      - name: Run workload ingest
+      - name: Ingest workload (OneDrive)
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          BQ_TABLE:    ${{ env.WORKLOAD_TABLE }}        # constant table name, not a secret
-          BQ_WRITE_MODE: WRITE_APPEND
-        run: Rscript ".github/scripts/workload_ingest.R"
+          GCP_PROJECT: sac-vald-hub
+          BQ_DATASET: analytics
+          BQ_LOCATION: US
+          WORKLOAD_TABLE: workload_daily
+          WRITE_MODE: WRITE_APPEND
+          ONEDRIVE_PUBLIC_URL: ${{ secrets.WORKLOAD_CSV_URL }}
+        run: Rscript .github/scripts/workload_ingest.R
+
 
       - name: Check ingest success
         id: ingest_check
