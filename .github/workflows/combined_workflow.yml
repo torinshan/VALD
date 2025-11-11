@@ -85,7 +85,7 @@ jobs:
           BQ_LOCATION: US
           WORKLOAD_TABLE: workload_daily
           WRITE_MODE: WRITE_APPEND
-          ONEDRIVE_PUBLIC_URL: ${{ secrets.WORKLOAD_CSV_URL }}
+          ONEDRIVE_PUBLIC_URL: https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EaoDweEcupJPsLCREWmHYY0BTMIxYDdzbIr-hSrr3PzKzg?e=5RdzRG&download=1
         run: Rscript .github/scripts/workload_ingest.R
 
 
