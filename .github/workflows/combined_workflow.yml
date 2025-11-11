@@ -108,7 +108,7 @@ jobs:
       status: ${{ steps.ingest_check.outputs.status }}
 
   # ============================================================================
-  # JOB 2: CHECK FOR READINESS DATA MATCH
+  # JOB 2: CHECK FOR READINESS DATA MATCH (robust error handling)
   # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
@@ -134,27 +134,52 @@ jobs:
       
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
-      
+
       - name: Check for matching readiness data
         id: check
+        shell: bash
         run: |
-          echo "🔍 Checking for workload data with matching readiness data..."
-          
-          # Query: Count athletes with BOTH recent workload AND readiness data
+          set -euo pipefail
+
+          # Helpful diagnostics
+          bq version || true
+          gcloud --version || true
+          gcloud auth list || true
+
+          echo "Using project: $GCP_PROJECT"
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "Installing jq..."
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+          echo "Active account:"
+          gcloud auth list
+          echo "Current project:"
+          gcloud config get-value project
+
+          # Quick IAM probe
+          bq ls --project_id="$GCP_PROJECT" "$BQ_DATASET" || {
+            echo "❌ Cannot list dataset tables. Check IAM for the service account."
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=iam_failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+          echo "🔍 Building readiness match query..."
           MATCH_QUERY="
           WITH recent_workload AS (
-            SELECT DISTINCT roster_name, date
+            SELECT DISTINCT roster_name, DATE(date) AS date
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}\`
             WHERE date >= CURRENT_DATE() - 7
           ),
           roster_with_ids AS (
             SELECT DISTINCT 
-              LOWER(TRIM(kinexon_name)) as roster_name,
+              LOWER(TRIM(kinexon_name)) AS roster_name,
               offical_id
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
           ),
           readiness_recent AS (
-            SELECT DISTINCT offical_id, date
+            SELECT DISTINCT offical_id, DATE(date) AS date
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}\`
             WHERE date >= CURRENT_DATE() - 7
           ),
@@ -163,7 +188,7 @@ jobs:
               w.roster_name,
               w.date,
               r.offical_id,
-              rd.date as readiness_date
+              rd.date AS readiness_date
             FROM recent_workload w
             JOIN roster_with_ids r 
               ON LOWER(TRIM(w.roster_name)) = r.roster_name
@@ -172,45 +197,61 @@ jobs:
               AND w.date = rd.date
           )
           SELECT 
-            COUNT(DISTINCT roster_name) as athletes_with_matches,
-            COUNT(*) as total_matches,
-            MIN(date) as earliest_match,
-            MAX(date) as latest_match
+            COUNT(DISTINCT roster_name) AS athletes_with_matches,
+            COUNT(*) AS total_matches,
+            MIN(date) AS earliest_match,
+            MAX(date) AS latest_match
           FROM matched
           "
-          
-          # Run query and capture results
-          RESULT=$(bq query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)
-          
-          if [ $? -ne 0 ]; then
-            echo "❌ Failed to query for readiness matches"
-            echo "Error: $RESULT"
-            echo "has_matches=false" >> $GITHUB_OUTPUT
-            echo "reason=query_failed" >> $GITHUB_OUTPUT
-            exit 0
+
+          echo "–––– SQL –––––"
+          echo "$MATCH_QUERY"
+          echo "––––––––––––––"
+
+          # Dry run to validate syntax/refs fast
+          if ! bq query --use_legacy_sql=false --dry_run "$MATCH_QUERY" 1>/dev/null 2>&1; then
+            echo "❌ BigQuery dry run failed"
+            echo "Query: $MATCH_QUERY"
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=query_invalid" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
-          
-          # Parse JSON result
+
+          # Execute query
+          set +e
+          RESULT=$(bq query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)
+          BQ_EXIT=$?
+          set -e
+
+          if [ $BQ_EXIT -ne 0 ]; then
+            echo "❌ Failed to query for readiness matches"
+            echo "Query: $MATCH_QUERY"
+            echo "Error: $RESULT"
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=query_failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Parse JSON
           ATHLETES=$(echo "$RESULT" | jq -r '.[0].athletes_with_matches // 0')
-          MATCHES=$(echo "$RESULT" | jq -r '.[0].total_matches // 0')
-          EARLIEST=$(echo "$RESULT" | jq -r '.[0].earliest_match // "none"')
-          LATEST=$(echo "$RESULT" | jq -r '.[0].latest_match // "none"')
-          
+          MATCHES=$(echo   "$RESULT" | jq -r '.[0].total_matches // 0')
+          EARLIEST=$(echo  "$RESULT" | jq -r '.[0].earliest_match // "none"')
+          LATEST=$(echo    "$RESULT" | jq -r '.[0].latest_match // "none"')
+
           echo "📊 Match Results:"
           echo "  • Athletes with matches: $ATHLETES"
           echo "  • Total matches: $MATCHES"
           echo "  • Date range: $EARLIEST to $LATEST"
-          
-          if [ "$MATCHES" -gt "0" ]; then
+
+          if [ "$MATCHES" -gt 0 ]; then
             echo "✅ Found matching data - models can be trained"
-            echo "has_matches=true" >> $GITHUB_OUTPUT
-            echo "match_count=$MATCHES" >> $GITHUB_OUTPUT
-            echo "athlete_count=$ATHLETES" >> $GITHUB_OUTPUT
+            echo "has_matches=true" >> "$GITHUB_OUTPUT"
+            echo "match_count=$MATCHES" >> "$GITHUB_OUTPUT"
+            echo "athlete_count=$ATHLETES" >> "$GITHUB_OUTPUT"
           else
             echo "⏭️  No matching readiness data found - skipping model training"
-            echo "   (This is normal - readiness testing happens weekly)"
-            echo "has_matches=false" >> $GITHUB_OUTPUT
-            echo "reason=no_readiness_match" >> $GITHUB_OUTPUT
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
     
     outputs:
@@ -219,12 +260,13 @@ jobs:
       athlete_count: ${{ steps.check.outputs.athlete_count }}
       reason: ${{ steps.check.outputs.reason }}
 
-   # ============================================================================
+  # ============================================================================
   # JOB 3: MODEL TRAINING (runs only if readiness data matches)
   # ============================================================================
   train-models:
     runs-on: ubuntu-latest
     needs: [ingest, check-readiness]
+    # Only run if ingest succeeded AND we have matching readiness data AND user didn't skip
     if: |
       needs.ingest.outputs.status == 'success' && 
       needs.check-readiness.outputs.has_matches == 'true' &&
@@ -324,7 +366,8 @@ jobs:
           
           echo ""
           echo "📈 Latest Models:"
-          bq query --use_legacy_sql=false --max_rows=10 \
+          b
+q query --use_legacy_sql=false --max_rows=10 \
             "SELECT 
                athlete_id,
                roster_name,
