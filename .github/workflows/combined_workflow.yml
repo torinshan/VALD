@@ -19,24 +19,23 @@ on:
         required: false
         default: '2025-12-31'
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GLOBAL DEFAULTS (safe fallbacks; jobs may override)
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# GLOBAL CONSTANTS (not secrets)
+# ------------------------------------------------------------------------------
 env:
+  # GCP project configuration (constants)
   GCP_PROJECT: sac-vald-hub
   BQ_DATASET:  analytics
   BQ_LOCATION: US
 
-  # Tables/views used by this workflow
+  # BigQuery table names (constants; DO NOT point these to secrets)
   WORKLOAD_TABLE:  workload_daily
-  READINESS_TABLE: ml_builder_readiness         # ← the VIEW you created
-  ROSTER_TABLE:    roster_mapping               # optional (not required for name-join)
-  PREDICTIONS_TABLE: readiness_predictions_byname
+  READINESS_TABLE: vald_fd_jumps          # raw VALD table
+  ROSTER_TABLE:    roster_mapping         # has offical_id and `Vald Name`
+  PREDICTIONS_TABLE: readiness_predictions_byname  # if writing name-keyed preds (optional)
 
-  # Team/bucket (needed by training script if saving artifacts)
+  # Other constants
   TEAM_NAME: sacstate-football
-  # GCS_BUCKET should be set as a Secret; leave here for clarity
-  # GCS_BUCKET: your-bucket-name
 
 jobs:
   # ============================================================================
@@ -50,7 +49,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
           create_credentials_file: true
           export_environment_variables: true
 
@@ -84,8 +83,7 @@ jobs:
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          # Your ingest script may need these (showing placeholders):
-          BQ_TABLE:    ${{ env.WORKLOAD_TABLE }}
+          BQ_TABLE:    ${{ env.WORKLOAD_TABLE }}        # constant table name, not a secret
           BQ_WRITE_MODE: WRITE_APPEND
         run: Rscript ".github/scripts/workload_ingest.R"
 
@@ -99,7 +97,7 @@ jobs:
       status: ${{ steps.ingest_check.outputs.status }}
 
   # ============================================================================
-  # JOB 2: CHECK FOR READINESS DATA MATCH (by name+date, robust & graceful)
+  # JOB 2: CHECK FOR READINESS DATA MATCH (ID-based via roster mapping)
   # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
@@ -112,7 +110,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
           create_credentials_file: true
           export_environment_variables: true
 
@@ -133,6 +131,7 @@ jobs:
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE:  ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE:    ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
 
@@ -142,12 +141,14 @@ jobs:
           echo "  BQ_LOCATION=$BQ_LOCATION"
           echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
           echo "  READINESS_TABLE=$READINESS_TABLE"
+          echo "  ROSTER_TABLE=$ROSTER_TABLE"
 
           : "${GCP_PROJECT:?GCP_PROJECT is required}"
           : "${BQ_DATASET:?BQ_DATASET is required}"
           : "${BQ_LOCATION:?BQ_LOCATION is required}"
           : "${WORKLOAD_TABLE:?WORKLOAD_TABLE is required}"
           : "${READINESS_TABLE:?READINESS_TABLE is required}"
+          : "${ROSTER_TABLE:?ROSTER_TABLE is required}"
 
           echo "Checking dataset exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
@@ -156,13 +157,17 @@ jobs:
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
-          echo "Checking readiness view/table exists…"
+          echo "Checking readiness table exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
 
+          echo "Checking roster table exists…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
+            "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
+
           echo "Preflight OK"
 
-      - name: Check for matching readiness data (normalized name + date)
+      - name: Check for matching readiness data (offical_id + date via roster mapping)
         id: check
         shell: bash
         env:
@@ -171,38 +176,61 @@ jobs:
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE:  ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE:    ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
-          echo "🔍 Checking workload ↔ readiness matches (by normalized name & date)…"
+          echo "🔍 Checking workload ↔ readiness (ID + same date) via roster mapping…"
 
           MATCH_QUERY="
-          WITH recent_workload AS (
+          WITH workload AS (
             SELECT DISTINCT
-              LOWER(TRIM(roster_name)) AS name_norm,
+              TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}\`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
-          readiness_recent AS (
-            SELECT DISTINCT
-              full_name_norm AS name_norm,
-              DATE(date) AS date
+          readiness_raw AS (
+            SELECT
+              DATE(date) AS date,
+              LOWER(TRIM(full_name)) AS vald_full_name_norm,
+              SAFE_DIVIDE(
+                IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
+                IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
+                IFNULL(CAST(rsi_readiness          AS FLOAT64), 0),
+                NULLIF(
+                  IF(jump_height_readiness IS NULL, 0, 1) +
+                  IF(epf_readiness          IS NULL, 0, 1) +
+                  IF(rsi_readiness          IS NULL, 0, 1),
+                  0
+                )
+              ) AS readiness
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}\`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
-          matched AS (
-            SELECT w.name_norm, w.date
-            FROM recent_workload w
-            JOIN readiness_recent r
-              ON r.name_norm = w.name_norm
-             AND r.date = w.date
+          roster_norm AS (
+            SELECT
+              TRIM(CAST(offical_id AS STRING)) AS offical_id,
+              LOWER(TRIM(\`Vald Name\`))       AS vald_full_name_norm
+            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
+          ),
+          readiness_by_id AS (
+            SELECT
+              rmap.offical_id,
+              rr.date,
+              rr.readiness
+            FROM readiness_raw rr
+            JOIN roster_norm rmap
+              ON rmap.vald_full_name_norm = rr.vald_full_name_norm
           )
           SELECT
-            COUNT(DISTINCT name_norm) AS athletes_with_matches,
+            COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
             COUNT(*) AS total_matches,
-            MIN(date) AS earliest_match,
-            MAX(date) AS latest_match
-          FROM matched
+            MIN(w.date) AS earliest_match,
+            MAX(w.date) AS latest_match
+          FROM workload w
+          JOIN readiness_by_id rd
+            ON rd.offical_id = w.offical_id
+           AND rd.date       = w.date
           "
 
           echo "–––– SQL ––––"
@@ -216,7 +244,7 @@ jobs:
             echo "$DRYRUN_OUT"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=query_invalid" >> "$GITHUB_OUTPUT"
-            exit 1   # real error: invalid SQL / missing refs
+            exit 1
           fi
           echo "✅ Dry run OK"
 
@@ -227,7 +255,7 @@ jobs:
             echo "$RESULT_JSON"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=query_failed" >> "$GITHUB_OUTPUT"
-            exit 1   # real error at execution time
+            exit 1
           fi
 
           ATHLETES="$(echo "$RESULT_JSON" | jq -r '.[0].athletes_with_matches // 0')"
@@ -245,19 +273,17 @@ jobs:
             echo "has_matches=true" >> "$GITHUB_OUTPUT"
             echo "match_count=$MATCHES" >> "$GITHUB_OUTPUT"
             echo "athlete_count=$ATHLETES" >> "$GITHUB_OUTPUT"
-            exit 0
           else
-            echo "⏭️  No matching readiness data – training will be skipped (this is OK)"
+            echo "⏭️  No matching readiness data – training will be skipped (OK)"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
 
     outputs:
-      has_matches:  ${{ steps.check.outputs.has_matches }}
-      match_count:  ${{ steps.check.outputs.match_count }}
-      athlete_count:${{ steps.check.outputs.athlete_count }}
-      reason:       ${{ steps.check.outputs.reason }}
+      has_matches:   ${{ steps.check.outputs.has_matches }}
+      match_count:   ${{ steps.check.outputs.match_count }}
+      athlete_count: ${{ steps.check.outputs.athlete_count }}
+      reason:        ${{ steps.check.outputs.reason }}
 
   # ============================================================================
   # JOB 3: MODEL TRAINING (only if matches found and not manually skipped)
@@ -276,7 +302,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
           create_credentials_file: true
           export_environment_variables: true
 
@@ -322,16 +348,15 @@ jobs:
 
       - name: Run model training
         env:
+          # constants
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          GCS_BUCKET:  ${{ secrets.GCS_BUCKET }}
           TEAM_NAME:   ${{ env.TEAM_NAME }}
 
           WORKLOAD_TABLE:    ${{ env.WORKLOAD_TABLE }}
-          READINESS_TABLE:   ${{ env.READINESS_TABLE }}  # name-based view
-          ROSTER_TABLE:      ${{ env.ROSTER_TABLE }}     # optional; script can ignore if name-join
-
+          READINESS_TABLE:   ${{ env.READINESS_TABLE }}  # raw VALD table
+          ROSTER_TABLE:      ${{ env.ROSTER_TABLE }}
           PREDICTIONS_TABLE: ${{ env.PREDICTIONS_TABLE }}
 
           START_DATE:        ${{ github.event.inputs.start_date || '2025-06-01' }}
@@ -342,6 +367,9 @@ jobs:
           HAS_MATCHES:       ${{ needs.check-readiness.outputs.has_matches }}
           MATCH_LOOKBACK_DAYS: '7'
           SKIP_TRAINING:     ${{ github.event.inputs.skip_training || 'false' }}
+
+          # secrets
+          GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}   # <-- secret, not a literal
         run: Rscript ".github/scripts/readiness_models.R"
 
       - name: Show today’s training summary (best-effort)
@@ -355,7 +383,7 @@ jobs:
           echo "📈 Latest Models:"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 \
             "SELECT 
-               athlete_id    AS athlete,   -- if your script writes name-based, this may be athlete_key
+               athlete_id,
                roster_name,
                model_type,
                ROUND(primary_rmse, 3) as rmse,
