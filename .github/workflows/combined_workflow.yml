@@ -219,13 +219,12 @@ jobs:
       athlete_count: ${{ steps.check.outputs.athlete_count }}
       reason: ${{ steps.check.outputs.reason }}
 
-  # ============================================================================
+   # ============================================================================
   # JOB 3: MODEL TRAINING (runs only if readiness data matches)
   # ============================================================================
   train-models:
     runs-on: ubuntu-latest
     needs: [ingest, check-readiness]
-    # Only run if ingest succeeded AND we have matching readiness data AND user didn't skip
     if: |
       needs.ingest.outputs.status == 'success' && 
       needs.check-readiness.outputs.has_matches == 'true' &&
@@ -250,6 +249,11 @@ jobs:
       END_DATE:       ${{ github.event.inputs.end_date || '2025-12-31' }}
       TRAIN_FRACTION: '0.80'
       MIN_TRAIN_OBS:  '3'
+
+      # ---- NEW: wire Job 2 decision & manual skip into the R script ----
+      HAS_MATCHES:           ${{ needs.check-readiness.outputs.has_matches }}
+      MATCH_LOOKBACK_DAYS:   '7'   # optional: used only if HAS_MATCHES not provided
+      SKIP_TRAINING:         ${{ github.event.inputs.skip_training || 'false' }}
     
     steps:
       - uses: actions/checkout@v4
