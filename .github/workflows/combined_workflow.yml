@@ -1,4 +1,13 @@
 name: Workload & Model Pipeline (Every 15 min)
+
+# This workflow runs every 15 minutes and:
+# 1. Always ingests new GPS workload data
+# 2. Checks if workload data has matching readiness data
+# 3. Only trains models when there's BOTH workload AND readiness data
+# 
+# Since readiness testing happens weekly, most runs will skip model training.
+# This is expected behavior - workload data is still saved every time.
+
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -99,13 +108,128 @@ jobs:
       status: ${{ steps.ingest_check.outputs.status }}
 
   # ============================================================================
-  # JOB 2: MODEL TRAINING (runs only if ingest succeeds)
+  # JOB 2: CHECK FOR READINESS DATA MATCH
+  # ============================================================================
+  check-readiness:
+    runs-on: ubuntu-latest
+    needs: ingest
+    if: needs.ingest.outputs.status == 'success'
+    
+    env:
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
+      READINESS_TABLE: ${{ vars.READINESS_TABLE }}
+      WORKLOAD_TABLE: ${{ vars.WORKLOAD_TABLE }}
+      ROSTER_TABLE: ${{ vars.ROSTER_TABLE }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+      
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Check for matching readiness data
+        id: check
+        run: |
+          echo "🔍 Checking for workload data with matching readiness data..."
+          
+          # Query: Count athletes with BOTH recent workload AND readiness data
+          MATCH_QUERY="
+          WITH recent_workload AS (
+            SELECT DISTINCT roster_name, date
+            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}\`
+            WHERE date >= CURRENT_DATE() - 7
+          ),
+          roster_with_ids AS (
+            SELECT DISTINCT 
+              LOWER(TRIM(kinexon_name)) as roster_name,
+              offical_id
+            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
+          ),
+          readiness_recent AS (
+            SELECT DISTINCT offical_id, date
+            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}\`
+            WHERE date >= CURRENT_DATE() - 7
+          ),
+          matched AS (
+            SELECT 
+              w.roster_name,
+              w.date,
+              r.offical_id,
+              rd.date as readiness_date
+            FROM recent_workload w
+            JOIN roster_with_ids r 
+              ON LOWER(TRIM(w.roster_name)) = r.roster_name
+            JOIN readiness_recent rd
+              ON r.offical_id = rd.offical_id
+              AND w.date = rd.date
+          )
+          SELECT 
+            COUNT(DISTINCT roster_name) as athletes_with_matches,
+            COUNT(*) as total_matches,
+            MIN(date) as earliest_match,
+            MAX(date) as latest_match
+          FROM matched
+          "
+          
+          # Run query and capture results
+          RESULT=$(bq query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to query for readiness matches"
+            echo "Error: $RESULT"
+            echo "has_matches=false" >> $GITHUB_OUTPUT
+            echo "reason=query_failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Parse JSON result
+          ATHLETES=$(echo "$RESULT" | jq -r '.[0].athletes_with_matches // 0')
+          MATCHES=$(echo "$RESULT" | jq -r '.[0].total_matches // 0')
+          EARLIEST=$(echo "$RESULT" | jq -r '.[0].earliest_match // "none"')
+          LATEST=$(echo "$RESULT" | jq -r '.[0].latest_match // "none"')
+          
+          echo "📊 Match Results:"
+          echo "  • Athletes with matches: $ATHLETES"
+          echo "  • Total matches: $MATCHES"
+          echo "  • Date range: $EARLIEST to $LATEST"
+          
+          if [ "$MATCHES" -gt "0" ]; then
+            echo "✅ Found matching data - models can be trained"
+            echo "has_matches=true" >> $GITHUB_OUTPUT
+            echo "match_count=$MATCHES" >> $GITHUB_OUTPUT
+            echo "athlete_count=$ATHLETES" >> $GITHUB_OUTPUT
+          else
+            echo "⏭️  No matching readiness data found - skipping model training"
+            echo "   (This is normal - readiness testing happens weekly)"
+            echo "has_matches=false" >> $GITHUB_OUTPUT
+            echo "reason=no_readiness_match" >> $GITHUB_OUTPUT
+          fi
+    
+    outputs:
+      has_matches: ${{ steps.check.outputs.has_matches }}
+      match_count: ${{ steps.check.outputs.match_count }}
+      athlete_count: ${{ steps.check.outputs.athlete_count }}
+      reason: ${{ steps.check.outputs.reason }}
+
+  # ============================================================================
+  # JOB 3: MODEL TRAINING (runs only if readiness data matches)
   # ============================================================================
   train-models:
     runs-on: ubuntu-latest
-    needs: ingest
-    # Only run if ingest succeeded AND user didn't skip training
-    if: needs.ingest.outputs.status == 'success' && github.event.inputs.skip_training != 'true'
+    needs: [ingest, check-readiness]
+    # Only run if ingest succeeded AND we have matching readiness data AND user didn't skip
+    if: |
+      needs.ingest.outputs.status == 'success' && 
+      needs.check-readiness.outputs.has_matches == 'true' &&
+      github.event.inputs.skip_training != 'true'
     
     env:
       # ---- GCP / BigQuery ----
@@ -187,12 +311,15 @@ jobs:
         if: success()
         run: |
           echo "✅ Model training completed successfully"
+          echo ""
+          echo "📊 Trained on ${{ needs.check-readiness.outputs.match_count }} workload-readiness matches"
+          echo "   across ${{ needs.check-readiness.outputs.athlete_count }} athletes"
           
           # Query recent results
           gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
           
           echo ""
-          echo "📊 Model Training Summary:"
+          echo "📈 Latest Models:"
           bq query --use_legacy_sql=false --max_rows=10 \
             "SELECT 
                athlete_id,
@@ -207,7 +334,7 @@ jobs:
              LIMIT 10" || echo "No training results yet"
           
           echo ""
-          echo "📈 Today's Stats:"
+          echo "📊 Today's Training Stats:"
           bq query --use_legacy_sql=false \
             "SELECT 
                COUNT(DISTINCT athlete_id) as athletes_trained,
@@ -237,37 +364,70 @@ jobs:
              LIMIT 10" || echo "Could not query error logs"
 
   # ============================================================================
-  # JOB 3: SUMMARY (runs after both jobs, always)
+  # JOB 4: SUMMARY (runs after all jobs, always)
   # ============================================================================
   summary:
     runs-on: ubuntu-latest
-    needs: [ingest, train-models]
+    needs: [ingest, check-readiness, train-models]
     if: always()
     
     steps:
       - name: Pipeline Summary
         run: |
-          echo "═══════════════════════════════════════════════════════"
+          echo "═══════════════════════════════════════════════════════════════"
           echo "    WORKLOAD & MODEL PIPELINE SUMMARY"
-          echo "═══════════════════════════════════════════════════════"
+          echo "═══════════════════════════════════════════════════════════════"
           echo ""
-          echo "🔹 Workload Ingest: ${{ needs.ingest.result }}"
-          echo "🔹 Model Training:  ${{ needs.train-models.result }}"
+          echo "🔹 Workload Ingest:     ${{ needs.ingest.result }}"
+          echo "🔹 Readiness Check:     ${{ needs.check-readiness.result }}"
+          echo "🔹 Model Training:      ${{ needs.train-models.result }}"
           echo ""
           
-          if [ "${{ needs.ingest.result }}" == "success" ] && \
-             [ "${{ needs.train-models.result }}" == "success" ]; then
-            echo "✅ PIPELINE COMPLETE - Both jobs succeeded"
+          # Detailed status explanation
+          if [ "${{ needs.ingest.result }}" != "success" ]; then
+            echo "❌ INGEST FAILED - Check workload ingest logs"
+            exit 1
+          
+          elif [ "${{ needs.check-readiness.result }}" == "skipped" ]; then
+            echo "⏭️  PIPELINE SKIPPED - Ingest failed, no readiness check performed"
+            exit 1
+          
+          elif [ "${{ needs.check-readiness.outputs.has_matches }}" != "true" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "⏭️  TRAINING SKIPPED - No matching readiness data found"
+            echo ""
+            echo "💡 This is normal! Readiness testing happens weekly."
+            echo "   Workload data is saved and models will train when"
+            echo "   new readiness data becomes available."
             exit 0
-          elif [ "${{ needs.ingest.result }}" == "success" ] && \
-               [ "${{ needs.train-models.result }}" == "skipped" ]; then
-            echo "✅ INGEST COMPLETE - Training skipped (no new data or manual skip)"
+          
+          elif [ "${{ needs.train-models.result }}" == "skipped" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ READINESS CHECK - Found ${{ needs.check-readiness.outputs.match_count }} matches"
+            echo "⏭️  TRAINING SKIPPED - Manual skip requested"
             exit 0
-          elif [ "${{ needs.ingest.result }}" == "success" ] && \
-               [ "${{ needs.train-models.result }}" == "failure" ]; then
-            echo "⚠️  PARTIAL SUCCESS - Ingest succeeded but training failed"
+          
+          elif [ "${{ needs.train-models.result }}" == "success" ]; then
+            echo "✅ PIPELINE COMPLETE - All jobs succeeded!"
+            echo ""
+            echo "📊 Summary:"
+            echo "   • Workload data: Updated"
+            echo "   • Matches found: ${{ needs.check-readiness.outputs.match_count }}"
+            echo "   • Athletes trained: ${{ needs.check-readiness.outputs.athlete_count }}"
+            echo "   • Models: Saved to GCS"
+            echo "   • Predictions: Saved to BigQuery"
             exit 0
+          
+          elif [ "${{ needs.train-models.result }}" == "failure" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ READINESS CHECK - Found ${{ needs.check-readiness.outputs.match_count }} matches"
+            echo "❌ TRAINING FAILED - Check model training logs"
+            echo ""
+            echo "⚠️  Workload data is saved, but models couldn't be trained."
+            echo "   Review error logs in BigQuery or GitHub Actions."
+            exit 0
+          
           else
-            echo "❌ PIPELINE FAILED - Check logs above"
+            echo "⚠️  UNKNOWN STATUS - Check individual job logs"
             exit 1
           fi
