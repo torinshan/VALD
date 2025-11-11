@@ -138,7 +138,6 @@ tryCatch({
   upload_logs_to_bigquery(); quit(status=1)
 })
 
-# ===== Token Refresh Function (match workload ingest) =====
 refresh_token_if_needed <- function() {
   tryCatch({
     tok <- system("gcloud auth print-access-token", intern = TRUE)
@@ -623,11 +622,15 @@ run_linear <- function(train_df, test_df, preds, val_method) {
   best
 }
 
+run_glmnet_predict <- function(cvfit, newX, s = "lambda.min") {
+  as.numeric(predict(cvfit, newX, s = s))
+}
+
 run_ridge <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, 0, lambda_grid, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, as.numeric(predict(fit$cv, fit$Xtr, s="lambda.min")))
+    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
     cv_rmse_val    <- sqrt(min(fit$cv$cvm))
     
     if (val_method == "test_set" && nrow(test_df) > 0) {
@@ -635,7 +638,7 @@ run_ridge <- function(train_df, test_df, preds, val_method) {
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
         Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], as.numeric(predict(fit$cv, Xn, s="lambda.min")))
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else {
@@ -666,7 +669,7 @@ run_lasso <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, 1, lambda_grid, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, as.numeric(predict(fit$cv, fit$Xtr, s="lambda.min")))
+    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
     cv_rmse_val    <- sqrt(min(fit$cv$cvm))
     
     if (val_method == "test_set" && nrow(test_df) > 0) {
@@ -674,7 +677,7 @@ run_lasso <- function(train_df, test_df, preds, val_method) {
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
         Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], as.numeric(predict(fit$cv, Xn, s="lambda.min")))
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else {
@@ -705,7 +708,7 @@ run_elastic <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (ai in seq(0.1,0.9,by=0.2)) for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, ai, lambda_grid_en, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, as.numeric(predict(fit$cv, fit$Xtr, s="lambda.min")))
+    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
     cv_rmse_val    <- sqrt(min(fit$cv$cvm))
     
     if (val_method == "test_set" && nrow(test_df) > 0) {
@@ -713,7 +716,7 @@ run_elastic <- function(train_df, test_df, preds, val_method) {
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
         Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], as.numeric(predict(fit$cv, Xn, s="lambda.min")))
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else {
