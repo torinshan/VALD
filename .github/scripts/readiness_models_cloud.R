@@ -1,12 +1,11 @@
 #!/usr/bin/env Rscript
 
 ################################################################################
-# PREDICTIVE MODELS — Cloud Version with Model Registry
-# - Read workload data from BigQuery (workload_daily table)
-# - Read readiness data from BigQuery (ML Builder / VALD data)
-# - Train models per athlete using 80/20 chronological split
-# - Save models to GCS with metadata in BigQuery registry
-# - Save predictions back to BigQuery
+# READINESS MODELS — Cloud Version with Model Registry (workflow-aware)
+# This script mirrors the pipeline fork:
+# - Honor SKIP_TRAINING / HAS_MATCHES provided by the workflow
+# - If needed, perform a readiness-match check (same athlete+date)
+# - Train only when there are matches; otherwise exit cleanly with a skip reason
 ################################################################################
 
 # ===== Packages (match workload ingest pattern) =====
@@ -18,6 +17,7 @@ tryCatch({
     library(gargle); library(glue); library(digest)
     library(googleCloudStorageR)
     library(glmnet); library(bnlearn); library(reticulate)
+    library(jsonlite)
   })
 }, error = function(e) { 
   cat("Error loading packages:", e$message, "\n"); quit(status=1)
@@ -48,6 +48,11 @@ cfg_end_date   <- as.Date(Sys.getenv("END_DATE",   "2025-12-31"))
 cfg_frac_train <- as.numeric(Sys.getenv("TRAIN_FRACTION", "0.80"))
 min_obs_train  <- as.integer(Sys.getenv("MIN_TRAIN_OBS", "3"))
 
+# Workflow fork controls (new)
+skip_training       <- tolower(Sys.getenv("SKIP_TRAINING", "false")) %in% c("1","true","yes")
+has_matches_hint    <- Sys.getenv("HAS_MATCHES", "")  # "" | "true" | "false" (from Job 2)
+match_lookback_days <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
+
 cat("=== CONFIGURATION ===\n")
 cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
@@ -56,7 +61,10 @@ cat("Team:", team_name, "\n")
 cat("Workload table:", workload_table, "\n")
 cat("Readiness table:", readiness_table, "\n")
 cat("Date range:", cfg_start_date, "to", cfg_end_date, "\n")
-cat("Train fraction:", cfg_frac_train, "\n\n")
+cat("Train fraction:", cfg_frac_train, "\n")
+cat("Skip training (env):", skip_training, "\n")
+cat("HAS_MATCHES (hint from Job 2):", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
+cat("MATCH_LOOKBACK_DAYS:", match_lookback_days, "\n\n")
 
 ################################################################################
 # LOGGING
@@ -66,16 +74,21 @@ log_entries <- tibble(
   level = character(0),
   message = character(0),
   run_id = character(0),
-  repository = character(0)
+  repository = character(0),
+  reason = character(0)
 )
 
-create_log_entry <- function(message, level="INFO") {
+create_log_entry <- function(message, level="INFO", reason="") {
   ts <- Sys.time()
-  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  cat(sprintf("[%s] [%s] %s%s\n",
+              format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"),
+              level, message,
+              ifelse(nzchar(reason), paste0(" (reason=", reason, ")"), "")))
   log_entries <<- bind_rows(log_entries, tibble(
     timestamp = ts, level = level, message = message,
     run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
-    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
+    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown"),
+    reason = reason
   ))
 }
 
@@ -211,6 +224,71 @@ safe_runner <- function(name, fun, ...) {
            fitted = list(type = "error", msg = conditionMessage(e)))
     }
   )
+}
+
+################################################################################
+# NEW: WORKFLOW FORK — honor skip flag + readiness match gate
+################################################################################
+
+# 1) Manual skip from workflow_dispatch
+if (skip_training) {
+  create_log_entry("Training skipped by request (workflow input skip_training=true)", "INFO", reason="manual_skip")
+  upload_logs_to_bigquery()
+  cat("⏭️  TRAINING SKIPPED (manual)\n"); quit(status=0)
+}
+
+# 2) If Job 2 passed a definitive answer, honor it
+if (nzchar(has_matches_hint)) {
+  if (tolower(has_matches_hint) %in% c("false","0","no")) {
+    create_log_entry("No matching readiness data (from Job 2 output)", "INFO", reason="no_readiness_match")
+    upload_logs_to_bigquery()
+    cat("⏭️  TRAINING SKIPPED (no matches)\n"); quit(status=0)
+  }
+  # if "true", continue to training section
+}
+
+# 3) If not provided, self-check for matches (same logic as Job 2)
+if (!nzchar(has_matches_hint)) {
+  create_log_entry("No HAS_MATCHES hint; performing readiness match check")
+  match_sql <- glue("
+    WITH recent_workload AS (
+      SELECT DISTINCT roster_name, DATE(date) AS date
+      FROM `{project}.{dataset}.{workload_table}`
+      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+        AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
+    ),
+    roster_with_ids AS (
+      SELECT DISTINCT LOWER(TRIM(kinexon_name)) AS roster_name, offical_id
+      FROM `{project}.{dataset}.{roster_table}`
+    ),
+    readiness_recent AS (
+      SELECT DISTINCT offical_id, DATE(date) AS date
+      FROM `{project}.{dataset}.{readiness_table}`
+      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+        AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
+    ),
+    matched AS (
+      SELECT w.roster_name, w.date, r.offical_id
+      FROM recent_workload w
+      JOIN roster_with_ids r ON LOWER(TRIM(w.roster_name)) = r.roster_name
+      JOIN readiness_recent rd ON r.offical_id = rd.offical_id AND w.date = rd.date
+    )
+    SELECT 
+      COUNT(DISTINCT roster_name) AS athletes_with_matches,
+      COUNT(*) AS total_matches
+    FROM matched
+  ")
+  mres <- tryCatch(
+    bq_table_download(bq_project_query(project, match_sql)),
+    error = function(e) { create_log_entry(paste("Readiness match query failed:", e$message), "WARN", reason="query_failed"); NULL }
+  )
+  if (is.null(mres) || nrow(mres)==0 || is.na(mres$total_matches[1]) || mres$total_matches[1] == 0) {
+    create_log_entry("No matching readiness data found in lookback window", "INFO", reason="no_readiness_match")
+    upload_logs_to_bigquery()
+    cat("⏭️  TRAINING SKIPPED (no matches)\n"); quit(status=0)
+  } else {
+    create_log_entry(glue("Matches found: {mres$total_matches[1]} across {mres$athletes_with_matches[1]} athletes"))
+  }
 }
 
 ################################################################################
@@ -368,9 +446,11 @@ data_joined <- workload_data %>%
 
 create_log_entry(glue("Joined data: {nrow(data_joined)} rows with readiness"))
 
+# IMPORTANT: if the join is empty, SKIP (not error) to align with Job 3 conditional.
 if (nrow(data_joined) == 0) {
-  create_log_entry("No data after join - exiting", "ERROR")
-  upload_logs_to_bigquery(); quit(status=1)
+  create_log_entry("No matched workload-readiness rows after join", "INFO", reason="no_readiness_match")
+  upload_logs_to_bigquery()
+  cat("⏭️  TRAINING SKIPPED (no matches after join)\n"); quit(status=0)
 }
 
 ################################################################################
