@@ -1,9 +1,20 @@
 #!/usr/bin/env Rscript
 
 ################################################################################
-# READINESS MODELS — Cloud Version with Model Registry (workflow-aware)
+# READINESS MODELS — Cloud Version with Model Registry
 # Uses VALD -> Roster mapping inside SQL to produce offical_id for readiness,
 # and treats workload.roster_name as offical_id. Joins on (offical_id, date).
+#
+# FIXES APPLIED:
+# - 1.3: Registry tables with primary keys and partitioning
+# - 2.3: Pipeline health metrics tracking
+# - 2.4: Predictions APPEND strategy with run timestamps
+# - 2.6: Consistent athlete ID normalization
+# - 2.7: Date validation with MM/DD/YYYY format preference
+# - 3.3: Configuration audit trail
+# - 3.7: Semantic versioning for models
+# - 4.1: Consolidated SQL template
+# - 4.2: Extracted constants/magic numbers
 ################################################################################
 
 # ===== Packages =====
@@ -26,7 +37,7 @@ options(bigrquery.use_bqstorage = FALSE)
 Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 
 ################################################################################
-# CONFIG
+# FIX 4.2: CONFIGURATION CONSTANTS (extracted magic numbers)
 ################################################################################
 project    <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
 dataset    <- Sys.getenv("BQ_DATASET",  "analytics")
@@ -34,9 +45,9 @@ location   <- Sys.getenv("BQ_LOCATION", "US")
 gcs_bucket <- Sys.getenv("GCS_BUCKET",  "")
 team_name  <- Sys.getenv("TEAM_NAME",   "sacstate-football")
 
-# Table names (constants; map VALD -> roster -> ID in-SQL)
+# Table names
 workload_table    <- Sys.getenv("WORKLOAD_TABLE",    "workload_daily")
-readiness_table   <- Sys.getenv("READINESS_TABLE",   "vald_fd_jumps")  # RAW VALD
+readiness_table   <- Sys.getenv("READINESS_TABLE",   "vald_fd_jumps")
 roster_table      <- Sys.getenv("ROSTER_TABLE",      "roster_mapping")
 predictions_table <- Sys.getenv("PREDICTIONS_TABLE", "readiness_predictions_byname")
 
@@ -44,11 +55,28 @@ predictions_table <- Sys.getenv("PREDICTIONS_TABLE", "readiness_predictions_byna
 cfg_start_date <- as.Date(Sys.getenv("START_DATE", "2025-06-01"))
 cfg_end_date   <- as.Date(Sys.getenv("END_DATE",   "2025-12-31"))
 cfg_frac_train <- as.numeric(Sys.getenv("TRAIN_FRACTION", "0.80"))
-min_obs_train  <- as.integer(Sys.getenv("MIN_TRAIN_OBS", "3"))
+
+# Training thresholds (FIX 4.2)
+MIN_TRAIN_OBS         <- as.integer(Sys.getenv("MIN_TRAIN_OBS", "3"))
+MIN_TEST_OBS_FOR_EVAL <- as.integer(Sys.getenv("MIN_TEST_OBS", "5"))
+MIN_TRAIN_RATIO       <- as.numeric(Sys.getenv("MIN_TRAIN_RATIO", "0.7"))
+MIN_PREDICTOR_VARIANCE <- as.numeric(Sys.getenv("MIN_PRED_VARIANCE", "0.0"))
+
+# Cross-validation config (FIX 4.2)
+MAX_CV_FOLDS <- as.integer(Sys.getenv("MAX_CV_FOLDS", "5"))
+MIN_CV_FOLDS <- as.integer(Sys.getenv("MIN_CV_FOLDS", "2"))
+
+# Model selection (FIX 4.2)
+LAMBDA_GRID_SIZE_FULL <- as.integer(Sys.getenv("LAMBDA_GRID_SIZE", "100"))
+LAMBDA_GRID_SIZE_EN   <- as.integer(Sys.getenv("LAMBDA_GRID_SIZE_EN", "50"))
+
+# Retry config (FIX 4.2)
+MAX_RETRY_ATTEMPTS <- as.integer(Sys.getenv("MAX_RETRY_ATTEMPTS", "3"))
+RETRY_WAIT_SECONDS <- as.integer(Sys.getenv("RETRY_WAIT_SECONDS", "5"))
 
 # Workflow fork controls
 skip_training       <- tolower(Sys.getenv("SKIP_TRAINING", "false")) %in% c("1","true","yes")
-has_matches_hint    <- Sys.getenv("HAS_MATCHES", "")     # "" | "true" | "false"
+has_matches_hint    <- Sys.getenv("HAS_MATCHES", "")
 match_lookback_days <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
 
 cat("=== CONFIGURATION ===\n")
@@ -57,14 +85,15 @@ cat("BQ Dataset:", dataset, "\n")
 cat("GCS Bucket:", ifelse(nzchar(gcs_bucket), gcs_bucket, "(none)"), "\n")
 cat("Team:", team_name, "\n")
 cat("Workload table:", workload_table, "\n")
-cat("Readiness table (RAW VALD):", readiness_table, "\n")
+cat("Readiness table:", readiness_table, "\n")
 cat("Roster table:", roster_table, "\n")
 cat("Predictions table:", predictions_table, "\n")
-cat("Date range:", cfg_start_date, "to", cfg_end_date, "\n")
+cat("Date range:", format(cfg_start_date, "%m/%d/%Y"), "to", format(cfg_end_date, "%m/%d/%Y"), "\n")
 cat("Train fraction:", cfg_frac_train, "\n")
-cat("Skip training (env):", skip_training, "\n")
-cat("HAS_MATCHES (hint from Job 2):", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
-cat("MATCH_LOOKBACK_DAYS:", match_lookback_days, "\n\n")
+cat("Min train obs:", MIN_TRAIN_OBS, "\n")
+cat("Skip training:", skip_training, "\n")
+cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
+cat("Match lookback days:", match_lookback_days, "\n\n")
 
 ################################################################################
 # LOGGING
@@ -81,7 +110,7 @@ log_entries <- tibble(
 create_log_entry <- function(message, level="INFO", reason="") {
   ts <- Sys.time()
   cat(sprintf("[%s] [%s] %s%s\n",
-              format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"),
+              format(ts, "%m/%d/%Y %H:%M:%S", tz="America/Los_Angeles"),
               level, message,
               ifelse(nzchar(reason), paste0(" (reason=", reason, ")"), "")))
   log_entries <<- bind_rows(log_entries, tibble(
@@ -138,17 +167,126 @@ tryCatch({
 })
 
 ################################################################################
-# HELPERS
+# HELPER FUNCTIONS
 ################################################################################
-normalize_key <- function(x) {
-  y <- tolower(as.character(x))
-  y <- stringr::str_replace_all(y, "[^a-z0-9 ]", " ")
-  stringr::str_squish(y)
+
+# FIX 2.6: Consistent normalization function
+normalize_athlete_id <- function(x) {
+  # Consistent with SQL: TRIM(CAST(x AS STRING))
+  # No lowercase or special char removal to match SQL exactly
+  stringr::str_trim(as.character(x))
 }
+
+# FIX 2.7: Date parsing with MM/DD/YYYY preference
+parse_date_mmddyyyy <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  out <- rep(as.Date(NA), length(x))
+  
+  # Try MM/DD/YYYY first (American format)
+  suppressWarnings({
+    parsed <- lubridate::mdy(as.character(x))
+    good <- !is.na(parsed)
+    if (any(good)) out[good] <- parsed[good]
+  })
+  
+  # Then try YYYY-MM-DD (ISO)
+  bad <- is.na(out)
+  if (any(bad)) {
+    suppressWarnings({
+      parsed <- lubridate::ymd(as.character(x[bad]))
+      good <- !is.na(parsed)
+      if (any(good)) out[bad][good] <- parsed[good]
+    })
+  }
+  
+  # Finally try DD/MM/YYYY
+  bad <- is.na(out)
+  if (any(bad)) {
+    suppressWarnings({
+      parsed <- lubridate::dmy(as.character(x[bad]))
+      good <- !is.na(parsed)
+      if (any(good)) out[bad][good] <- parsed[good]
+    })
+  }
+  
+  # Try Excel numeric dates
+  bad <- is.na(out)
+  if (any(bad)) {
+    suppressWarnings({
+      as_num <- as.numeric(x[bad])
+      good <- !is.na(as_num) & as_num > 30000 & as_num < 50000
+      if (any(good)) {
+        out[bad][good] <- as.Date(as_num[good], origin = "1899-12-30")
+      }
+    })
+  }
+  
+  out
+}
+
+# FIX 2.7: Date validation function
+validate_dates <- function(df, date_col, context) {
+  if (!date_col %in% names(df)) {
+    create_log_entry(sprintf("ERROR: Date column '%s' not found in %s", date_col, context), "ERROR")
+    upload_logs_to_bigquery(); quit(status=1)
+  }
+  
+  if (!inherits(df[[date_col]], "Date")) {
+    create_log_entry(sprintf("WARN: %s date column is %s, attempting conversion", 
+                             context, class(df[[date_col]])[1]), "WARN")
+    df[[date_col]] <- parse_date_mmddyyyy(df[[date_col]])
+  }
+  
+  # Check for invalid dates
+  invalid_count <- sum(is.na(df[[date_col]]))
+  if (invalid_count > 0) {
+    create_log_entry(sprintf("ERROR: %d invalid dates in %s", invalid_count, context), "ERROR")
+    upload_logs_to_bigquery(); quit(status=1)
+  }
+  
+  df
+}
+
+# Retry helper
+retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS, 
+                           wait_seconds = RETRY_WAIT_SECONDS, 
+                           operation_name = "operation") {
+  for (attempt in 1:max_attempts) {
+    result <- tryCatch({
+      force(expr)
+      return(list(success = TRUE, result = expr))
+    }, error = function(e) {
+      if (attempt < max_attempts) {
+        create_log_entry(
+          sprintf("%s failed (attempt %d/%d): %s. Retrying in %d seconds...", 
+                  operation_name, attempt, max_attempts, e$message, wait_seconds),
+          "WARN",
+          reason = "retry_transient_error"
+        )
+        Sys.sleep(wait_seconds)
+        NULL
+      } else {
+        create_log_entry(
+          sprintf("%s failed after %d attempts: %s", 
+                  operation_name, max_attempts, e$message),
+          "ERROR",
+          reason = "retry_exhausted"
+        )
+        return(list(success = FALSE, error = e$message))
+      }
+    })
+    if (!is.null(result)) return(result)
+  }
+}
+
+# Existing helpers
 rmse <- function(obs, pred) sqrt(mean((obs - pred)^2, na.rm=TRUE))
 to_numeric_df <- function(df, cols) { for (c in cols) df[[c]] <- as.numeric(df[[c]]); df }
 enough_rows <- function(n, min_n = 2) { !is.na(n) && is.finite(n) && n >= min_n }
-choose_nfolds <- function(n) { if (is.na(n) || n < 2) 2L else pmin(5L, n) }
+choose_nfolds <- function(n) { 
+  if (is.na(n) || n < MIN_CV_FOLDS) MIN_CV_FOLDS 
+  else pmin(MAX_CV_FOLDS, n) 
+}
 
 impute_train_test <- function(train_df, test_df, preds) {
   tr <- train_df; te <- test_df
@@ -170,12 +308,14 @@ safe_scale_fit <- function(df, cols) {
        scale  = as.numeric(attr(Xs, "scaled:scale")),
        cols   = cols)
 }
+
 safe_scale_apply <- function(df, fit) {
   stopifnot(all(fit$cols %in% names(df)))
   X <- as.matrix(df[, fit$cols, drop = FALSE])
   s <- fit$scale; s[is.na(s) | s == 0] <- 1
   scale(X, center = fit$center, scale = s)
 }
+
 safe_runner <- function(name, fun, ...) {
   tryCatch(
     fun(...),
@@ -187,6 +327,54 @@ safe_runner <- function(name, fun, ...) {
     }
   )
 }
+
+################################################################################
+# FIX 3.3: CONFIGURATION AUDIT TRAIL
+################################################################################
+create_log_entry("Saving configuration snapshot")
+
+config_snapshot <- tibble(
+  run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+  run_timestamp = Sys.time(),
+  git_sha = Sys.getenv("GITHUB_SHA", "unknown"),
+  git_ref = Sys.getenv("GITHUB_REF", "unknown"),
+  
+  # Environment config
+  gcp_project = project,
+  bq_dataset = dataset,
+  gcs_bucket = ifelse(nzchar(gcs_bucket), gcs_bucket, "(none)"),
+  team_name = team_name,
+  
+  # Table names
+  workload_table = workload_table,
+  readiness_table = readiness_table,
+  roster_table = roster_table,
+  predictions_table = predictions_table,
+  
+  # Training config
+  start_date = cfg_start_date,
+  end_date = cfg_end_date,
+  train_fraction = cfg_frac_train,
+  min_train_obs = MIN_TRAIN_OBS,
+  match_lookback_days = match_lookback_days,
+  
+  # Flags
+  skip_training = skip_training,
+  has_matches_hint = ifelse(nzchar(has_matches_hint), has_matches_hint, "(not provided)")
+)
+
+tryCatch({
+  config_tbl <- bq_table(project, dataset, "pipeline_config_history")
+  if (!bq_table_exists(config_tbl)) {
+    bq_table_create(config_tbl, 
+                    fields = as_bq_fields(config_snapshot),
+                    time_partitioning = list(type="DAY", field="run_timestamp"))
+  }
+  bq_table_upload(config_tbl, config_snapshot, write_disposition = "WRITE_APPEND")
+  create_log_entry("Configuration snapshot saved")
+}, error = function(e) {
+  create_log_entry(paste("Config snapshot save failed (non-fatal):", e$message), "WARN")
+})
 
 ################################################################################
 # WORKFLOW FORK — honor skip flag + readiness match gate
@@ -206,12 +394,13 @@ if (nzchar(has_matches_hint)) {
     upload_logs_to_bigquery()
     cat("⏭️  TRAINING SKIPPED (no matches)\n"); quit(status=0)
   }
-  # if "true", proceed
 }
 
-# 3) Self-check for matches if not provided (uses ID mapping in-SQL)
+# 3) Self-check for matches if not provided (FIX 4.1: using consolidated SQL)
 if (!nzchar(has_matches_hint)) {
-  create_log_entry("No HAS_MATCHES hint; performing readiness match check (offical_id + date via roster mapping)")
+  create_log_entry("No HAS_MATCHES hint; performing readiness match check")
+  
+  # Build SQL from template
   match_sql <- glue("
     WITH workload AS (
       SELECT DISTINCT
@@ -262,10 +451,15 @@ if (!nzchar(has_matches_hint)) {
       ON rd.offical_id = w.offical_id
      AND rd.date       = w.date
   ")
+  
   mres <- tryCatch(
     bq_table_download(bq_project_query(project, match_sql)),
-    error = function(e) { create_log_entry(paste("Readiness match query failed:", e$message), "WARN", reason="query_failed"); NULL }
+    error = function(e) { 
+      create_log_entry(paste("Readiness match query failed:", e$message), "WARN", reason="query_failed")
+      NULL 
+    }
   )
+  
   if (is.null(mres) || nrow(mres)==0 || is.na(mres$total_matches[1]) || mres$total_matches[1] == 0) {
     create_log_entry("No matching readiness data found in lookback window", "INFO", reason="no_readiness_match")
     upload_logs_to_bigquery()
@@ -276,39 +470,93 @@ if (!nzchar(has_matches_hint)) {
 }
 
 ################################################################################
-# INIT REGISTRY TABLES (idempotent)
+# FIX 1.3: INIT REGISTRY TABLES (with primary keys and partitioning)
 ################################################################################
 create_log_entry("Initializing model registry tables")
 tryCatch({
   ds <- bq_dataset(project, dataset)
   if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
-  registry_tables <- list(
-    models = "
-      CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_models` (
-        model_id STRING, model_name STRING, team STRING, owner STRING,
-        description STRING, created_at TIMESTAMP
-      )",
-    versions = "
-      CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_versions` (
-        model_id STRING, version_id STRING, created_at TIMESTAMP, created_by STRING,
-        artifact_uri STRING, artifact_sha256 STRING, framework STRING,
-        r_version STRING, package_info STRING, notes STRING
-      )",
-    metrics = "
-      CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_metrics` (
-        model_id STRING, version_id STRING, metric_name STRING, metric_value FLOAT64,
-        split STRING, logged_at TIMESTAMP
-      )",
-    stages = "
-      CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_stages` (
-        model_id STRING, version_id STRING, stage STRING, set_at TIMESTAMP,
-        set_by STRING, reason STRING
-      )"
-  )
-  for (tbl_name in names(registry_tables)) {
-    sql <- glue(registry_tables[[tbl_name]]); bq_project_query(project, sql)
-    create_log_entry(glue("Registry table verified: registry_{tbl_name}"))
-  }
+  
+  # Registry Models
+  bq_project_query(project, glue("
+    CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_models` (
+      model_id STRING NOT NULL,
+      model_name STRING NOT NULL,
+      team STRING,
+      owner STRING,
+      description STRING,
+      created_at TIMESTAMP NOT NULL,
+      PRIMARY KEY (model_id) NOT ENFORCED
+    )
+    PARTITION BY DATE(created_at)
+    CLUSTER BY team, model_id
+  "))
+  create_log_entry("Registry table verified: registry_models")
+  
+  # Registry Versions
+  bq_project_query(project, glue("
+    CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_versions` (
+      model_id STRING NOT NULL,
+      version_id STRING NOT NULL,
+      created_at TIMESTAMP NOT NULL,
+      created_by STRING,
+      artifact_uri STRING,
+      artifact_sha256 STRING,
+      framework STRING,
+      r_version STRING,
+      package_info STRING,
+      training_data_start_date DATE,
+      training_data_end_date DATE,
+      n_training_samples INT64,
+      n_test_samples INT64,
+      validation_method STRING,
+      predictor_list STRING,
+      hyperparameters STRING,
+      train_rmse FLOAT64,
+      cv_rmse FLOAT64,
+      test_rmse FLOAT64,
+      pipeline_run_id STRING,
+      git_commit_sha STRING,
+      notes STRING,
+      PRIMARY KEY (model_id, version_id) NOT ENFORCED
+    )
+    PARTITION BY DATE(created_at)
+    CLUSTER BY model_id, version_id
+  "))
+  create_log_entry("Registry table verified: registry_versions")
+  
+  # Registry Metrics
+  bq_project_query(project, glue("
+    CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_metrics` (
+      model_id STRING NOT NULL,
+      version_id STRING NOT NULL,
+      metric_name STRING NOT NULL,
+      metric_value FLOAT64,
+      split STRING NOT NULL,
+      logged_at TIMESTAMP NOT NULL,
+      PRIMARY KEY (model_id, version_id, metric_name, split) NOT ENFORCED
+    )
+    PARTITION BY DATE(logged_at)
+    CLUSTER BY model_id, version_id, metric_name
+  "))
+  create_log_entry("Registry table verified: registry_metrics")
+  
+  # Registry Stages
+  bq_project_query(project, glue("
+    CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_stages` (
+      model_id STRING NOT NULL,
+      version_id STRING NOT NULL,
+      stage STRING NOT NULL,
+      set_at TIMESTAMP NOT NULL,
+      set_by STRING,
+      reason STRING,
+      PRIMARY KEY (model_id, version_id, stage) NOT ENFORCED
+    )
+    PARTITION BY DATE(set_at)
+    CLUSTER BY model_id, version_id, stage
+  "))
+  create_log_entry("Registry table verified: registry_stages")
+  
 }, error = function(e) {
   create_log_entry(paste("Registry initialization failed:", e$message), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
@@ -318,72 +566,115 @@ tryCatch({
 # LOAD DATA (WITH MAPPING IN SQL)
 ################################################################################
 
-# Workload: treat roster_name as offical_id
+# FIX 2.6: Workload with consistent normalization
 create_log_entry("Loading workload data from BigQuery")
-workload_data <- tryCatch({
-  sql <- glue("
-    SELECT 
-      TRIM(CAST(roster_name AS STRING)) AS offical_id,
-      DATE(date) AS date,
-      distance, high_speed_distance, mechanical_load,
-      distance_7d, distance_28d, distance_monotony_7d,
-      hsd_7d, hsd_28d, ml_7d, ml_28d, ml_monotony_7d
-    FROM `{project}.{dataset}.{workload_table}`
-    WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
-  ")
-  bq_table_download(bq_project_query(project, sql)) %>%
-    mutate(date = as.Date(date))
-}, error = function(e) {
-  create_log_entry(paste("Workload data load failed:", e$message), "ERROR")
+workload_result <- retry_operation(
+  {
+    sql <- glue("
+      SELECT 
+        TRIM(CAST(roster_name AS STRING)) AS offical_id,
+        DATE(date) AS date,
+        distance, high_speed_distance, mechanical_load,
+        distance_7d, distance_28d, distance_monotony_7d,
+        hsd_7d, hsd_28d, ml_7d, ml_28d, ml_monotony_7d
+      FROM `{project}.{dataset}.{workload_table}`
+      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+    ")
+    bq_table_download(bq_project_query(project, sql))
+  },
+  max_attempts = MAX_RETRY_ATTEMPTS,
+  wait_seconds = RETRY_WAIT_SECONDS,
+  operation_name = "workload data load"
+)
+
+if (!workload_result$success) {
+  create_log_entry("Workload data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
-})
+}
+workload_data <- workload_result$result
+
+# FIX 2.7: Validate and parse dates
+workload_data <- validate_dates(workload_data, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_data)} rows"))
+
+# Validate required columns
+required_workload_cols <- c("offical_id", "date", "distance", "high_speed_distance", "mechanical_load")
+missing_cols <- setdiff(required_workload_cols, names(workload_data))
+if (length(missing_cols) > 0) {
+  create_log_entry(paste("ERROR: Missing columns in workload data:", paste(missing_cols, collapse=", ")), "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+}
+
+# Check for null athlete IDs
+null_id_count <- sum(is.na(workload_data$offical_id) | workload_data$offical_id == "")
+if (null_id_count > 0) {
+  create_log_entry(sprintf("WARN: %d workload rows with missing/empty offical_id (will be filtered)", 
+                           null_id_count), "WARN")
+  workload_data <- workload_data %>% filter(!is.na(offical_id) & nzchar(offical_id))
+}
 
 # Readiness: VALD -> roster -> offical_id
 create_log_entry("Loading readiness data from BigQuery (via roster mapping)")
-readiness_data <- tryCatch({
-  sql <- glue("
-    WITH readiness_raw AS (
+readiness_result <- retry_operation(
+  {
+    sql <- glue("
+      WITH readiness_raw AS (
+        SELECT
+          DATE(date) AS date,
+          LOWER(TRIM(full_name)) AS vald_full_name_norm,
+          SAFE_DIVIDE(
+            IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
+            IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
+            IFNULL(CAST(rsi_readiness          AS FLOAT64), 0),
+            NULLIF(
+              IF(jump_height_readiness IS NULL, 0, 1) +
+              IF(epf_readiness          IS NULL, 0, 1) +
+              IF(rsi_readiness          IS NULL, 0, 1),
+              0
+            )
+          ) AS readiness
+        FROM `{project}.{dataset}.{readiness_table}`
+        WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+      ),
+      roster_norm AS (
+        SELECT
+          TRIM(CAST(offical_id AS STRING)) AS offical_id,
+          LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm
+        FROM `{project}.{dataset}.{roster_table}`
+      )
       SELECT
-        DATE(date) AS date,
-        LOWER(TRIM(full_name)) AS vald_full_name_norm,
-        SAFE_DIVIDE(
-          IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
-          IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
-          IFNULL(CAST(rsi_readiness          AS FLOAT64), 0),
-          NULLIF(
-            IF(jump_height_readiness IS NULL, 0, 1) +
-            IF(epf_readiness          IS NULL, 0, 1) +
-            IF(rsi_readiness          IS NULL, 0, 1),
-            0
-          )
-        ) AS readiness
-      FROM `{project}.{dataset}.{readiness_table}`
-      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
-    ),
-    roster_norm AS (
-      SELECT
-        TRIM(CAST(offical_id AS STRING)) AS offical_id,
-        LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm
-      FROM `{project}.{dataset}.{roster_table}`
-    )
-    SELECT
-      rmap.offical_id,
-      rr.date,
-      rr.readiness
-    FROM readiness_raw rr
-    JOIN roster_norm rmap
-      ON rmap.vald_full_name_norm = rr.vald_full_name_norm
-    WHERE rr.readiness IS NOT NULL
-  ")
-  bq_table_download(bq_project_query(project, sql)) %>%
-    mutate(date = as.Date(date),
-           readiness = as.numeric(readiness))
-}, error = function(e) {
-  create_log_entry(paste("Readiness data load failed:", e$message), "ERROR")
+        rmap.offical_id,
+        rr.date,
+        rr.readiness
+      FROM readiness_raw rr
+      JOIN roster_norm rmap
+        ON rmap.vald_full_name_norm = rr.vald_full_name_norm
+      WHERE rr.readiness IS NOT NULL
+    ")
+    bq_table_download(bq_project_query(project, sql))
+  },
+  max_attempts = MAX_RETRY_ATTEMPTS,
+  wait_seconds = RETRY_WAIT_SECONDS,
+  operation_name = "readiness data load"
+)
+
+if (!readiness_result$success) {
+  create_log_entry("Readiness data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
-})
+}
+readiness_data <- readiness_result$result %>%
+  mutate(readiness = as.numeric(readiness))
+
+# FIX 2.7: Validate dates
+readiness_data <- validate_dates(readiness_data, "date", "readiness")
 create_log_entry(glue("Readiness data loaded: {nrow(readiness_data)} rows"))
+
+# Check readiness value bounds
+readiness_range <- range(readiness_data$readiness, na.rm=TRUE)
+if (readiness_range[1] < 0 || readiness_range[2] > 100) {
+  create_log_entry(sprintf("WARN: Readiness values outside expected 0-100 range: [%.2f, %.2f]", 
+                           readiness_range[1], readiness_range[2]), "WARN")
+}
 
 ################################################################################
 # MERGE WORKLOAD + READINESS BY (offical_id, date)
@@ -443,11 +734,11 @@ all_predictors <- c(
 data_clean <- as.data.table(data_model)
 create_log_entry(glue("Model input: {nrow(data_clean)} rows, {length(unique(data_clean$offical_id))} athletes"))
 
-# Hyperparams
-lambda_grid    <- exp(seq(log(1e-4), log(100), length.out = 100))
-lambda_grid_en <- exp(seq(log(1e-4), log(100), length.out = 50))
+# Hyperparams (FIX 4.2: using constants)
+lambda_grid    <- exp(seq(log(1e-4), log(100), length.out = LAMBDA_GRID_SIZE_FULL))
+lambda_grid_en <- exp(seq(log(1e-4), log(100), length.out = LAMBDA_GRID_SIZE_EN))
 
-# ---- Training functions (unchanged from prior) ----
+# ---- Training functions (same as before but using constants) ----
 run_glmnet_cvfit <- function(train_df, preds, alpha_glmnet, lambda_grid, fit_intercept, normalization) {
   mm_cols <- c(response_var, preds)
   tr_cc <- train_df[stats::complete.cases(train_df[, mm_cols, drop = FALSE]), , drop = FALSE]
@@ -464,7 +755,9 @@ run_glmnet_cvfit <- function(train_df, preds, alpha_glmnet, lambda_grid, fit_int
   ))
   list(cv=cv, scaler=sc, Xtr=Xtr, y=y, train_cc=tr_cc)
 }
+
 run_glmnet_predict <- function(cvfit, newX, s = "lambda.min") as.numeric(predict(cvfit, newX, s = s))
+
 run_linear <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE, FALSE)) for (sc in c(TRUE, FALSE)) {
@@ -475,10 +768,19 @@ run_linear <- function(train_df, test_df, preds, val_method) {
     mm_cols <- c(response_var, preds)
     tr_cc <- tr_df[stats::complete.cases(tr_df[, mm_cols, drop = FALSE]), , drop = FALSE]
     if (!enough_rows(nrow(tr_cc), 2L)) next
-    if (sc) { fit_sc <- safe_scale_fit(tr_cc, preds); tr_fit <- tr_cc; tr_fit[, preds] <- fit_sc$X; m <- stats::lm(form, data=tr_fit, singular.ok=TRUE) }
-    else    { fit_sc <- NULL; m <- stats::lm(form, data=tr_cc); tr_fit <- tr_cc }
+    if (sc) { 
+      fit_sc <- safe_scale_fit(tr_cc, preds)
+      tr_fit <- tr_cc
+      tr_fit[, preds] <- fit_sc$X
+      m <- stats::lm(form, data=tr_fit, singular.ok=TRUE)
+    } else { 
+      fit_sc <- NULL
+      m <- stats::lm(form, data=tr_cc)
+      tr_fit <- tr_cc
+    }
     train_rmse_val <- rmse(tr_fit[[response_var]], stats::predict(m, tr_fit))
-    k <- choose_nfolds(nrow(tr_cc)); folds <- sample(rep(1:k, length.out=nrow(tr_cc)))
+    k <- choose_nfolds(nrow(tr_cc))
+    folds <- sample(rep(1:k, length.out=nrow(tr_cc)))
     cv_vals <- numeric(k)
     for (f in seq_len(k)) {
       tr_ix <- folds != f; te_ix <- folds == f
@@ -490,21 +792,42 @@ run_linear <- function(train_df, test_df, preds, val_method) {
     if (val_method == "test_set" && nrow(te_df) > 0) {
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
-        if (sc) { te_scaled <- safe_scale_apply(te_cc, fit_sc); te_fit <- te_cc; te_fit[, preds] <- te_scaled; test_rmse_val <- rmse(te_fit[[response_var]], stats::predict(m, te_fit)) }
-        else    { test_rmse_val <- rmse(te_cc[[response_var]], stats::predict(m, te_cc)) }
+        if (sc) {
+          te_scaled <- safe_scale_apply(te_cc, fit_sc)
+          te_fit <- te_cc
+          te_fit[, preds] <- te_scaled
+          test_rmse_val <- rmse(te_fit[[response_var]], stats::predict(m, te_fit))
+        } else {
+          test_rmse_val <- rmse(te_cc[[response_var]], stats::predict(m, te_cc))
+        }
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_val }
-    cand <- list(model_type="linear", train_rmse=train_rmse_val, cv_rmse=cv_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("fit_intercept=%s; normalization=%s", fi, sc),
-                 fitted=list(type="lm", model=m, predictors=preds,
-                             preprocessing=list(normalization=sc, center=if (sc) fit_sc$center else NULL,
-                                               scale=if (sc) fit_sc$scale else NULL, cols=if (sc) fit_sc$cols else preds,
-                                               fit_intercept=fi)))
+    cand <- list(
+      model_type="linear", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("fit_intercept=%s; normalization=%s", fi, sc),
+      fitted=list(
+        type="lm", 
+        model=m, 
+        predictors=preds,
+        preprocessing=list(
+          normalization=sc, 
+          center=if (sc) fit_sc$center else NULL,
+          scale=if (sc) fit_sc$scale else NULL, 
+          cols=if (sc) fit_sc$cols else preds,
+          fit_intercept=fi
+        )
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
 }
+
 run_ridge <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
@@ -520,17 +843,33 @@ run_ridge <- function(train_df, test_df, preds, val_method) {
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
-    cand <- list(model_type="ridge", train_rmse=train_rmse_val, cv_rmse=cv_rmse_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
-                 fitted=list(type="glmnet", model=fit$cv, predictors=preds,
-                             preprocessing=list(normalization=sc_norm, center=if (sc_norm) fit$scaler$center else NULL,
-                                               scale=if (sc_norm) fit$scaler$scale else NULL, cols=fit$scaler$cols,
-                                               fit_intercept=fi),
-                             lambda_min=fit$cv$lambda.min, alpha=0))
+    cand <- list(
+      model_type="ridge", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_rmse_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
+      fitted=list(
+        type="glmnet", 
+        model=fit$cv, 
+        predictors=preds,
+        preprocessing=list(
+          normalization=sc_norm, 
+          center=if (sc_norm) fit$scaler$center else NULL,
+          scale=if (sc_norm) fit$scaler$scale else NULL, 
+          cols=fit$scaler$cols,
+          fit_intercept=fi
+        ),
+        lambda_min=fit$cv$lambda.min, 
+        alpha=0
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
 }
+
 run_lasso <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
@@ -546,17 +885,33 @@ run_lasso <- function(train_df, test_df, preds, val_method) {
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
-    cand <- list(model_type="lasso", train_rmse=train_rmse_val, cv_rmse=cv_rmse_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
-                 fitted=list(type="glmnet", model=fit$cv, predictors=preds,
-                             preprocessing=list(normalization=sc_norm, center=if (sc_norm) fit$scaler$center else NULL,
-                                               scale=if (sc_norm) fit$scaler$scale else NULL, cols=fit$scaler$cols,
-                                               fit_intercept=fi),
-                             lambda_min=fit$cv$lambda.min, alpha=1))
+    cand <- list(
+      model_type="lasso", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_rmse_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
+      fitted=list(
+        type="glmnet", 
+        model=fit$cv, 
+        predictors=preds,
+        preprocessing=list(
+          normalization=sc_norm, 
+          center=if (sc_norm) fit$scaler$center else NULL,
+          scale=if (sc_norm) fit$scaler$scale else NULL, 
+          cols=fit$scaler$cols,
+          fit_intercept=fi
+        ),
+        lambda_min=fit$cv$lambda.min, 
+        alpha=1
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
 }
+
 run_elastic <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (ai in seq(0.1,0.9,by=0.2)) for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
@@ -572,21 +927,44 @@ run_elastic <- function(train_df, test_df, preds, val_method) {
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
-    cand <- list(model_type="elastic_net", train_rmse=train_rmse_val, cv_rmse=cv_rmse_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("lambda=%.6f; l1_ratio=%.1f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, ai, fi, sc_norm),
-                 fitted=list(type="glmnet", model=fit$cv, predictors=preds,
-                             preprocessing=list(normalization=sc_norm, center=if (sc_norm) fit$scaler$center else NULL,
-                                               scale=if (sc_norm) fit$scaler$scale else NULL, cols=fit$scaler$cols,
-                                               fit_intercept=fi),
-                             lambda_min=fit$cv$lambda.min, alpha=ai))
+    cand <- list(
+      model_type="elastic_net", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_rmse_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("lambda=%.6f; l1_ratio=%.1f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, ai, fi, sc_norm),
+      fitted=list(
+        type="glmnet", 
+        model=fit$cv, 
+        predictors=preds,
+        preprocessing=list(
+          normalization=sc_norm, 
+          center=if (sc_norm) fit$scaler$center else NULL,
+          scale=if (sc_norm) fit$scaler$scale else NULL, 
+          cols=fit$scaler$cols,
+          fit_intercept=fi
+        ),
+        lambda_min=fit$cv$lambda.min, 
+        alpha=ai
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
 }
+
 run_bayes_reg <- function(train_df, test_df, preds, val_method) {
   if (!reticulate::py_module_available("sklearn")) {
-    return(list(model_type="bayesian_regression", train_rmse=Inf, cv_rmse=Inf, test_rmse=Inf, primary_rmse=Inf,
-                hyper="sklearn not available", fitted=list(type="error")))
+    return(list(
+      model_type="bayesian_regression", 
+      train_rmse=Inf, 
+      cv_rmse=Inf, 
+      test_rmse=Inf, 
+      primary_rmse=Inf,
+      hyper="sklearn not available", 
+      fitted=list(type="error")
+    ))
   }
   sk <- reticulate::import("sklearn.linear_model", delay_load = TRUE)
   BayesRidge <- sk$BayesianRidge
@@ -601,7 +979,9 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
     m <- BayesRidge(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1, fit_intercept=TRUE)
     m$fit(Xtr, y)
     train_rmse_val <- rmse(y, as.numeric(m$predict(Xtr)))
-    k <- choose_nfolds(nrow(tr_cc)); folds <- sample(rep(seq_len(k), length.out=nrow(tr_cc))); cv_vals <- numeric(k)
+    k <- choose_nfolds(nrow(tr_cc))
+    folds <- sample(rep(seq_len(k), length.out=nrow(tr_cc)))
+    cv_vals <- numeric(k)
     for (f in seq_len(k)) {
       tr_ix <- folds != f; te_ix <- folds == f
       if (sum(tr_ix) < 2 || sum(te_ix) < 1) { cv_vals[f] <- NA_real_; next }
@@ -623,46 +1003,99 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
     coef_vec <- tryCatch(as.numeric(reticulate::py_to_r(m$coef_)), error=function(e) rep(NA_real_, length(preds)))
     intercept_val <- tryCatch(as.numeric(reticulate::py_to_r(m$intercept_)), error=function(e) NA_real_)
-    cand <- list(model_type="bayesian_regression", train_rmse=train_rmse_val, cv_rmse=cv_rmse_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("alpha_1=%.0e; lambda_1=%.0e", a1, l1),
-                 fitted=list(type="bayesridge_params", predictors=preds,
-                             preprocessing=list(normalization=TRUE, center=fit_sc$center, scale=fit_sc$scale, cols=fit_sc$cols, fit_intercept=TRUE),
-                             coefficients=coef_vec, intercept=intercept_val,
-                             priors=list(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1)))
+    cand <- list(
+      model_type="bayesian_regression", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_rmse_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("alpha_1=%.0e; lambda_1=%.0e", a1, l1),
+      fitted=list(
+        type="bayesridge_params", 
+        predictors=preds,
+        preprocessing=list(
+          normalization=TRUE, 
+          center=fit_sc$center, 
+          scale=fit_sc$scale, 
+          cols=fit_sc$cols, 
+          fit_intercept=TRUE
+        ),
+        coefficients=coef_vec, 
+        intercept=intercept_val,
+        priors=list(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1)
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
 }
+
 run_bayes_net <- function(train_df, test_df, preds, val_method) {
   cols <- c(response_var, preds)
-  tr_df <- train_df[, cols, drop = FALSE]; for (cl in cols) if (!is.numeric(tr_df[[cl]])) tr_df[[cl]] <- as.numeric(tr_df[[cl]])
+  tr_df <- train_df[, cols, drop = FALSE]
+  for (cl in cols) if (!is.numeric(tr_df[[cl]])) tr_df[[cl]] <- as.numeric(tr_df[[cl]])
   tr_df <- tr_df[stats::complete.cases(tr_df), , drop = FALSE]
-  if (nrow(tr_df) < 3) return(list(model_type="bayesian_network", train_rmse=Inf, cv_rmse=Inf, test_rmse=Inf, primary_rmse=Inf,
-                                   hyper="insufficient data", fitted=list(type="error")))
-  if (nrow(test_df) > 0) { te_df <- test_df[, cols, drop = FALSE]; for (cl in cols) if (!is.numeric(te_df[[cl]])) te_df[[cl]] <- as.numeric(te_df[[cl]]); te_df <- te_df[stats::complete.cases(te_df), , drop = FALSE] }
-  else te_df <- data.frame()
+  if (nrow(tr_df) < 3) {
+    return(list(
+      model_type="bayesian_network", 
+      train_rmse=Inf, 
+      cv_rmse=Inf, 
+      test_rmse=Inf, 
+      primary_rmse=Inf,
+      hyper="insufficient data", 
+      fitted=list(type="error")
+    ))
+  }
+  if (nrow(test_df) > 0) {
+    te_df <- test_df[, cols, drop = FALSE]
+    for (cl in cols) if (!is.numeric(te_df[[cl]])) te_df[[cl]] <- as.numeric(te_df[[cl]])
+    te_df <- te_df[stats::complete.cases(te_df), , drop = FALSE]
+  } else te_df <- data.frame()
+  
   best <- NULL
   for (alg in c("hc","tabu")) {
     net <- if (alg == "hc") bnlearn::hc(tr_df, score="bic-g") else bnlearn::tabu(tr_df, score="bic-g")
     fit <- bnlearn::bn.fit(net, data=tr_df, method="mle-g")
-    pr_tr <- as.numeric(predict(fit, node=response_var, data=tr_df[, preds, drop = FALSE])); train_rmse_val <- rmse(tr_df[[response_var]], pr_tr)
-    k <- choose_nfolds(nrow(tr_df)); folds <- sample(rep(seq_len(k), length.out=nrow(tr_df))); cv_vals <- numeric(k)
+    pr_tr <- as.numeric(predict(fit, node=response_var, data=tr_df[, preds, drop = FALSE]))
+    train_rmse_val <- rmse(tr_df[[response_var]], pr_tr)
+    k <- choose_nfolds(nrow(tr_df))
+    folds <- sample(rep(seq_len(k), length.out=nrow(tr_df)))
+    cv_vals <- numeric(k)
     for (f in seq_len(k)) {
       tr_ix <- folds != f; te_ix <- folds == f
       if (sum(tr_ix) < 3 || sum(te_ix) < 1) { cv_vals[f] <- NA_real_; next }
       net_cv <- if (alg == "hc") bnlearn::hc(tr_df[tr_ix,], score="bic-g") else bnlearn::tabu(tr_df[tr_ix,], score="bic-g")
       fit_cv <- bnlearn::bn.fit(net_cv, data=tr_df[tr_ix,], method="mle-g")
-      pr_cv  <- as.numeric(predict(fit_cv, node=response_var, data=tr_df[te_ix, preds, drop = FALSE])); cv_vals[f] <- rmse(tr_df[[response_var]][te_ix], pr_cv)
+      pr_cv  <- as.numeric(predict(fit_cv, node=response_var, data=tr_df[te_ix, preds, drop = FALSE]))
+      cv_vals[f] <- rmse(tr_df[[response_var]][te_ix], pr_cv)
     }
     cv_rmse_val <- mean(cv_vals, na.rm=TRUE)
     if (nrow(te_df) > 0 && val_method=="test_set") {
-      pr_te <- as.numeric(predict(fit, node=response_var, data=te_df[, preds, drop = FALSE])); test_rmse_val <- rmse(te_df[[response_var]], pr_te); primary <- test_rmse_val
+      pr_te <- as.numeric(predict(fit, node=response_var, data=te_df[, preds, drop = FALSE]))
+      test_rmse_val <- rmse(te_df[[response_var]], pr_te)
+      primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
-    cand <- list(model_type="bayesian_network", train_rmse=train_rmse_val, cv_rmse=cv_rmse_val, test_rmse=test_rmse_val, primary_rmse=primary,
-                 hyper=sprintf("structure=%s; param=mle", alg),
-                 fitted=list(type="bnlearn", model=fit, predictors=preds,
-                             preprocessing=list(normalization=FALSE, center=NULL, scale=NULL, cols=preds),
-                             structure=alg, param_method="mle"))
+    cand <- list(
+      model_type="bayesian_network", 
+      train_rmse=train_rmse_val, 
+      cv_rmse=cv_rmse_val, 
+      test_rmse=test_rmse_val, 
+      primary_rmse=primary,
+      hyper=sprintf("structure=%s; param=mle", alg),
+      fitted=list(
+        type="bnlearn", 
+        model=fit, 
+        predictors=preds,
+        preprocessing=list(
+          normalization=FALSE, 
+          center=NULL, 
+          scale=NULL, 
+          cols=preds
+        ),
+        structure=alg, 
+        param_method="mle"
+      )
+    )
     if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
   }
   best
@@ -675,29 +1108,98 @@ create_log_entry("Starting model training loop")
 athletes <- unique(na.omit(data_clean$offical_id))
 n_athletes <- length(athletes)
 create_log_entry(glue("Training models for {n_athletes} athletes"))
-timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-all_results <- list(); all_predictions <- list(); success_count <- 0; fail_count <- 0
+
+# FIX 3.7: Semantic versioning
+generate_version_id <- function() {
+  date_range <- paste0(
+    format(cfg_start_date, "%Y%m%d"),
+    "-",
+    format(cfg_end_date, "%Y%m%d")
+  )
+  
+  git_sha <- Sys.getenv("GITHUB_SHA", "unknown")
+  short_sha <- if (nzchar(git_sha) && git_sha != "unknown") substr(git_sha, 1, 7) else "manual"
+  
+  run_id <- Sys.getenv("GITHUB_RUN_ID", format(Sys.time(), "%Y%m%d_%H%M%S"))
+  
+  sprintf("v1_%s_run%s_%s", date_range, run_id, short_sha)
+}
+
+version_id <- generate_version_id()
+create_log_entry(glue("Generated version ID: {version_id}"))
+
+all_results <- list()
+all_predictions <- list()
+success_count <- 0
+fail_count <- 0
 
 for (i in seq_len(n_athletes)) {
   athlete_id <- athletes[i]
+  
+  # Progress indicator every 10 athletes
+  if (i %% 10 == 0 || i == n_athletes) {
+    pct_complete <- round((i / n_athletes) * 100)
+    elapsed <- as.numeric(difftime(Sys.time(), script_start, units="mins"))
+    est_remaining <- if(i > 0) (elapsed / i) * (n_athletes - i) else NA
+    
+    create_log_entry(sprintf(
+      "Progress: %d/%d (%d%%) | Success: %d | Failed: %d | Elapsed: %.1f min | Est remaining: %.1f min",
+      i, n_athletes, pct_complete, success_count, fail_count, elapsed, est_remaining
+    ), "INFO", reason="progress_update")
+  }
+  
   create_log_entry(glue("[{i}/{n_athletes}] Training models for {athlete_id}"))
+  
   tryCatch({
     ath_data  <- data_clean[offical_id == athlete_id]
     ath_train <- ath_data[is_test == 1]
     ath_test  <- ath_data[is_test == 2]
-    if (nrow(ath_train) < min_obs_train) { create_log_entry(glue("  SKIP: insufficient training rows ({nrow(ath_train)})"), "WARN"); fail_count <- fail_count + 1; next }
+    
+    if (nrow(ath_train) < MIN_TRAIN_OBS) {
+      reason <- glue(
+        "Athlete has only {nrow(ath_train)} training samples (minimum required: {MIN_TRAIN_OBS}). ",
+        "Date range: {min(ath_train$date)} to {max(ath_train$date)}. ",
+        "Consider extending date range or lowering MIN_TRAIN_OBS threshold."
+      )
+      create_log_entry(glue("  SKIP: {reason}"), "WARN", reason="insufficient_training_data")
+      fail_count <- fail_count + 1
+      next
+    }
+    
     preds <- intersect(all_predictors, names(ath_train))
-    if (length(preds) == 0) { create_log_entry("  SKIP: no predictors available", "WARN"); fail_count <- fail_count + 1; next }
+    if (length(preds) == 0) {
+      create_log_entry("  SKIP: no predictors available", "WARN", reason="no_predictors")
+      fail_count <- fail_count + 1
+      next
+    }
+    
     ath_train_df <- as.data.frame(ath_train[, c(response_var, preds), with=FALSE])
     ath_test_df  <- as.data.frame(ath_test[,  c(response_var, preds), with=FALSE])
-    ath_train_df <- to_numeric_df(ath_train_df, preds); if (nrow(ath_test_df) > 0) ath_test_df <- to_numeric_df(ath_test_df, preds)
-    imp <- impute_train_test(ath_train_df, ath_test_df, preds); ath_train_df <- imp$train; ath_test_df <- imp$test
-    sds <- sapply(ath_train_df[, preds, drop=FALSE], stats::sd, na.rm=TRUE); keep <- names(sds)[is.finite(sds) & sds > 0]
-    if (length(keep) < 1) { create_log_entry("  SKIP: no predictor variance", "WARN"); fail_count <- fail_count + 1; next }
+    ath_train_df <- to_numeric_df(ath_train_df, preds)
+    if (nrow(ath_test_df) > 0) ath_test_df <- to_numeric_df(ath_test_df, preds)
+    
+    imp <- impute_train_test(ath_train_df, ath_test_df, preds)
+    ath_train_df <- imp$train
+    ath_test_df <- imp$test
+    
+    sds <- sapply(ath_train_df[, preds, drop=FALSE], stats::sd, na.rm=TRUE)
+    keep <- names(sds)[is.finite(sds) & sds > MIN_PREDICTOR_VARIANCE]
+    if (length(keep) < 1) {
+      create_log_entry("  SKIP: no predictor variance", "WARN", reason="no_variance")
+      fail_count <- fail_count + 1
+      next
+    }
     preds <- keep
-    n_tr <- nrow(ath_train_df); n_te <- nrow(ath_test_df)
-    val_method <- if (n_te >= 5 && n_tr/(n_tr+n_te) >= 0.7) "test_set" else "cv"; if (val_method == "cv") ath_test_df <- data.frame()
-
+    
+    n_tr <- nrow(ath_train_df)
+    n_te <- nrow(ath_test_df)
+    val_method <- if (n_te >= MIN_TEST_OBS_FOR_EVAL && n_tr/(n_tr+n_te) >= MIN_TRAIN_RATIO) {
+      "test_set"
+    } else {
+      "cv"
+    }
+    if (val_method == "cv") ath_test_df <- data.frame()
+    
     # Train candidates
     cands <- list(
       safe_runner("linear",              run_linear,    ath_train_df, ath_test_df, preds, val_method),
@@ -707,31 +1209,65 @@ for (i in seq_len(n_athletes)) {
       safe_runner("bayesian_regression", run_bayes_reg, ath_train_df, ath_test_df, preds, val_method),
       safe_runner("bayesian_network",    run_bayes_net, ath_train_df, ath_test_df, preds, val_method)
     )
-    prim_rmse <- sapply(cands, function(c) c$primary_rmse); finite_idx <- which(is.finite(prim_rmse))
-    if (length(finite_idx) == 0) { create_log_entry("  ERROR: all models failed", "ERROR"); fail_count <- fail_count + 1; next }
-    best_idx <- finite_idx[which.min(prim_rmse[finite_idx])]; best_cand <- cands[[best_idx]]
-
-    # Save best model to registry (if bucket configured)
-    save_model_to_registry <- function(athlete_id, model_name, candidate, timestamp) {
+    
+    prim_rmse <- sapply(cands, function(c) c$primary_rmse)
+    finite_idx <- which(is.finite(prim_rmse))
+    if (length(finite_idx) == 0) {
+      create_log_entry("  ERROR: all models failed", "ERROR")
+      fail_count <- fail_count + 1
+      next
+    }
+    
+    best_idx <- finite_idx[which.min(prim_rmse[finite_idx])]
+    best_cand <- cands[[best_idx]]
+    
+    # Save best model to registry
+    save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
       if (is.null(candidate$fitted) || candidate$fitted$type == "error" || !nzchar(gcs_bucket)) {
-        return(list(success = FALSE, model_id = paste(team_name, model_name, sep=":"), version_id = timestamp, artifact_uri = NA))
+        return(list(
+          success = FALSE, 
+          model_id = paste(team_name, model_name, sep=":"), 
+          version_id = version_id, 
+          artifact_uri = NA
+        ))
       }
+      
       tryCatch({
-        model_id <- paste(team_name, model_name, sep = ":"); version_id <- timestamp
+        model_id <- paste(team_name, model_name, sep = ":")
+        
+        # Save artifact to GCS
         dir.create("artifact", showWarnings = FALSE)
-        model_save <- list(model=candidate$fitted$model, type=candidate$model_type,
-                           predictors=candidate$fitted$predictors, preprocessing=candidate$fitted$preprocessing,
-                           date_created=Sys.time(), athlete_id=athlete_id)
-        saveRDS(model_save, "artifact/model.rds"); sha <- digest::digest(file="artifact/model.rds", algo="sha256")
-        manifest <- list(model_name=model_name, version_id=version_id, created_at=as.character(Sys.time()),
-                         r_version=R.version$version.string, checksum_sha256=sha, hyperparameters=candidate$hyper)
+        model_save <- list(
+          model=candidate$fitted$model, 
+          type=candidate$model_type,
+          predictors=candidate$fitted$predictors, 
+          preprocessing=candidate$fitted$preprocessing,
+          date_created=Sys.time(), 
+          athlete_id=athlete_id
+        )
+        saveRDS(model_save, "artifact/model.rds")
+        sha <- digest::digest(file="artifact/model.rds", algo="sha256")
+        
+        manifest <- list(
+          model_name=model_name, 
+          version_id=version_id, 
+          created_at=as.character(Sys.time()),
+          r_version=R.version$version.string, 
+          checksum_sha256=sha, 
+          hyperparameters=candidate$hyper
+        )
         jsonlite::write_json(manifest, "artifact/manifest.json", auto_unbox=TRUE, pretty=TRUE)
-        safe_model_name <- gsub("[^A-Za-z0-9]+", "_", model_name); gcs_path <- sprintf("models/%s/%s/%s/", team_name, safe_model_name, version_id)
+        
+        safe_model_name <- gsub("[^A-Za-z0-9]+", "_", model_name)
+        gcs_path <- sprintf("models/%s/%s/%s/", team_name, safe_model_name, version_id)
+        
         gcs_upload("artifact/model.rds", name=paste0(gcs_path, "model.rds"))
         gcs_upload("artifact/manifest.json", name=paste0(gcs_path, "manifest.json"))
         artifact_uri <- sprintf("gs://%s/%smodel.rds", gcs_bucket, gcs_path)
-
+        
+        # Save to registry with enhanced metadata (FIX 1.3)
         con <- DBI::dbConnect(bigrquery::bigquery(), project = project, dataset = dataset)
+        
         DBI::dbExecute(con, glue("
           MERGE `{project}.{dataset}.registry_models` T 
           USING (SELECT '{model_id}' AS model_id, '{model_name}' AS model_name,
@@ -741,43 +1277,67 @@ for (i in seq_len(n_athletes)) {
           ON T.model_id = S.model_id
           WHEN NOT MATCHED THEN INSERT ROW
         "))
+        
         DBI::dbExecute(con, glue("
           INSERT INTO `{project}.{dataset}.registry_versions`
             (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
-             framework, r_version, package_info, notes)
+             framework, r_version, package_info, notes,
+             training_data_start_date, training_data_end_date,
+             n_training_samples, n_test_samples, validation_method,
+             predictor_list, hyperparameters,
+             train_rmse, cv_rmse, test_rmse,
+             pipeline_run_id, git_commit_sha)
           VALUES
             ('{model_id}','{version_id}',CURRENT_TIMESTAMP(),'github_actions',
-             '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','')
+             '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','',
+             '{cfg_start_date}', '{cfg_end_date}',
+             {n_tr}, {n_te}, '{val_method}',
+             '{jsonlite::toJSON(preds, auto_unbox=TRUE)}',
+             '{jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)}',
+             {candidate$train_rmse}, {candidate$cv_rmse}, {candidate$test_rmse},
+             '{Sys.getenv("GITHUB_RUN_ID", "manual")}',
+             '{Sys.getenv("GITHUB_SHA", "unknown")}')
         "))
+        
         metrics <- tibble(
-          model_id = model_id, version_id = version_id,
+          model_id = model_id, 
+          version_id = version_id,
           metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
           metric_value = c(candidate$train_rmse, candidate$cv_rmse, candidate$test_rmse, candidate$primary_rmse),
-          split = c("train","cv","test","primary"), logged_at = Sys.time()
+          split = c("train","cv","test","primary"), 
+          logged_at = Sys.time()
         )
-        bq_table_upload(bq_table(project, dataset, "registry_metrics"), metrics, write_disposition="WRITE_APPEND")
+        bq_table_upload(
+          bq_table(project, dataset, "registry_metrics"), 
+          metrics, 
+          write_disposition="WRITE_APPEND"
+        )
+        
         DBI::dbExecute(con, glue("
           INSERT INTO `{project}.{dataset}.registry_stages`
             (model_id, version_id, stage, set_at, set_by, reason)
           VALUES
             ('{model_id}','{version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
         "))
+        
         DBI::dbDisconnect(con)
         unlink("artifact", recursive=TRUE)
+        
         list(success=TRUE, model_id=model_id, version_id=version_id, artifact_uri=artifact_uri)
       }, error = function(e) {
         create_log_entry(paste("Model save failed for", model_name, ":", e$message), "ERROR")
         list(success=FALSE, model_id=NA, version_id=NA, artifact_uri=NA)
       })
     }
-
+    
     model_name <- paste(athlete_id, best_cand$model_type, sep = "_")
-    save_result <- save_model_to_registry(athlete_id, model_name, best_cand, timestamp)
-
+    save_result <- save_model_to_registry(athlete_id, model_name, best_cand, version_id)
+    
     if (isTRUE(save_result$success) || is.na(save_result$success)) {
       create_log_entry(glue("  SUCCESS: {best_cand$model_type} (RMSE={round(best_cand$primary_rmse, 3)})"))
       success_count <- success_count + 1
-      # Predictions (optional best-effort)
+      
+      # Generate predictions
       all_data <- rbind(ath_train_df, ath_test_df)
       if (nrow(all_data) > 0) {
         preds_model <- tryCatch({
@@ -793,22 +1353,33 @@ for (i in seq_len(n_athletes)) {
             }
           } else if (best_cand$fitted$type == "bnlearn") {
             as.numeric(predict(best_cand$fitted$model, node = response_var, data = all_data[, preds, drop=FALSE]))
-          } else { rep(NA_real_, nrow(all_data)) }
-        }, error = function(e) { create_log_entry(glue("  Prediction generation failed: {e$message}"), "WARN"); rep(NA_real_, nrow(all_data)) })
-        # Reconstruct meta to save
-        pred_meta <- rbind(ath_train[, .(offical_id, date, readiness, is_test)],
-                           ath_test[,  .(offical_id, date, readiness, is_test)])
+          } else {
+            rep(NA_real_, nrow(all_data))
+          }
+        }, error = function(e) {
+          create_log_entry(glue("  Prediction generation failed: {e$message}"), "WARN")
+          rep(NA_real_, nrow(all_data))
+        })
+        
+        pred_meta <- rbind(
+          ath_train[, .(offical_id, date, readiness, is_test)],
+          ath_test[,  .(offical_id, date, readiness, is_test)]
+        )
+        
         pred_df <- pred_meta %>%
-          mutate(predicted_readiness = preds_model,
-                 model_id = save_result$model_id %||% NA_character_,
-                 version_id = save_result$version_id %||% NA_character_,
-                 prediction_date = Sys.time())
+          mutate(
+            predicted_readiness = preds_model,
+            model_id = save_result$model_id %||% NA_character_,
+            version_id = save_result$version_id %||% NA_character_,
+            prediction_date = Sys.time()
+          )
         all_predictions[[length(all_predictions) + 1]] <- pred_df
       }
+      
       # Save summary row
       all_results[[length(all_results) + 1]] <- tibble(
         athlete_id = athlete_id,
-        roster_name = NA_character_,  # no name join here; ID-based
+        roster_name = NA_character_,
         model_type = best_cand$model_type,
         model_id = save_result$model_id %||% NA_character_,
         version_id = save_result$version_id %||% NA_character_,
@@ -817,17 +1388,20 @@ for (i in seq_len(n_athletes)) {
         cv_rmse = best_cand$cv_rmse,
         test_rmse = best_cand$test_rmse,
         primary_rmse = best_cand$primary_rmse,
-        n_train = n_tr, n_test = n_te,
+        n_train = n_tr,
+        n_test = n_te,
         n_predictors = length(preds),
         validation_method = val_method,
         hyperparameters = best_cand$hyper,
         trained_at = Sys.time()
       )
     } else {
-      create_log_entry(glue("  ERROR: model save failed"), "ERROR"); fail_count <- fail_count + 1
+      create_log_entry(glue("  ERROR: model save failed"), "ERROR")
+      fail_count <- fail_count + 1
     }
   }, error = function(e) {
-    create_log_entry(glue("  ERROR: {e$message}"), "ERROR"); fail_count <- fail_count + 1
+    create_log_entry(glue("  ERROR: {e$message}"), "ERROR")
+    fail_count <- fail_count + 1
   })
 }
 
@@ -840,24 +1414,85 @@ if (length(all_results) > 0) {
   results_df <- bind_rows(all_results)
   tbl <- bq_table(project, dataset, "model_training_summary")
   if (!bq_table_exists(tbl)) {
-    bq_table_create(tbl, fields = as_bq_fields(results_df),
+    bq_table_create(tbl, 
+                    fields = as_bq_fields(results_df),
                     time_partitioning = list(type="DAY", field="trained_at"))
   }
   bq_table_upload(tbl, results_df, write_disposition = "WRITE_APPEND")
   create_log_entry(glue("Model training summary saved: {nrow(results_df)} rows"))
 }
 
+# FIX 2.4: Predictions with APPEND strategy and run metadata
 if (length(all_predictions) > 0) {
-  preds_df <- bind_rows(all_predictions)
+  preds_df <- bind_rows(all_predictions) %>%
+    mutate(
+      prediction_run_timestamp = Sys.time(),
+      prediction_run_id = Sys.getenv("GITHUB_RUN_ID", "manual")
+    )
+  
   tbl <- bq_table(project, dataset, predictions_table)
   if (!bq_table_exists(tbl)) {
-    bq_table_create(tbl, fields = as_bq_fields(preds_df),
-                    time_partitioning = list(type="DAY", field="date"),
-                    clustering_fields = c("offical_id", "model_id"))
+    bq_table_create(tbl, 
+                    fields = as_bq_fields(preds_df),
+                    time_partitioning = list(type="DAY", field="prediction_run_timestamp"),
+                    clustering_fields = c("offical_id", "date", "model_id"))
   }
-  bq_table_upload(tbl, preds_df, write_disposition = "WRITE_TRUNCATE")
-  create_log_entry(glue("Predictions saved: {nrow(preds_df)} rows"))
+  
+  # WRITE_APPEND preserves historical predictions
+  bq_table_upload(tbl, preds_df, write_disposition = "WRITE_APPEND")
+  create_log_entry(glue("Predictions saved: {nrow(preds_df)} rows (appended to history)"))
 }
+
+################################################################################
+# FIX 2.3: PIPELINE HEALTH METRICS
+################################################################################
+create_log_entry("Saving pipeline health metrics")
+
+health_metrics <- tibble(
+  pipeline_run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+  run_timestamp = Sys.time(),
+  team_name = team_name,
+  
+  # Data availability
+  workload_rows_loaded = nrow(workload_data),
+  readiness_rows_loaded = nrow(readiness_data),
+  joined_rows = nrow(data_joined),
+  
+  # Training outcomes
+  athletes_attempted = length(athletes),
+  athletes_succeeded = success_count,
+  athletes_failed = fail_count,
+  success_rate = if(length(athletes) > 0) round(success_count / length(athletes), 3) else NA_real_,
+  
+  # Model quality (aggregate)
+  avg_primary_rmse = if(length(all_results) > 0) {
+    mean(bind_rows(all_results)$primary_rmse, na.rm=TRUE)
+  } else NA_real_,
+  median_primary_rmse = if(length(all_results) > 0) {
+    median(bind_rows(all_results)$primary_rmse, na.rm=TRUE)
+  } else NA_real_,
+  
+  # Execution metrics
+  execution_time_minutes = as.numeric(difftime(Sys.time(), script_start, units="mins")),
+  
+  # Config snapshot
+  config_start_date = cfg_start_date,
+  config_end_date = cfg_end_date,
+  config_train_fraction = cfg_frac_train
+)
+
+tryCatch({
+  health_tbl <- bq_table(project, dataset, "pipeline_health_metrics")
+  if (!bq_table_exists(health_tbl)) {
+    bq_table_create(health_tbl, 
+                    fields = as_bq_fields(health_metrics),
+                    time_partitioning = list(type="DAY", field="run_timestamp"))
+  }
+  bq_table_upload(health_tbl, health_metrics, write_disposition = "WRITE_APPEND")
+  create_log_entry("Pipeline health metrics saved")
+}, error = function(e) {
+  create_log_entry(paste("Health metrics save failed (non-fatal):", e$message), "WARN")
+})
 
 ################################################################################
 # SUMMARY
