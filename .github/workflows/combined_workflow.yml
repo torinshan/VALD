@@ -27,9 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # ---- GCP / BigQuery ----
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
-      BQ_LOCATION: ${{ secrets.BQ_LOCATION || 'US' }}
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET:  analytics
+      BQ_LOCATION: US
       BQ_TABLE:    ${{ secrets.BQ_TABLE }}
       BQ_WRITE_MODE: ${{ secrets.BQ_WRITE_MODE }}
       # ---- OneDrive public link ----
@@ -108,11 +108,11 @@ jobs:
     if: needs.ingest.outputs.status == 'success'
     
     env:
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
-      BQ_LOCATION: ${{ secrets.BQ_LOCATION || 'US' }}
-      READINESS_TABLE: ${{ vars.READINESS_TABLE }}
-      WORKLOAD_TABLE:  ${{ vars.WORKLOAD_TABLE }}
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET:  analytics
+      BQ_LOCATION: US
+      WORKLOAD_TABLE:  workload_daily
+      READINESS_TABLE: ml_builder_readiness
       ROSTER_TABLE:    ${{ vars.ROSTER_TABLE }}
     
     steps:
@@ -134,34 +134,77 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Required env
-          : "${GCP_PROJECT:?GCP_PROJECT is required}"
-          : "${BQ_DATASET:?BQ_DATASET is required}"
-          : "${WORKLOAD_TABLE:?WORKLOAD_TABLE is required}"
-          : "${READINESS_TABLE:?READINESS_TABLE is required}"
-          : "${ROSTER_TABLE:?ROSTER_TABLE is required}"
-          : "${BQ_LOCATION:=US}"
-
-          echo "Using project: $GCP_PROJECT"
-          echo "Dataset: $BQ_DATASET"
-          echo "Location: $BQ_LOCATION"
-          echo "Tables:"
-          echo "  • workload:  $WORKLOAD_TABLE"
-          echo "  • readiness: $READINESS_TABLE"
-          echo "  • roster:    $ROSTER_TABLE"
-
-          bq version || true
-          gcloud --version || true
-          echo "Active account(s):"
-          gcloud auth list
-
-          echo "Verifying dataset access..."
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
-
-          # jq if needed
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y jq
+          echo "🔍 Checking for workload ↔ readiness matches (by name & date)..."
+          
+          # Build query using name_norm (LOWER(TRIM(roster_name))) from workload
+          # and full_name_norm from readiness view
+          read -r -d '' MATCH_QUERY <<'SQL'
+          WITH recent_workload AS (
+            SELECT DISTINCT
+              LOWER(TRIM(roster_name)) AS name_norm,
+              DATE(date) AS date
+            FROM `@PROJECT.@DATASET.@WORKLOAD`
+            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          ),
+          readiness_recent AS (
+            SELECT DISTINCT
+              full_name_norm AS name_norm,
+              DATE(date) AS date
+            FROM `@PROJECT.@DATASET.@READINESS`
+            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          ),
+          matched AS (
+            SELECT w.name_norm, w.date
+            FROM recent_workload w
+            JOIN readiness_recent r
+              ON r.name_norm = w.name_norm
+             AND r.date = w.date
+          )
+          SELECT
+            COUNT(DISTINCT name_norm) AS athletes_with_matches,
+            COUNT(*) AS total_matches,
+            MIN(date) AS earliest_match,
+            MAX(date) AS latest_match
+          FROM matched
+          SQL
+          
+          # Replace placeholders with real values
+          MATCH_QUERY="${MATCH_QUERY//@PROJECT/$GCP_PROJECT}"
+          MATCH_QUERY="${MATCH_QUERY//@DATASET/$BQ_DATASET}"
+          MATCH_QUERY="${MATCH_QUERY//@WORKLOAD/$WORKLOAD_TABLE}"
+          MATCH_QUERY="${MATCH_QUERY//@READINESS/$READINESS_TABLE}"
+          
+          echo "–––– SQL ––––"
+          echo "$MATCH_QUERY"
+          echo "––––––––––––––"
+          
+          # Dry-run check (fail fast on bad refs)
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
+             --use_legacy_sql=false --dry_run "$MATCH_QUERY" >/dev/null
+          echo "✅ Dry run OK"
+          
+          # Execute for real
+          RESULT_JSON=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
+                            --use_legacy_sql=false --format=json "$MATCH_QUERY")
+          
+          ATHLETES=$(echo "$RESULT_JSON" | jq -r '.[0].athletes_with_matches // 0')
+          MATCHES=$(echo "$RESULT_JSON" | jq -r '.[0].total_matches // 0')
+          EARLIEST=$(echo "$RESULT_JSON" | jq -r '.[0].earliest_match // "none"')
+          LATEST=$(echo "$RESULT_JSON" | jq -r '.[0].latest_match // "none"')
+          
+          echo "📊 Matches: $MATCHES rows across $ATHLETES athletes ($EARLIEST → $LATEST)"
+          
+          if [ "$MATCHES" -gt 0 ]; then
+            echo "✅ Found matching data – models can train"
+            echo "has_matches=true" >> "$GITHUB_OUTPUT"
+            echo "match_count=$MATCHES" >> "$GITHUB_OUTPUT"
+            echo "athlete_count=$ATHLETES" >> "$GITHUB_OUTPUT"
+          else
+            echo "⏭️  No matching readiness data – skipping model training"
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
+
 
           # Build query via HERE-DOC with token substitution
           read -r -d '' MATCH_QUERY <<'SQL'
@@ -281,17 +324,17 @@ jobs:
     
     env:
       # ---- GCP / BigQuery ----
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-      BQ_DATASET:  ${{ secrets.BQ_DATASET }}
-      BQ_LOCATION: ${{ secrets.BQ_LOCATION || 'US' }}
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET:  analytics
+      BQ_LOCATION: US
       GCS_BUCKET:  ${{ secrets.GCS_BUCKET }}
       TEAM_NAME:   ${{ vars.TEAM_NAME }}
       
       # ---- Table names ----
-      WORKLOAD_TABLE:    ${{ vars.WORKLOAD_TABLE }}
-      READINESS_TABLE:   ${{ vars.READINESS_TABLE }}
-      ROSTER_TABLE:      ${{ vars.ROSTER_TABLE }}
-      PREDICTIONS_TABLE: ${{ vars.PREDICTIONS_TABLE }}
+      WORKLOAD_TABLE:  workload_daily
+      READINESS_TABLE: ml_builder_readiness
+      ROSTER_TABLE:    roster_mapping
+      PREDICTIONS_TABLE: readiness_predictions_byname
       
       # ---- Model training config ----
       START_DATE:     ${{ github.event.inputs.start_date || '2025-06-01' }}
