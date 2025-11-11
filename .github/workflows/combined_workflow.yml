@@ -366,8 +366,7 @@ jobs:
           
           echo ""
           echo "📈 Latest Models:"
-          b
-q query --use_legacy_sql=false --max_rows=10 \
+          bq query --use_legacy_sql=false --max_rows=10 \
             "SELECT 
                athlete_id,
                roster_name,
