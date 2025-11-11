@@ -308,4 +308,175 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Auth to Google Cloud
-        uses: google-github-actions/au
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+      
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install scikit-learn==1.5.1 numpy==1.26.4
+      
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+      
+      - name: Install R deps (cached)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          use-public-rspm: true
+          cache-version: 1
+          extra-packages: |
+            any::bigrquery
+            any::DBI
+            any::dplyr
+            any::tidyr
+            any::data.table
+            any::lubridate
+            any::slider
+            any::stringr
+            any::gargle
+            any::glue
+            any::digest
+            any::googleCloudStorageR
+            any::glmnet
+            any::bnlearn
+            any::reticulate
+      
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      
+      - name: Run model training
+        run: Rscript ".github/scripts/readiness_models.R"
+      
+      - name: Check training success
+        if: success()
+        run: |
+          echo "✅ Model training completed successfully"
+          echo ""
+          echo "📊 Trained on ${{ needs.check-readiness.outputs.match_count }} workload-readiness matches"
+          echo "   across ${{ needs.check-readiness.outputs.athlete_count }} athletes"
+          
+          gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+          
+          echo ""
+          echo "📈 Latest Models:"
+          bq --location="${{ secrets.BQ_LOCATION || 'US' }}" query --use_legacy_sql=false --max_rows=10 \
+            "SELECT 
+               athlete_id,
+               roster_name,
+               model_type,
+               ROUND(primary_rmse, 3) as rmse,
+               n_train,
+               FORMAT_TIMESTAMP('%H:%M', trained_at) as time
+             FROM \`${{ secrets.GCP_PROJECT }}.${{ secrets.BQ_DATASET }}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()
+             ORDER BY trained_at DESC
+             LIMIT 10" || echo "No training results yet"
+          
+          echo ""
+          echo "📊 Today's Training Stats:"
+          bq --location="${{ secrets.BQ_LOCATION || 'US' }}" query --use_legacy_sql=false \
+            "SELECT 
+               COUNT(DISTINCT athlete_id) as athletes_trained,
+               COUNT(*) as total_models,
+               ROUND(AVG(primary_rmse), 3) as avg_rmse,
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run
+             FROM \`${{ secrets.GCP_PROJECT }}.${{ secrets.BQ_DATASET }}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
+      
+      - name: Check for failures
+        if: failure()
+        run: |
+          echo "❌ Model training failed"
+          echo "Check logs in BigQuery: ${{ secrets.GCP_PROJECT }}.${{ secrets.BQ_DATASET }}.model_training_log"
+          gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS" || true
+          bq --location="${{ secrets.BQ_LOCATION || 'US' }}" query --use_legacy_sql=false --max_rows=10 \
+            "SELECT 
+               FORMAT_TIMESTAMP('%H:%M:%S', timestamp) as time,
+               level, 
+               message
+             FROM \`${{ secrets.GCP_PROJECT }}.${{ secrets.BQ_DATASET }}.model_training_log\`
+             WHERE level = 'ERROR' 
+               AND DATE(timestamp) = CURRENT_DATE()
+             ORDER BY timestamp DESC
+             LIMIT 10" || echo "Could not query error logs"
+
+  # ============================================================================
+  # JOB 4: SUMMARY (always runs)
+  # ============================================================================
+  summary:
+    runs-on: ubuntu-latest
+    needs: [ingest, check-readiness, train-models]
+    if: always()
+    
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "    WORKLOAD & MODEL PIPELINE SUMMARY"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo ""
+          echo "🔹 Workload Ingest:     ${{ needs.ingest.result }}"
+          echo "🔹 Readiness Check:     ${{ needs.check-readiness.result }}"
+          echo "🔹 Model Training:      ${{ needs.train-models.result }}"
+          echo ""
+          
+          if [ "${{ needs.ingest.result }}" != "success" ]; then
+            echo "❌ INGEST FAILED - Check workload ingest logs"
+            exit 1
+          
+          elif [ "${{ needs.check-readiness.result }}" == "skipped" ]; then
+            echo "⏭️  PIPELINE SKIPPED - Ingest failed, no readiness check performed"
+            exit 1
+          
+          elif [ "${{ needs.check-readiness.outputs.has_matches }}" != "true" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "⏭️  TRAINING SKIPPED - No matching readiness data found"
+            echo ""
+            echo "💡 This is normal! Readiness testing happens weekly."
+            echo "   Workload data is saved and models will train when"
+            echo "   new readiness data becomes available."
+            exit 0
+          
+          elif [ "${{ needs.train-models.result }}" == "skipped" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ READINESS CHECK - Found ${{ needs.check-readiness.outputs.match_count }} matches"
+            echo "⏭️  TRAINING SKIPPED - Manual skip requested"
+            exit 0
+          
+          elif [ "${{ needs.train-models.result }}" == "success" ]; then
+            echo "✅ PIPELINE COMPLETE - All jobs succeeded!"
+            echo ""
+            echo "📊 Summary:"
+            echo "   • Workload data: Updated"
+            echo "   • Matches found: ${{ needs.check-readiness.outputs.match_count }}"
+            echo "   • Athletes trained: ${{ needs.check-readiness.outputs.athlete_count }}"
+            echo "   • Models: Saved to GCS"
+            echo "   • Predictions: Upserted to BigQuery"
+            exit 0
+          
+          elif [ "${{ needs.train-models.result }}" == "failure" ]; then
+            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ READINESS CHECK - Found ${{ needs.check-readiness.outputs.match_count }} matches"
+            echo "❌ TRAINING FAILED - Check model training logs"
+            echo ""
+            echo "⚠️  Workload data is saved, but models couldn't be trained."
+            echo "   Review error logs in BigQuery or GitHub Actions."
+            exit 0
+          
+          else
+            echo "⚠️  UNKNOWN STATUS - Check individual job logs"
+            exit 1
+          fi
