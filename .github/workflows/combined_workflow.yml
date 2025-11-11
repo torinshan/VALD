@@ -32,7 +32,7 @@ env:
   WORKLOAD_TABLE:  workload_daily
   READINESS_TABLE: vald_fd_jumps          # raw VALD table
   ROSTER_TABLE:    roster_mapping         # has offical_id and `Vald Name`
-  PREDICTIONS_TABLE: readiness_predictions_byname  # if writing name-keyed preds (optional)
+  PREDICTIONS_TABLE: readiness_predictions_byname
 
   # Other constants
   TEAM_NAME: sacstate-football
@@ -98,6 +98,8 @@ jobs:
 
   # ============================================================================
   # JOB 2: CHECK FOR READINESS DATA MATCH (ID-based via roster mapping)
+  # FIX 1.4: Enhanced error handling
+  # FIX: Removed dry-run components - direct execution only
   # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
@@ -122,7 +124,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
-      - name: Preflight: validate env & resources
+      - name: Preflight validation
         id: preflight
         shell: bash
         env:
@@ -135,14 +137,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Env:"
+          echo "=== Environment Configuration ==="
           echo "  GCP_PROJECT=$GCP_PROJECT"
           echo "  BQ_DATASET=$BQ_DATASET"
           echo "  BQ_LOCATION=$BQ_LOCATION"
           echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
           echo "  READINESS_TABLE=$READINESS_TABLE"
           echo "  ROSTER_TABLE=$ROSTER_TABLE"
+          echo ""
 
+          # Validate required env vars
           : "${GCP_PROJECT:?GCP_PROJECT is required}"
           : "${BQ_DATASET:?BQ_DATASET is required}"
           : "${BQ_LOCATION:?BQ_LOCATION is required}"
@@ -150,23 +154,93 @@ jobs:
           : "${READINESS_TABLE:?READINESS_TABLE is required}"
           : "${ROSTER_TABLE:?ROSTER_TABLE is required}"
 
+          echo "✅ Environment variables validated"
+          echo ""
+
+          # Check dataset exists
           echo "Checking dataset exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
+          echo "✅ Dataset exists"
 
+          # Check workload table exists
           echo "Checking workload table exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
+          echo "✅ Workload table exists"
 
+          # Check readiness table exists
           echo "Checking readiness table exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          echo "✅ Readiness table exists"
 
+          # Check roster table exists
           echo "Checking roster table exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
+          echo "✅ Roster table exists"
+          echo ""
 
-          echo "Preflight OK"
+      # FIX 1.4: Validate roster mapping table
+      - name: Validate roster mapping table
+        shell: bash
+        env:
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET:  ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
+        run: |
+          set -euo pipefail
+          
+          echo "🔍 Validating roster mapping table..."
+          
+          # Check table has data
+          ROSTER_COUNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+            query --use_legacy_sql=false --format=csv \
+            "SELECT COUNT(*) as cnt FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`" \
+            | tail -n1)
+          
+          if [ "$ROSTER_COUNT" -eq 0 ]; then
+            echo "❌ ERROR: Roster mapping table is empty - cannot perform ID mapping"
+            echo "Please populate ${ROSTER_TABLE} with offical_id and 'Vald Name' mappings"
+            exit 1
+          fi
+          
+          echo "✅ Roster table has $ROSTER_COUNT mappings"
+          
+          # Validate required columns exist
+          echo "Validating required columns..."
+          
+          SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
+            --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
+          
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^offical_id$" || {
+            echo "❌ ERROR: Column 'offical_id' not found in roster_mapping"
+            echo "Available columns:"
+            echo "$SCHEMA" | jq -r '.[].name'
+            exit 1
+          }
+          
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^Vald Name$" || {
+            echo "❌ ERROR: Column 'Vald Name' not found in roster_mapping"
+            echo "💡 Note: Column name must be exactly 'Vald Name' (with space)"
+            echo "Available columns:"
+            echo "$SCHEMA" | jq -r '.[].name'
+            exit 1
+          }
+          
+          echo "✅ All required columns present"
+          
+          # Show sample mappings for verification
+          echo ""
+          echo "📋 Sample mappings (first 5):"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+            query --use_legacy_sql=false --format=pretty \
+            "SELECT offical_id, \`Vald Name\` 
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\` 
+             LIMIT 5"
 
+      # FIX: Removed dry-run - direct execution only
       - name: Check for matching readiness data (offical_id + date via roster mapping)
         id: check
         shell: bash
@@ -233,22 +307,7 @@ jobs:
            AND rd.date       = w.date
           "
 
-          echo "–––– SQL ––––"
-          echo "$MATCH_QUERY"
-          echo "––––––––––––––"
-
-          echo "Dry run…"
-          if ! DRYRUN_OUT="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
-                --use_legacy_sql=false --dry_run "$MATCH_QUERY" 2>&1)"; then
-            echo "❌ BigQuery dry run failed"
-            echo "$DRYRUN_OUT"
-            echo "has_matches=false" >> "$GITHUB_OUTPUT"
-            echo "reason=query_invalid" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          echo "✅ Dry run OK"
-
-          echo "Executing…"
+          echo "Executing query…"
           if ! RESULT_JSON="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
                 --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)"; then
             echo "❌ BigQuery execution failed"
@@ -287,6 +346,7 @@ jobs:
 
   # ============================================================================
   # JOB 3: MODEL TRAINING (only if matches found and not manually skipped)
+  # FIX 1.2: Updated path to readiness_models_cloud.R
   # ============================================================================
   train-models:
     runs-on: ubuntu-latest
@@ -346,6 +406,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
 
+      # FIX 1.2: Path updated to readiness_models_cloud.R
       - name: Run model training
         env:
           # constants
@@ -370,9 +431,9 @@ jobs:
 
           # secrets
           GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}   # <-- secret, not a literal
-        run: Rscript ".github/scripts/readiness_models.R"
+        run: Rscript ".github/scripts/readiness_models_cloud.R"
 
-      - name: Show today’s training summary (best-effort)
+      - name: Show today's training summary (best-effort)
         if: success()
         env:
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
@@ -464,3 +525,4 @@ jobs:
           else
             echo "⚠️  UNKNOWN STATUS - Check individual job logs"
             exit 1
+          fi
