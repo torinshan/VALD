@@ -1,8 +1,8 @@
 #!/usr/bin/env Rscript
 
 # ──────────────────────────────────────────────────────────────────────────────
-# WORKLOAD INGEST — EXACT COLUMNS, NO HEURISTICS
-# Uses your provided headers (after janitor::clean_names()):
+# WORKLOAD INGEST — XLSX/CSV from OneDrive/SharePoint (public link)
+# Uses post-cleaned field names:
 #   roster_name, date, distance_yd, high_speed_distance, mechanical_load
 # Builds daily features and MERGE-upserts into analytics.workload_daily
 # ──────────────────────────────────────────────────────────────────────────────
@@ -11,8 +11,9 @@
 tryCatch({
   suppressPackageStartupMessages({
     library(bigrquery); library(DBI)
-    library(dplyr); library(tidyr); library(readr); library(stringr)
-    library(tibble); library(lubridate); library(slider); library(janitor)
+    library(dplyr); library(tidyr); library(readr); library(readxl)
+    library(stringr); library(tibble); library(lubridate)
+    library(slider); library(janitor)
     library(httr); library(gargle); library(glue)
   })
 }, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
@@ -36,7 +37,7 @@ cat("BQ Location:", location, "\n")
 cat("BQ Table:", table_out, "\n")
 cat("Write mode:", write_mode, "\n")
 
-# ===== Logging (simple) =====
+# ===== Logging =====
 log <- function(msg, lvl="INFO"){
   ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz="UTC")
   cat(sprintf("[%s] [%s] %s\n", ts, lvl, msg))
@@ -71,19 +72,6 @@ refresh_token <- function(){
 }
 
 # ===== Helpers =====
-download_public_onedrive <- function(url){
-  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
-  tf <- tempfile(fileext = ".csv")
-  dl <- if (grepl("\\?", url)) paste0(url,"&download=1") else paste0(url,"?download=1")
-  r1 <- httr::GET(dl, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
-  if (httr::http_error(r1) || file.info(tf)$size < 50) {
-    r2 <- httr::GET(url, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
-    if (httr::http_error(r2)) stop("Failed to download CSV")
-  }
-  tf
-}
-
-# Robust date parser for vectors
 parse_date_robust <- function(x){
   if (inherits(x,"Date"))   return(x)
   if (inherits(x,"POSIXt")) return(as.Date(x))
@@ -116,23 +104,87 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=c("ro
   log(glue("Created {tbl$table} (partition={partition_field}; cluster={paste(cl %||% '', collapse=',')})"))
 }
 
-# ===== Read CSV =====
-csv_path <- tryCatch({
-  if (nzchar(public_url)) { log("Downloading CSV via public OneDrive/SharePoint (no auth)"); download_public_onedrive(public_url) }
-  else if (nzchar(local_file)) { log(glue("Reading local file: {local_file}")); local_file }
-  else stop("Provide ONEDRIVE_PUBLIC_URL or LOCAL_FILE_PATH")
-}, error=function(e){ log(paste("CSV fetch failed:", e$message),"ERROR"); quit(status=1) })
+# Download file from OneDrive/SharePoint (force download, follow redirects)
+download_public_file <- function(url) {
+  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
+  tf <- tempfile(fileext = "")  # we'll infer type
+  final <- if (grepl("\\?", url)) paste0(url,"&download=1") else paste0(url,"?download=1")
+  r <- httr::GET(final, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180), httr::add_headers(Accept="*/*"))
+  if (httr::http_error(r)) {
+    # try original
+    r2 <- httr::GET(url, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180), httr::add_headers(Accept="*/*"))
+    httr::stop_for_status(r2)
+  }
+  ctype <- httr::headers(r)[["content-type"]]
+  if (is.null(ctype)) ctype <- ""
+  sig <- tryCatch(readBin(tf, what="raw", n=4), error=function(e) raw(0))
 
-raw <- tryCatch({
-  readr::read_csv(csv_path, show_col_types = FALSE)
-}, error=function(e){ log(paste("CSV parse error:", e$message), "ERROR"); quit(status=1) })
+  list(path=tf, content_type=ctype, signature=sig)
+}
 
-# ===== Transform (use known headers after clean_names) =====
-raw_std <- raw %>% janitor::clean_names()
+# Try reading XLSX/CSV; auto-pick the sheet with roster_name + date
+read_any_tabular <- function(fetch) {
+  is_html <- grepl("text/html", fetch$content_type, ignore.case = TRUE)
+  # XLSX if content-type says so or ZIP signature "PK"
+  is_xlsx <- grepl("spreadsheetml|application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                   fetch$content_type, ignore.case=TRUE) ||
+             (length(fetch$signature) >= 2 && rawToChar(fetch$signature[1:2]) == "PK")
 
-log(glue("CSV columns (cleaned): {paste(names(raw_std), collapse=', ')}"))
+  if (is_html) {
+    log("Got HTML (viewer page) instead of a file. Ensure the link is public and has ?download=1", "ERROR")
+    stop("HTML response from OneDrive link.")
+  }
 
-# Hard requirements (per your schema)
+  if (nzchar(local_file)) {
+    # local file path short-circuit handled outside; keeping for clarity
+    log(glue("Reading local file: {local_file}"))
+  }
+
+  if (is_xlsx || grepl("\\.xlsx$", fetch$path, ignore.case=TRUE)) {
+    log("Detected XLSX file; scanning sheets to find roster_name/date")
+    sh <- readxl::excel_sheets(fetch$path)
+    if (length(sh) == 0) stop("No sheets in XLSX")
+    for (s in sh) {
+      df <- tryCatch(readxl::read_excel(fetch$path, sheet=s), error=function(e) NULL)
+      if (is.null(df)) next
+      dfc <- janitor::clean_names(df)
+      if (all(c("roster_name") %in% names(dfc)) && any(c("date") %in% names(dfc))) {
+        log(glue("Using sheet: {s}"))
+        return(dfc)
+      }
+    }
+    # Fallback to first sheet if not found; caller will error with column list
+    log("Could not find a sheet with roster_name/date; using first sheet", "WARN")
+    return(janitor::clean_names(readxl::read_excel(fetch$path, sheet = 1)))
+  }
+
+  log("Detected CSV or unknown; reading with readr::read_csv")
+  return(janitor::clean_names(readr::read_csv(fetch$path, show_col_types = FALSE)))
+}
+
+# ===== Read data (local overrides URL) =====
+raw_std <- NULL
+if (nzchar(local_file)) {
+  if (grepl("\\.xlsx$", local_file, ignore.case=TRUE)) {
+    log(glue("Reading local XLSX: {local_file}"))
+    tmp <- readxl::read_excel(local_file, sheet = 1)
+    raw_std <- janitor::clean_names(tmp)
+  } else {
+    log(glue("Reading local CSV: {local_file}"))
+    tmp <- readr::read_csv(local_file, show_col_types = FALSE)
+    raw_std <- janitor::clean_names(tmp)
+  }
+} else if (nzchar(public_url)) {
+  log("Downloading from OneDrive/SharePoint (public link)…")
+  fetched <- download_public_file(public_url)
+  raw_std <- read_any_tabular(fetched)
+} else {
+  stop("Provide ONEDRIVE_PUBLIC_URL or LOCAL_FILE_PATH")
+}
+
+log(glue("Columns (cleaned): {paste(names(raw_std), collapse=', ')}"))
+
+# ===== Validate required columns =====
 required <- c("roster_name", "date")
 missing  <- setdiff(required, names(raw_std))
 if (length(missing) > 0) {
@@ -140,7 +192,7 @@ if (length(missing) > 0) {
   quit(status=1)
 }
 
-# Metrics — present in your file list; still guard to never hard fail
+# Metrics (present in your export; still guarded)
 distance_col <- if ("distance_yd" %in% names(raw_std)) "distance_yd" else NULL
 hsd_col      <- if ("high_speed_distance" %in% names(raw_std)) "high_speed_distance" else NULL
 ml_col       <- if ("mechanical_load" %in% names(raw_std)) "mechanical_load" else NULL
@@ -148,6 +200,7 @@ if (is.null(distance_col)) log("distance_yd not found; defaulting to 0s", "WARN"
 if (is.null(hsd_col))      log("high_speed_distance not found; defaulting to 0s", "WARN")
 if (is.null(ml_col))       log("mechanical_load not found; defaulting to 0s", "WARN")
 
+# ===== Transform → features
 work_data0 <- raw_std %>%
   transmute(
     roster_name = .data[["roster_name"]],
@@ -218,14 +271,12 @@ tryCatch({
   ds  <- bq_dataset(project, dataset)
   tbl <- bq_table(ds, table_out)
 
-  # Ensure table exists (partition on date, cluster by roster_name)
   ensure_table(tbl, work_data, partition_field="date", cluster_fields=c("roster_name"))
 
   if (write_mode == "TRUNCATE") {
     bq_table_upload(tbl, work_data, write_disposition = "WRITE_TRUNCATE")
     log("TRUNCATE upload complete.")
   } else {
-    # Pull existing, replace overlaps, keep the rest
     existing <- if (bq_table_exists(tbl)) tryCatch(bq_table_download(tbl), error=function(e) tibble()) else tibble()
     if (nrow(existing) > 0) {
       existing <- existing %>% mutate(date = as.Date(date))
