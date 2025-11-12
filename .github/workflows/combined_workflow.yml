@@ -29,10 +29,10 @@ env:
   BQ_LOCATION: US
 
   # BigQuery table names (constants; DO NOT point these to secrets)
-  WORKLOAD_TABLE:  workload_daily
-  READINESS_TABLE: vald_fd_jumps          # raw VALD table
-  ROSTER_TABLE:    roster_mapping         # has offical_id and `Vald Name`
-  PREDICTIONS_TABLE: readiness_predictions_byname
+  WORKLOAD_TABLE:      workload_daily
+  READINESS_TABLE:     vald_fd_jumps           # raw VALD table
+  ROSTER_TABLE:        roster_mapping          # has offical_id and `Vald Name`
+  PREDICTIONS_TABLE:   readiness_predictions_byname
 
   # Other constants
   TEAM_NAME: sacstate-football
@@ -49,7 +49,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
@@ -72,23 +72,50 @@ jobs:
             any::gargle
             any::glue
             any::jsonlite
+            any::httr
+            any::curl
+            any::janitor
+            any::lubridate
+            any::slider
+            any::tibble
+            any::data.table
+            any::hms
+            any::readxl
 
       - name: System libs
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq curl
+
+      # --- sanity check the public link so we don't ingest HTML by mistake
+      - name: Sanity check OneDrive link
+        env:
+          ONEDRIVE_PUBLIC_URL: "https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EfH5izRo81tHiVlwG99DEFsBzjwhTzBzQ_1_hYKgpq_VPA?download=1"
+        run: |
+          set -euo pipefail
+          echo "HEAD (may follow redirects):"
+          curl -I -L "$ONEDRIVE_PUBLIC_URL" | sed -n '1,20p'
+          echo "Sniff first 512 bytes:"
+          curl -L -s "$ONEDRIVE_PUBLIC_URL" --range 0-511 -o /tmp/sniff.bin
+          file -b /tmp/sniff.bin
+          if file -b /tmp/sniff.bin | grep -qi 'html'; then
+            echo "❌ Got HTML instead of a file — check sharing settings or URL"
+            exit 1
+          fi
 
       - name: Ingest workload (OneDrive)
         env:
-          GCP_PROJECT: sac-vald-hub
-          BQ_DATASET: analytics
-          BQ_LOCATION: US
-          WORKLOAD_TABLE: workload_daily
-          WRITE_MODE: WRITE_APPEND
-          ONEDRIVE_PUBLIC_URL: "https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EfH5izRo81tHiVlwG99DEFsBzjwhTzBzQ_1_hYKgpq_VPA?download=1"
-          LOCAL_FILE_PATH: ""   
-        run: Rscript .github/scripts/workload_ingest.R
+          # GCP/BQ (your R script reads these)
+          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
+          BQ_DATASET:    ${{ env.BQ_DATASET }}
+          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
+          BQ_TABLE:      ${{ env.WORKLOAD_TABLE }}   # <-- script expects BQ_TABLE
+          BQ_WRITE_MODE: WRITE_APPEND                 # <-- script expects BQ_WRITE_MODE
 
+          # OneDrive public link (no auth)
+          ONEDRIVE_PUBLIC_URL: "https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EfH5izRo81tHiVlwG99DEFsBzjwhTzBzQ_1_hYKgpq_VPA?download=1"
+          LOCAL_FILE_PATH: ""   # leave empty to use URL
+        run: Rscript .github/scripts/workload_ingest.R
 
       - name: Check ingest success
         id: ingest_check
@@ -101,8 +128,6 @@ jobs:
 
   # ============================================================================
   # JOB 2: CHECK FOR READINESS DATA MATCH (ID-based via roster mapping)
-  # FIX 1.4: Enhanced error handling
-  # FIX: Removed dry-run components - direct execution only
   # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
@@ -115,7 +140,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
@@ -131,133 +156,61 @@ jobs:
         id: preflight
         shell: bash
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          WORKLOAD_TABLE:  ${{ env.WORKLOAD_TABLE }}
-          READINESS_TABLE: ${{ env.READINESS_TABLE }}
-          ROSTER_TABLE:    ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
+          BQ_DATASET:    ${{ env.BQ_DATASET }}
+          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
+          WORKLOAD_TABLE:${{ env.WORKLOAD_TABLE }}
+          READINESS_TABLE:${{ env.READINESS_TABLE }}
+          ROSTER_TABLE:  ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
+          echo "=== Environment ==="
+          echo "GCP_PROJECT=$GCP_PROJECT"
+          echo "BQ_DATASET=$BQ_DATASET"
+          echo "BQ_LOCATION=$BQ_LOCATION"
+          echo "WORKLOAD_TABLE=$WORKLOAD_TABLE"
+          echo "READINESS_TABLE=$READINESS_TABLE"
+          echo "ROSTER_TABLE=$ROSTER_TABLE"
 
-          echo "=== Environment Configuration ==="
-          echo "  GCP_PROJECT=$GCP_PROJECT"
-          echo "  BQ_DATASET=$BQ_DATASET"
-          echo "  BQ_LOCATION=$BQ_LOCATION"
-          echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
-          echo "  READINESS_TABLE=$READINESS_TABLE"
-          echo "  ROSTER_TABLE=$ROSTER_TABLE"
-          echo ""
+          : "${GCP_PROJECT:?}"; : "${BQ_DATASET:?}"; : "${BQ_LOCATION:?}"
+          : "${WORKLOAD_TABLE:?}"; : "${READINESS_TABLE:?}"; : "${ROSTER_TABLE:?}"
 
-          # Validate required env vars
-          : "${GCP_PROJECT:?GCP_PROJECT is required}"
-          : "${BQ_DATASET:?BQ_DATASET is required}"
-          : "${BQ_LOCATION:?BQ_LOCATION is required}"
-          : "${WORKLOAD_TABLE:?WORKLOAD_TABLE is required}"
-          : "${READINESS_TABLE:?READINESS_TABLE is required}"
-          : "${ROSTER_TABLE:?ROSTER_TABLE is required}"
-
-          echo "✅ Environment variables validated"
-          echo ""
-
-          # Check dataset exists
-          echo "Checking dataset exists…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
-          echo "✅ Dataset exists"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
 
-          # Check workload table exists
-          echo "Checking workload table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
-            "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
-          echo "✅ Workload table exists"
-
-          # Check readiness table exists
-          echo "Checking readiness table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
-            "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
-          echo "✅ Readiness table exists"
-
-          # Check roster table exists
-          echo "Checking roster table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
-            "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
-          echo "✅ Roster table exists"
-          echo ""
-
-      # FIX 1.4: Validate roster mapping table
       - name: Validate roster mapping table
         shell: bash
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
+          BQ_DATASET:    ${{ env.BQ_DATASET }}
+          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE:  ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
-          
-          echo "🔍 Validating roster mapping table..."
-          
-          # Check table has data
-          ROSTER_COUNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
-            query --use_legacy_sql=false --format=csv \
-            "SELECT COUNT(*) as cnt FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`" \
-            | tail -n1)
-          
-          if [ "$ROSTER_COUNT" -eq 0 ]; then
-            echo "❌ ERROR: Roster mapping table is empty - cannot perform ID mapping"
-            echo "Please populate ${ROSTER_TABLE} with offical_id and 'Vald Name' mappings"
-            exit 1
+          CNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --format=csv \
+            "SELECT COUNT(*) FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`" | tail -n1)
+          if [ "$CNT" -eq 0 ]; then
+            echo "❌ roster_mapping is empty"; exit 1
           fi
-          
-          echo "✅ Roster table has $ROSTER_COUNT mappings"
-          
-          # Validate required columns exist
-          echo "Validating required columns..."
-          
-          SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
-            --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
-          
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^offical_id$" || {
-            echo "❌ ERROR: Column 'offical_id' not found in roster_mapping"
-            echo "Available columns:"
-            echo "$SCHEMA" | jq -r '.[].name'
-            exit 1
-          }
-          
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^Vald Name$" || {
-            echo "❌ ERROR: Column 'Vald Name' not found in roster_mapping"
-            echo "💡 Note: Column name must be exactly 'Vald Name' (with space)"
-            echo "Available columns:"
-            echo "$SCHEMA" | jq -r '.[].name'
-            exit 1
-          }
-          
-          echo "✅ All required columns present"
-          
-          # Show sample mappings for verification
-          echo ""
-          echo "📋 Sample mappings (first 5):"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
-            query --use_legacy_sql=false --format=pretty \
-            "SELECT offical_id, \`Vald Name\` 
-             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\` 
-             LIMIT 5"
+          SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^offical_id$' || { echo "❌ need column offical_id"; exit 1; }
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^Vald Name$' || { echo "❌ need column `Vald Name`"; exit 1; }
 
-      # FIX: Removed dry-run - direct execution only
       - name: Check for matching readiness data (offical_id + date via roster mapping)
         id: check
         shell: bash
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          GCP_PROJECT:     ${{ env.GCP_PROJECT }}
+          BQ_DATASET:      ${{ env.BQ_DATASET }}
+          BQ_LOCATION:     ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE:  ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
           ROSTER_TABLE:    ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
-          echo "🔍 Checking workload ↔ readiness (ID + same date) via roster mapping…"
-
+          echo "🔍 Matching workload ↔ readiness via roster mapping…"
           MATCH_QUERY="
           WITH workload AS (
             SELECT DISTINCT
@@ -309,34 +262,23 @@ jobs:
             ON rd.offical_id = w.offical_id
            AND rd.date       = w.date
           "
-
-          echo "Executing query…"
-          if ! RESULT_JSON="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
-                --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)"; then
+          if ! RES="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)"; then
             echo "❌ BigQuery execution failed"
-            echo "$RESULT_JSON"
+            echo "$RES"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=query_failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-
-          ATHLETES="$(echo "$RESULT_JSON" | jq -r '.[0].athletes_with_matches // 0')"
-          MATCHES="$(echo   "$RESULT_JSON" | jq -r '.[0].total_matches // 0')"
-          EARLIEST="$(echo  "$RESULT_JSON" | jq -r '.[0].earliest_match // "none"')"
-          LATEST="$(echo    "$RESULT_JSON" | jq -r '.[0].latest_match // "none"')"
-
-          echo "📊 Result:"
-          echo "  • Athletes with matches: $ATHLETES"
-          echo "  • Total matches: $MATCHES"
-          echo "  • Date range: $EARLIEST → $LATEST"
-
-          if [ "$MATCHES" -gt 0 ]; then
-            echo "✅ Found matching data – models can train"
-            echo "has_matches=true" >> "$GITHUB_OUTPUT"
-            echo "match_count=$MATCHES" >> "$GITHUB_OUTPUT"
-            echo "athlete_count=$ATHLETES" >> "$GITHUB_OUTPUT"
+          ATH="$(echo "$RES" | jq -r '.[0].athletes_with_matches // 0')"
+          MAT="$(echo "$RES" | jq -r '.[0].total_matches // 0')"
+          EAR="$(echo "$RES" | jq -r '.[0].earliest_match // "none"')"
+          LAT="$(echo "$RES" | jq -r '.[0].latest_match // "none"')"
+          echo "📊 Athletes=$ATH, Matches=$MAT, Window=$EAR → $LAT"
+          if [ "$MAT" -gt 0 ]; then
+            echo "has_matches=true"  >> "$GITHUB_OUTPUT"
+            echo "match_count=$MAT"  >> "$GITHUB_OUTPUT"
+            echo "athlete_count=$ATH" >> "$GITHUB_OUTPUT"
           else
-            echo "⏭️  No matching readiness data – training will be skipped (OK)"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
@@ -349,7 +291,6 @@ jobs:
 
   # ============================================================================
   # JOB 3: MODEL TRAINING (only if matches found and not manually skipped)
-  # FIX 1.2: Updated path to readiness_models_cloud.R
   # ============================================================================
   train-models:
     runs-on: ubuntu-latest
@@ -365,7 +306,7 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}   # <-- secret
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
@@ -409,14 +350,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
 
-      # FIX 1.2: Path updated to readiness_models_cloud.R
       - name: Run model training
         env:
           # constants
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          TEAM_NAME:   ${{ env.TEAM_NAME }}
+          GCP_PROJECT:     ${{ env.GCP_PROJECT }}
+          BQ_DATASET:      ${{ env.BQ_DATASET }}
+          BQ_LOCATION:     ${{ env.BQ_LOCATION }}
+          TEAM_NAME:       ${{ env.TEAM_NAME }}
 
           WORKLOAD_TABLE:    ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE:   ${{ env.READINESS_TABLE }}  # raw VALD table
@@ -428,12 +368,12 @@ jobs:
           TRAIN_FRACTION:    '0.80'
           MIN_TRAIN_OBS:     '3'
 
-          HAS_MATCHES:       ${{ needs.check-readiness.outputs.has_matches }}
+          HAS_MATCHES:         ${{ needs.check-readiness.outputs.has_matches }}
           MATCH_LOOKBACK_DAYS: '7'
-          SKIP_TRAINING:     ${{ github.event.inputs.skip_training || 'false' }}
+          SKIP_TRAINING:       ${{ github.event.inputs.skip_training || 'false' }}
 
           # secrets
-          GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}   # <-- secret, not a literal
+          GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}
         run: Rscript ".github/scripts/readiness_models_cloud.R"
 
       - name: Show today's training summary (best-effort)
