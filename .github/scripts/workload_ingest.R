@@ -116,11 +116,45 @@ read_any_tabular <- function(path) {
 # (Kept for completeness; won’t be used since we’re reading local)
 download_public_onedrive <- function(url) {
   if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
-  dl1 <- if (grepl("\\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
+  dl1 <- if (grepl("\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
   tf <- tempfile(fileext = ".xlsx")
   r1 <- httr::GET(dl1, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
   if (httr::http_error(r1)) stop(httr::http_status(r1)$message)
   tf
+}
+
+# ===== Date helpers =====
+parse_date_robust <- function(vec) {
+  if (is.function(vec)) stop("parse_date_robust() received a function; pass the column vector instead.")
+  if (inherits(vec, "Date"))   return(vec)
+  if (inherits(vec, "POSIXt")) return(as.Date(vec))
+  if (is.numeric(vec)) return(as.Date(vec, origin = "1899-12-30"))
+  if (is.character(vec)) {
+    v <- trimws(vec); v[nchar(v) == 0] <- NA_character_
+    suppressWarnings({
+      # Prefer American format first since source uses M/D/YYYY
+      d <- as.Date(v, format = "%m/%d/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%Y-%m-%d")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m-%d-%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d/%m/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d-%m-%Y")
+    })
+    return(d)
+  }
+  rep(as.Date(NA), length(vec))
+}
+
+monotony_roll <- function(x, idx, window_days) {
+  slider::slide_index_dbl(
+    x, idx,
+    .f = ~ {
+      m <- mean(.x, na.rm = TRUE)
+      s <- sd(.x,  na.rm = TRUE)
+      if (length(na.omit(.x)) < 2 || is.na(s) || s == 0) NA_real_ else m / s
+    },
+    .before = lubridate::days(window_days - 1),
+    .complete = FALSE
+  )
 }
 
 # ===== Load file (LOCAL_FILE_PATH only) =====
@@ -156,19 +190,24 @@ required_cols_clean <- c(
   "distance_yd","mechanical_load","high_speed_distance","decel_4"
 )
 
+# Safe date parser wrapper (returns NA on any error)
+safe_parse_date <- purrr::possibly(parse_date_robust, otherwise = as.Date(NA))
+
 work_data0 <- raw %>%
   janitor::clean_names() %>%
   dplyr::select(any_of(required_cols_clean)) %>%
   mutate(
-    date = parse_date_robust(.data[["date"]])
+    date = safe_parse_date(.data["date"])
   ) %>%
   # Ensure numeric
   mutate(
-    distance_yd         = suppressWarnings(as.numeric(.data[["distance_yd"]] %||% NA)),
-    high_speed_distance = suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% NA)),
-    mechanical_load     = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
+    distance_yd         = suppressWarnings(as.numeric(.data["distance_yd"] %||% NA)),
+    high_speed_distance = suppressWarnings(as.numeric(.data["high_speed_distance"] %||% NA)),
+    mechanical_load     = suppressWarnings(as.numeric(.data["mechanical_load"] %||% NA))
   ) %>%
+  { tmp <- .; bad <- sum(is.na(tmp$date)); if (bad > 0) create_log_entry(glue("Date parse: {bad} invalid entries (NA) detected; rows will be dropped"), "WARN"); tmp } %>%
   filter(!is.na(roster_name), !is.na(date))
+
 
 daily_sum <- work_data0 %>%
   group_by(roster_name, date) %>%
