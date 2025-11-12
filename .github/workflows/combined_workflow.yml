@@ -103,7 +103,6 @@ jobs:
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           BQ_TABLE:    ${{ env.WORKLOAD_TABLE }}
           BQ_WRITE_MODE: MERGE
-          # Read from repo; disable OneDrive path
           LOCAL_FILE_PATH: ".github/Clean_Activities_GPS.xlsx"
           ONEDRIVE_PUBLIC_URL: ""
         run: Rscript ".github/scripts/workload_ingest.R"
@@ -149,12 +148,12 @@ jobs:
         id: preflight
         shell: bash
         env:
-          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
-          BQ_DATASET:    ${{ env.BQ_DATASET }}
-          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
-          WORKLOAD_TABLE:${{ env.WORKLOAD_TABLE }}
-          READINESS_TABLE:${{ env.READINESS_TABLE }}
-          ROSTER_TABLE:  ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT:    ${{ env.GCP_PROJECT }}
+          BQ_DATASET:     ${{ env.BQ_DATASET }}
+          BQ_LOCATION:    ${{ env.BQ_LOCATION }}
+          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE:   ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
 
@@ -191,10 +190,10 @@ jobs:
       - name: Validate roster mapping table
         shell: bash
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
-          BQ_DATASET:  ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          ROSTER_TABLE:${{ env.ROSTER_TABLE }}
+          GCP_PROJECT:  ${{ env.GCP_PROJECT }}
+          BQ_DATASET:   ${{ env.BQ_DATASET }}
+          BQ_LOCATION:  ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
 
@@ -225,12 +224,12 @@ jobs:
         id: check
         shell: bash
         env:
-          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
-          BQ_DATASET:    ${{ env.BQ_DATASET }}
-          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
-          WORKLOAD_TABLE:${{ env.WORKLOAD_TABLE }}
-          READINESS_TABLE:${{ env.READINESS_TABLE }}
-          ROSTER_TABLE:  ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT:    ${{ env.GCP_PROJECT }}
+          BQ_DATASET:     ${{ env.BQ_DATASET }}
+          BQ_LOCATION:    ${{ env.BQ_LOCATION }}
+          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE:   ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
           echo "🔍 Checking workload ↔ readiness matches (by offical_id via roster, same DATE)…"
@@ -245,14 +244,14 @@ jobs:
           ),
           roster_norm AS (
             SELECT
-              TRIM(CAST(offical_id AS STRING))       AS offical_id,
-              LOWER(TRIM(\`Vald Name\`))             AS vald_full_name_norm
+              TRIM(CAST(offical_id AS STRING)) AS offical_id,
+              LOWER(TRIM(\`Vald Name\`))       AS vald_full_name_norm
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
           ),
           readiness_recent AS (
             SELECT
-              DATE(date)                               AS date,
-              LOWER(TRIM(full_name))                   AS vald_full_name_norm,
+              DATE(date)             AS date,
+              LOWER(TRIM(full_name)) AS vald_full_name_norm,
               SAFE_DIVIDE(
                 IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
                 IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
