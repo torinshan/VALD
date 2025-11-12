@@ -6,28 +6,30 @@ on:
   workflow_dispatch:
     inputs:
       skip_training:
-        description: 'Skip model training (ingest only)'
+        description: "Skip model training (ingest only)"
         required: false
         type: boolean
         default: false
       start_date:
-        description: 'Model training start date (YYYY-MM-DD)'
+        description: "Model training start date (YYYY-MM-DD)"
         required: false
-        default: '2025-06-01'
+        default: "2025-06-01"
       end_date:
-        description: 'Model training end date (YYYY-MM-DD)'
+        description: "Model training end date (YYYY-MM-DD)"
         required: false
-        default: '2025-12-31'
+        default: "2025-12-31"
 
 env:
+  # GCP / BigQuery configuration
   GCP_PROJECT: sac-vald-hub
-  BQ_DATASET:  analytics
+  BQ_DATASET: analytics
   BQ_LOCATION: US
 
-  WORKLOAD_TABLE:      workload_daily
-  READINESS_TABLE:     vald_fd_jumps
-  ROSTER_TABLE:        roster_mapping
-  PREDICTIONS_TABLE:   readiness_predictions_byname
+  # BigQuery table names
+  WORKLOAD_TABLE: workload_daily
+  READINESS_TABLE: vald_fd_jumps
+  ROSTER_TABLE: roster_mapping
+  PREDICTIONS_TABLE: readiness_predictions_byname
 
   TEAM_NAME: sacstate-football
 
@@ -83,20 +85,22 @@ jobs:
           ONEDRIVE_PUBLIC_URL: "https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EfH5izRo81tHiVlwG99DEFsBzjwhTzBzQ_1_hYKgpq_VPA?download=1"
         run: |
           set -euo pipefail
+          echo "HEAD:"
           curl -I -L "$ONEDRIVE_PUBLIC_URL" | sed -n '1,20p'
-          curl -L -s "$ONEDRIVE_PUBLIC_URL" --range 0-511 -o /tmp/sniff.bin
+            curl -L -s "$ONEDRIVE_PUBLIC_URL" --range 0-511 -o /tmp/sniff.bin
           if file -b /tmp/sniff.bin | grep -qi 'html'; then
-            echo "❌ Got HTML instead of a file — check sharing settings or URL"
+            echo "❌ Got HTML instead of expected data file"
             exit 1
           fi
 
       - name: Ingest workload (OneDrive)
         env:
-          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
-          BQ_DATASET:    ${{ env.BQ_DATASET }}
-          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
-          BQ_TABLE:      ${{ env.WORKLOAD_TABLE }}
-          BQ_WRITE_MODE: MERGE
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          BQ_TABLE: ${{ env.WORKLOAD_TABLE }}
+          # Choose appropriate write mode: WRITE_APPEND (default) or MERGE if script supports upserts
+          BQ_WRITE_MODE: WRITE_APPEND
           ONEDRIVE_PUBLIC_URL: "https://mysacstate-my.sharepoint.com/:x:/g/personal/torin_shanahan_csus_edu/EfH5izRo81tHiVlwG99DEFsBzjwhTzBzQ_1_hYKgpq_VPA?download=1"
           LOCAL_FILE_PATH: ""
         run: Rscript .github/scripts/workload_ingest.R
@@ -114,7 +118,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: ingest
     if: needs.ingest.outputs.status == 'success'
-
     steps:
       - uses: actions/checkout@v4
 
@@ -137,14 +140,22 @@ jobs:
         id: preflight
         shell: bash
         env:
-          GCP_PROJECT:    ${{ env.GCP_PROJECT }}
-          BQ_DATASET:     ${{ env.BQ_DATASET }}
-          BQ_LOCATION:    ${{ env.BQ_LOCATION }}
-          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}     # ← FIX: added spaces
-          READINESS_TABLE: ${{ env.READINESS_TABLE }}   # ← FIX: added spaces
-          ROSTER_TABLE:   ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
+          echo "=== Preflight ==="
+          for v in GCP_PROJECT BQ_DATASET BQ_LOCATION WORKLOAD_TABLE READINESS_TABLE ROSTER_TABLE; do
+            eval "val=\${$v}"
+            if [ -z "$val" ]; then
+              echo "❌ $v is empty"
+              exit 1
+            fi
+          done
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
@@ -153,31 +164,35 @@ jobs:
       - name: Validate roster mapping table
         shell: bash
         env:
-          GCP_PROJECT:   ${{ env.GCP_PROJECT }}
-          BQ_DATASET:    ${{ env.BQ_DATASET }}
-          BQ_LOCATION:   ${{ env.BQ_LOCATION }}
-          ROSTER_TABLE:  ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
           CNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --format=csv \
             "SELECT COUNT(*) FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`" | tail -n1)
-          if [ "$CNT" -eq 0 ]; then echo "❌ roster_mapping is empty"; exit 1; fi
+          if [ "$CNT" -eq 0 ]; then
+            echo "❌ roster_mapping is empty"
+            exit 1
+          fi
           SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^offical_id$' || { echo "❌ need column offical_id"; exit 1; }
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^Vald Name$'   || { echo "❌ need column `Vald Name`"; exit 1; }
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^offical_id$' || { echo "❌ missing column offical_id (check spelling)"; exit 1; }
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q '^Vald Name$'   || { echo "❌ missing column 'Vald Name'"; exit 1; }
 
       - name: Check for matching readiness data (offical_id + date via roster mapping)
         id: check
         shell: bash
         env:
-          GCP_PROJECT:     ${{ env.GCP_PROJECT }}
-          BQ_DATASET:      ${{ env.BQ_DATASET }}
-          BQ_LOCATION:     ${{ env.BQ_LOCATION }}
-          WORKLOAD_TABLE:  ${{ env.WORKLOAD_TABLE }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
-          ROSTER_TABLE:    ${{ env.ROSTER_TABLE }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
+          echo "🔍 Checking workload ↔ readiness matches (last 7 days)..."
           MATCH_QUERY="
           WITH workload AS (
             SELECT DISTINCT
@@ -207,7 +222,7 @@ jobs:
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(\`Vald Name\`))       AS vald_full_name_norm
+              LOWER(TRIM(\`Vald Name\`)) AS vald_full_name_norm
             FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
           ),
           readiness_by_id AS (
@@ -229,12 +244,21 @@ jobs:
             ON rd.offical_id = w.offical_id
            AND rd.date       = w.date
           "
-          RES="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --format=json "$MATCH_QUERY")"
-          ATH="$(echo "$RES" | jq -r '.[0].athletes_with_matches // 0')"
-          MAT="$(echo "$RES" | jq -r '.[0].total_matches // 0')"
+          if ! RES=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1); then
+            echo "❌ BigQuery match query failed"
+            echo "$RES"
+            echo "has_matches=false" >> "$GITHUB_OUTPUT"
+            echo "reason=query_failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          ATH=$(echo "$RES" | jq -r '.[0].athletes_with_matches // 0')
+          MAT=$(echo "$RES" | jq -r '.[0].total_matches // 0')
+          EAR=$(echo "$RES" | jq -r '.[0].earliest_match // "none"')
+          LAT=$(echo "$RES" | jq -r '.[0].latest_match // "none"')
+          echo "📊 Athletes matched: $ATH | Total matches: $MAT | Range: $EAR → $LAT"
           if [ "$MAT" -gt 0 ]; then
-            echo "has_matches=true"  >> "$GITHUB_OUTPUT"
-            echo "match_count=$MAT"  >> "$GITHUB_OUTPUT"
+            echo "has_matches=true" >> "$GITHUB_OUTPUT"
+            echo "match_count=$MAT" >> "$GITHUB_OUTPUT"
             echo "athlete_count=$ATH" >> "$GITHUB_OUTPUT"
           else
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
@@ -242,10 +266,10 @@ jobs:
           fi
 
     outputs:
-      has_matches:   ${{ steps.check.outputs.has_matches }}
-      match_count:   ${{ steps.check.outputs.match_count }}
+      has_matches: ${{ steps.check.outputs.has_matches }}
+      match_count: ${{ steps.check.outputs.match_count }}
       athlete_count: ${{ steps.check.outputs.athlete_count }}
-      reason:        ${{ steps.check.outputs.reason }}
+      reason: ${{ steps.check.outputs.reason }}
 
   train-models:
     runs-on: ubuntu-latest
@@ -254,7 +278,6 @@ jobs:
       needs.ingest.outputs.status == 'success' &&
       needs.check-readiness.outputs.has_matches == 'true' &&
       github.event.inputs.skip_training != 'true'
-
     steps:
       - uses: actions/checkout@v4
 
@@ -269,7 +292,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Python deps (for sklearn models)
         run: |
@@ -307,23 +330,65 @@ jobs:
 
       - name: Run model training
         env:
-          GCP_PROJECT:       ${{ env.GCP_PROJECT }}
-          BQ_DATASET:        ${{ env.BQ_DATASET }}
-          BQ_LOCATION:       ${{ env.BQ_LOCATION }}
-          TEAM_NAME:         ${{ env.TEAM_NAME }}
-          WORKLOAD_TABLE:    ${{ env.WORKLOAD_TABLE }}
-          READINESS_TABLE:   ${{ env.READINESS_TABLE }}
-          ROSTER_TABLE:      ${{ env.ROSTER_TABLE }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          TEAM_NAME: ${{ env.TEAM_NAME }}
+
+          WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
           PREDICTIONS_TABLE: ${{ env.PREDICTIONS_TABLE }}
-          START_DATE:        ${{ github.event.inputs.start_date || '2025-06-01' }}
-          END_DATE:          ${{ github.event.inputs.end_date   || '2025-12-31' }}
-          TRAIN_FRACTION:    '0.80'
-          MIN_TRAIN_OBS:     '3'
-          HAS_MATCHES:         ${{ needs.check-readiness.outputs.has_matches }}
-          MATCH_LOOKBACK_DAYS: '7'
-          SKIP_TRAINING:       ${{ github.event.inputs.skip_training || 'false' }}
-          GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}
-        run: Rscript ".github/scripts/readiness_models_cloud.R"
+
+          START_DATE: ${{ github.event.inputs.start_date || '2025-06-01' }}
+          END_DATE: ${{ github.event.inputs.end_date || '2025-12-31' }}
+          TRAIN_FRACTION: "0.80"
+          MIN_TRAIN_OBS: "3"
+
+          HAS_MATCHES: ${{ needs.check-readiness.outputs.has_matches }}
+          MATCH_LOOKBACK_DAYS: "7"
+          SKIP_TRAINING: ${{ github.event.inputs.skip_training || 'false' }}
+
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_MATCHES" != "true" ]; then
+            echo "No matches present; aborting training defensively."
+            exit 0
+          fi
+          Rscript ".github/scripts/readiness_models_cloud.R"
+
+      - name: Show today's training summary (best-effort)
+        if: success()
+        env:
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+        run: |
+          echo "📈 Latest Models:"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 \
+            "SELECT 
+               athlete_id,
+               roster_name,
+               model_type,
+               ROUND(primary_rmse, 3) AS rmse,
+               n_train,
+               FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()
+             ORDER BY trained_at DESC
+             LIMIT 10" || echo "No training results yet"
+
+          echo ""
+          echo "📊 Today's Training Stats:"
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false \
+            "SELECT 
+               COUNT(DISTINCT athlete_id) AS athletes_trained,
+               COUNT(*) AS total_models,
+               ROUND(AVG(primary_rmse), 3) AS avg_rmse,
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
+             WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
 
   summary:
     runs-on: ubuntu-latest
@@ -332,35 +397,42 @@ jobs:
     steps:
       - name: Pipeline Summary
         env:
-          HAS_MATCHES:  ${{ needs.check-readiness.outputs.has_matches }}
-          MATCH_COUNT:  ${{ needs.check-readiness.outputs.match_count }}
-          ATH_COUNT:    ${{ needs.check-readiness.outputs.athlete_count }}
+          HAS_MATCHES: ${{ needs.check-readiness.outputs.has_matches }}
+          MATCH_COUNT: ${{ needs.check-readiness.outputs.match_count }}
+          ATH_COUNT: ${{ needs.check-readiness.outputs.athlete_count }}
         run: |
-          echo "═══════════════════════════════════════════════════════════════"
+          echo "=============================================================="
           echo "    WORKLOAD & MODEL PIPELINE SUMMARY"
-          echo "═══════════════════════════════════════════════════════════════"
+          echo "=============================================================="
           echo ""
           echo "🔹 Workload Ingest:     ${{ needs.ingest.result }}"
           echo "🔹 Readiness Check:     ${{ needs.check-readiness.result }}"
           echo "🔹 Model Training:      ${{ needs.train-models.result }}"
           echo ""
           if [ "${{ needs.ingest.result }}" != "success" ]; then
-            echo "❌ INGEST FAILED - Check workload ingest logs"; exit 1
+            echo "❌ INGEST FAILED - Check workload ingest logs"
+            exit 1
           elif [ "${{ needs.check-readiness.result }}" == "skipped" ]; then
-            echo "⏭️  PIPELINE SKIPPED - Ingest failed, no readiness check performed"; exit 1
+            echo "⏭️  PIPELINE SKIPPED - Readiness check did not run (ingest failed)"
+            exit 1
           elif [ "$HAS_MATCHES" != "true" ]; then
             echo "✅ INGEST COMPLETE - Workload data saved"
-            echo "⏭️  TRAINING SKIPPED - No matching readiness data found (OK)"; exit 0
+            echo "⏭️  TRAINING SKIPPED - No matching readiness data found (OK)"
+            exit 0
           elif [ "${{ needs.train-models.result }}" == "skipped" ]; then
-            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ INGEST COMPLETE"
             echo "✅ READINESS CHECK - Found $MATCH_COUNT matches across $ATH_COUNT athletes"
-            echo "⏭️  TRAINING SKIPPED - Manual skip requested"; exit 0
+            echo "⏭️  TRAINING SKIPPED - Manual skip requested"
+            exit 0
           elif [ "${{ needs.train-models.result }}" == "success" ]; then
-            echo "✅ PIPELINE COMPLETE - All jobs succeeded!"; exit 0
+            echo "✅ PIPELINE COMPLETE - All jobs succeeded!"
+            echo "📊 Matches: $MATCH_COUNT | Athletes trained: $ATH_COUNT"
+            exit 0
           elif [ "${{ needs.train-models.result }}" == "failure" ]; then
-            echo "✅ INGEST COMPLETE - Workload data saved"
+            echo "✅ INGEST COMPLETE"
             echo "✅ READINESS CHECK - Found $MATCH_COUNT matches"
-            echo "❌ TRAINING FAILED - Check model training logs"; exit 0
+            echo "❌ TRAINING FAILED - See model training logs"
+            exit 0
           else
-            echo "⚠️  UNKNOWN STATUS - Check individual job logs"; exit 1
-          fi
+            echo "⚠️  UNKNOWN STATUS - Inspect individual job logs"
+            exit 1
