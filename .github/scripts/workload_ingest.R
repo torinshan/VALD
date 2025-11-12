@@ -41,7 +41,7 @@ log_entries <- tibble(
 )
 create_log_entry <- function(message, level="INFO") {
   ts <- Sys.time()
-  cat(sprintf("[%%s] [%%s] %%s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
   log_entries <<- bind_rows(log_entries, tibble(
     timestamp = ts, level = level, message = message,
     run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
@@ -259,7 +259,7 @@ read_bq_table_rest <- function(tbl) {
   meta <- bq_table_meta(tbl); fields <- meta$schema$fields
   out <- list(); pageToken <- NULL; i <- 0
   repeat {
-    url <- sprintf("https://bigquery.googleapis.com/bigquery/v2/projects/%%s/datasets/%%s/tables/%%s/data",
+    url <- sprintf("https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data",
                    tbl$project, tbl$dataset, tbl$table)
     resp <- httr::GET(url,
       httr::add_headers(Authorization=paste("Bearer", GLOBAL_ACCESS_TOKEN)),
