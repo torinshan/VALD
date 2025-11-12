@@ -1,35 +1,29 @@
 #!/usr/bin/env Rscript
 
-# ──────────────────────────────────────────────────────────────────────────────
-# WORKLOAD INGEST — XLSX/CSV from OneDrive/SharePoint (public link)
-# Uses post-cleaned field names:
-#   roster_name, date, distance_yd, high_speed_distance, mechanical_load
-# Builds daily features and MERGE-upserts into analytics.workload_daily
-# ──────────────────────────────────────────────────────────────────────────────
-
 # ===== Packages =====
 tryCatch({
   suppressPackageStartupMessages({
     library(bigrquery); library(DBI)
     library(dplyr); library(tidyr); library(readr); library(readxl)
-    library(stringr); library(tibble); library(lubridate)
-    library(slider); library(janitor)
-    library(httr); library(gargle); library(glue)
+    library(stringr); library(purrr); library(tibble); library(data.table)
+    library(hms); library(lubridate)
+    library(httr); library(jsonlite); library(curl)
+    library(gargle); library(glue); library(slider); library(janitor)
   })
 }, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
 
+# ===== Options =====
 options(bigrquery.use_bqstorage = FALSE)
 Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 
 # ===== Config =====
-project    <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
-dataset    <- Sys.getenv("BQ_DATASET",  "analytics")
-location   <- Sys.getenv("BQ_LOCATION", "US")
-table_out  <- Sys.getenv("BQ_TABLE",    "workload_daily")
-write_mode <- toupper(Sys.getenv("BQ_WRITE_MODE", "MERGE"))  # MERGE or TRUNCATE
-
-public_url <- Sys.getenv("ONEDRIVE_PUBLIC_URL", "")
-local_file <- Sys.getenv("LOCAL_FILE_PATH", "")
+project     <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
+dataset     <- Sys.getenv("BQ_DATASET",  "analytics")
+location    <- Sys.getenv("BQ_LOCATION","US")
+table_out   <- Sys.getenv("BQ_TABLE",    "workload_daily")
+write_mode  <- toupper(Sys.getenv("BQ_WRITE_MODE", "MERGE"))   # MERGE or TRUNCATE
+public_url  <- Sys.getenv("ONEDRIVE_PUBLIC_URL", "")
+local_file  <- Sys.getenv("LOCAL_FILE_PATH", "")
 
 cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
@@ -38,190 +32,196 @@ cat("BQ Table:", table_out, "\n")
 cat("Write mode:", write_mode, "\n")
 
 # ===== Logging =====
-log <- function(msg, lvl="INFO"){
-  ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz="UTC")
-  cat(sprintf("[%s] [%s] %s\n", ts, lvl, msg))
+log_entries <- tibble(
+  timestamp = as.POSIXct(character(0)),
+  level = character(0),
+  message = character(0),
+  run_id = character(0),
+  repository = character(0)
+)
+create_log_entry <- function(message, level="INFO") {
+  ts <- Sys.time()
+  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  log_entries <<- bind_rows(log_entries, tibble(
+    timestamp = ts, level = level, message = message,
+    run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
+  ))
+}
+upload_logs_to_bigquery <- function() {
+  if (nrow(log_entries)==0) return(invisible(TRUE))
+  tryCatch({
+    ds <- bq_dataset(project, dataset)
+    if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
+    log_tbl <- bq_table(ds, "workload_ingest_log")
+    if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
+    bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
+    TRUE
+  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
 }
 script_start <- Sys.time()
-log("=== WORKLOAD INGEST START ===","START")
+create_log_entry("=== WORKLOAD INGEST START ===", "START")
 
-# ===== Auth (gcloud → gargle token) =====
+# ===== Auth =====
 GLOBAL_ACCESS_TOKEN <- NULL
 tryCatch({
-  log("Authenticating to BigQuery via gcloud")
+  create_log_entry("Authenticating to BigQuery via gcloud")
   tok <- system("gcloud auth print-access-token", intern = TRUE)
-  GLOBAL_ACCESS_TOKEN <<- tok[1]; stopifnot(nzchar(GLOBAL_ACCESS_TOKEN))
+  GLOBAL_ACCESS_TOKEN <<- tok[1]
+  stopifnot(nzchar(GLOBAL_ACCESS_TOKEN))
   bq_auth(token = gargle::gargle2.0_token(
-    scope='https://www.googleapis.com/auth/bigquery',
-    client=gargle::gargle_client(),
-    credentials=list(access_token=GLOBAL_ACCESS_TOKEN)
+    scope = 'https://www.googleapis.com/auth/bigquery',
+    client = gargle::gargle_client(),
+    credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
   ))
-}, error=function(e){ log(paste("BigQuery auth failed:", e$message), "ERROR"); quit(status=1) })
+  ds <- bq_dataset(project, dataset)
+  if (!bq_dataset_exists(ds)) { bq_dataset_create(ds, location = location); create_log_entry(glue("Created dataset {dataset}")) }
+}, error = function(e) {
+  create_log_entry(paste("BigQuery auth failed:", e$message), "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+})
 
-refresh_token <- function(){
-  tok <- system("gcloud auth print-access-token", intern = TRUE)
-  if (nzchar(tok[1]) && tok[1] != GLOBAL_ACCESS_TOKEN) {
-    GLOBAL_ACCESS_TOKEN <<- tok[1]
-    bq_auth(token = gargle::gargle2.0_token(
-      scope='https://www.googleapis.com/auth/bigquery',
-      client=gargle::gargle_client(),
-      credentials=list(access_token=GLOBAL_ACCESS_TOKEN)
-    ))
-    log("Token refreshed")
+refresh_token_if_needed <- function() {
+  tryCatch({
+    tok <- system("gcloud auth print-access-token", intern = TRUE)
+    if (nzchar(tok[1]) && tok[1] != GLOBAL_ACCESS_TOKEN) {
+      GLOBAL_ACCESS_TOKEN <<- tok[1]
+      bq_auth(token = gargle::gargle2.0_token(
+        scope = 'https://www.googleapis.com/auth/bigquery',
+        client = gargle::gargle_client(),
+        credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+      ))
+      create_log_entry("Token refreshed", "INFO")
+    }
+  }, error = function(e) {
+    create_log_entry(paste("Token refresh warning:", e$message), "WARN")
+  })
+}
+
+# ===== File readers =====
+read_any_tabular <- function(path) {
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("xlsx", "xls")) {
+    create_log_entry(glue("Reading Excel: {path}"))
+    df <- readxl::read_excel(path, guess_max = 200000) |> as.data.frame()
+    return(df)
+  } else if (ext %in% c("csv", "txt")) {
+    create_log_entry(glue("Reading CSV: {path}"))
+    return(readr::read_csv(path, show_col_types = FALSE))
+  } else {
+    stop(glue("Unsupported file extension: .{ext}"))
   }
 }
 
-# ===== Helpers =====
-parse_date_robust <- function(x){
-  if (inherits(x,"Date"))   return(x)
-  if (inherits(x,"POSIXt")) return(as.Date(x))
-  if (is.numeric(x))        return(as.Date(x, origin="1899-12-30"))
-  v <- as.character(x)
-  d <- suppressWarnings(as.Date(v, "%Y-%m-%d"))
-  d[is.na(d)] <- suppressWarnings(as.Date(v[is.na(d)], "%m/%d/%Y"))
-  d[is.na(d)] <- suppressWarnings(as.Date(v[is.na(d)], "%m-%d-%Y"))
-  d[is.na(d)] <- suppressWarnings(as.Date(v[is.na(d)], "%d/%m/%Y"))
-  d[is.na(d)] <- suppressWarnings(as.Date(v[is.na(d)], "%d-%m-%Y"))
-  d
+# (Kept for completeness; won’t be used since we’re reading local)
+download_public_onedrive <- function(url) {
+  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
+  dl1 <- if (grepl("\\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
+  tf <- tempfile(fileext = ".xlsx")
+  r1 <- httr::GET(dl1, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
+  if (httr::http_error(r1)) stop(httr::http_status(r1)$message)
+  tf
 }
 
-monotony_roll <- function(x, idx, k){
+# ===== Date helpers =====
+parse_date_robust <- function(vec) {
+  if (is.function(vec)) stop("parse_date_robust() received a function; pass the column vector instead.")
+  if (inherits(vec, "Date"))   return(vec)
+  if (inherits(vec, "POSIXt")) return(as.Date(vec))
+  if (is.numeric(vec)) return(as.Date(vec, origin = "1899-12-30"))
+  if (is.character(vec)) {
+    v <- trimws(vec); v[nchar(v) == 0] <- NA_character_
+    suppressWarnings({
+      d <- as.Date(v, format = "%Y-%m-%d")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m/%d/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m-%d-%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d/%m/%Y")
+      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d-%m-%Y")
+    })
+    return(d)
+  }
+  rep(as.Date(NA), length(vec))
+}
+
+monotony_roll <- function(x, idx, window_days) {
   slider::slide_index_dbl(
     x, idx,
     .f = ~ {
-      m <- mean(.x, na.rm = TRUE); s <- sd(.x, na.rm = TRUE)
-      if (length(na.omit(.x)) < 2 || is.na(s) || s == 0) NA_real_ else m/s
+      m <- mean(.x, na.rm = TRUE)
+      s <- sd(.x,  na.rm = TRUE)
+      if (length(na.omit(.x)) < 2 || is.na(s) || s == 0) NA_real_ else m / s
     },
-    .before = lubridate::days(k-1), .complete = FALSE
+    .before = lubridate::days(window_days - 1),
+    .complete = FALSE
   )
 }
 
-ensure_table <- function(tbl, data, partition_field="date", cluster_fields=c("roster_name")){
-  if (bq_table_exists(tbl)) return(invisible(TRUE))
-  tp <- if (partition_field %in% names(data)) list(type="DAY", field=partition_field) else NULL
-  cl <- intersect(cluster_fields, names(data)); if (length(cl)==0) cl <- NULL
-  bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering_fields = cl)
-  log(glue("Created {tbl$table} (partition={partition_field}; cluster={paste(cl %||% '', collapse=',')})"))
-}
-
-# Download file from OneDrive/SharePoint (force download, follow redirects)
-download_public_file <- function(url) {
-  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
-  tf <- tempfile(fileext = "")  # we'll infer type
-  final <- if (grepl("\\?", url)) paste0(url,"&download=1") else paste0(url,"?download=1")
-  r <- httr::GET(final, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180), httr::add_headers(Accept="*/*"))
-  if (httr::http_error(r)) {
-    # try original
-    r2 <- httr::GET(url, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180), httr::add_headers(Accept="*/*"))
-    httr::stop_for_status(r2)
-  }
-  ctype <- httr::headers(r)[["content-type"]]
-  if (is.null(ctype)) ctype <- ""
-  sig <- tryCatch(readBin(tf, what="raw", n=4), error=function(e) raw(0))
-
-  list(path=tf, content_type=ctype, signature=sig)
-}
-
-# Try reading XLSX/CSV; auto-pick the sheet with roster_name + date
-read_any_tabular <- function(fetch) {
-  is_html <- grepl("text/html", fetch$content_type, ignore.case = TRUE)
-  # XLSX if content-type says so or ZIP signature "PK"
-  is_xlsx <- grepl("spreadsheetml|application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                   fetch$content_type, ignore.case=TRUE) ||
-             (length(fetch$signature) >= 2 && rawToChar(fetch$signature[1:2]) == "PK")
-
-  if (is_html) {
-    log("Got HTML (viewer page) instead of a file. Ensure the link is public and has ?download=1", "ERROR")
-    stop("HTML response from OneDrive link.")
-  }
-
+# ===== Load file (LOCAL_FILE_PATH wins) =====
+fpath <- NULL
+tryCatch({
   if (nzchar(local_file)) {
-    # local file path short-circuit handled outside; keeping for clarity
-    log(glue("Reading local file: {local_file}"))
-  }
-
-  if (is_xlsx || grepl("\\.xlsx$", fetch$path, ignore.case=TRUE)) {
-    log("Detected XLSX file; scanning sheets to find roster_name/date")
-    sh <- readxl::excel_sheets(fetch$path)
-    if (length(sh) == 0) stop("No sheets in XLSX")
-    for (s in sh) {
-      df <- tryCatch(readxl::read_excel(fetch$path, sheet=s), error=function(e) NULL)
-      if (is.null(df)) next
-      dfc <- janitor::clean_names(df)
-      if (all(c("roster_name") %in% names(dfc)) && any(c("date") %in% names(dfc))) {
-        log(glue("Using sheet: {s}"))
-        return(dfc)
-      }
-    }
-    # Fallback to first sheet if not found; caller will error with column list
-    log("Could not find a sheet with roster_name/date; using first sheet", "WARN")
-    return(janitor::clean_names(readxl::read_excel(fetch$path, sheet = 1)))
-  }
-
-  log("Detected CSV or unknown; reading with readr::read_csv")
-  return(janitor::clean_names(readr::read_csv(fetch$path, show_col_types = FALSE)))
-}
-
-# ===== Read data (local overrides URL) =====
-raw_std <- NULL
-if (nzchar(local_file)) {
-  if (grepl("\\.xlsx$", local_file, ignore.case=TRUE)) {
-    log(glue("Reading local XLSX: {local_file}"))
-    tmp <- readxl::read_excel(local_file, sheet = 1)
-    raw_std <- janitor::clean_names(tmp)
+    if (!file.exists(local_file)) stop(glue("LOCAL_FILE_PATH not found: {local_file}"))
+    create_log_entry("Loading local file (repo)")
+    fpath <- local_file
+  } else if (nzchar(public_url)) {
+    create_log_entry("Downloading from OneDrive/SharePoint (public link)…")
+    fpath <- download_public_onedrive(public_url)
   } else {
-    log(glue("Reading local CSV: {local_file}"))
-    tmp <- readr::read_csv(local_file, show_col_types = FALSE)
-    raw_std <- janitor::clean_names(tmp)
+    stop("Provide LOCAL_FILE_PATH (preferred) or ONEDRIVE_PUBLIC_URL.")
   }
-} else if (nzchar(public_url)) {
-  log("Downloading from OneDrive/SharePoint (public link)…")
-  fetched <- download_public_file(public_url)
-  raw_std <- read_any_tabular(fetched)
-} else {
-  stop("Provide ONEDRIVE_PUBLIC_URL or LOCAL_FILE_PATH")
+}, error = function(e) {
+  create_log_entry(paste("File fetch failed:", e$message), "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+})
+
+raw <- tryCatch({
+  read_any_tabular(fpath)
+}, error = function(e) {
+  create_log_entry(paste("File parse error:", e$message), "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+})
+
+# ===== Transform =====
+# Your sheet has the original header names. We select the exact ones you listed,
+# then clean names (snake_case).
+required_cols <- c(
+  "Name","Date","roster_name",
+  "Distance_yd_","Mechanical_Load","High_Speed_Distance","Decel_4"
+)
+have <- intersect(names(raw), required_cols)
+if (!all(c("roster_name","Date") %in% names(raw))) {
+  create_log_entry(glue("CSV/XLSX columns (raw): {paste(names(raw), collapse=', ')}"))
+  create_log_entry("Missing required columns: roster_name and/or Date", "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
 }
 
-log(glue("Columns (cleaned): {paste(names(raw_std), collapse=', ')}"))
-
-# ===== Validate required columns =====
-required <- c("roster_name", "date")
-missing  <- setdiff(required, names(raw_std))
-if (length(missing) > 0) {
-  log(glue("Missing required columns: {paste(missing, collapse=', ')}"), "ERROR")
-  quit(status=1)
-}
-
-# Metrics (present in your export; still guarded)
-distance_col <- if ("distance_yd" %in% names(raw_std)) "distance_yd" else NULL
-hsd_col      <- if ("high_speed_distance" %in% names(raw_std)) "high_speed_distance" else NULL
-ml_col       <- if ("mechanical_load" %in% names(raw_std)) "mechanical_load" else NULL
-if (is.null(distance_col)) log("distance_yd not found; defaulting to 0s", "WARN")
-if (is.null(hsd_col))      log("high_speed_distance not found; defaulting to 0s", "WARN")
-if (is.null(ml_col))       log("mechanical_load not found; defaulting to 0s", "WARN")
-
-# ===== Transform → features
-work_data0 <- raw_std %>%
-  transmute(
-    roster_name = .data[["roster_name"]],
-    date        = parse_date_robust(.data[["date"]]),
-    distance    = suppressWarnings(as.numeric(if (!is.null(distance_col)) .data[[distance_col]] else 0)),
-    hsd         = suppressWarnings(as.numeric(if (!is.null(hsd_col))      .data[[hsd_col]]      else 0)),
-    ml          = suppressWarnings(as.numeric(if (!is.null(ml_col))       .data[[ml_col]]       else 0))
+work_data0 <- raw %>%
+  dplyr::select(any_of(required_cols)) %>%
+  janitor::clean_names() %>%
+  mutate(
+    date = parse_date_robust(.data[["date"]])
+  ) %>%
+  # Ensure numeric
+  mutate(
+    distance_yd        = suppressWarnings(as.numeric(.data[["distance_yd_"]] %||% NA)),
+    high_speed_distance= suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% .data[["high_speed_distance_"]] %||% NA)),
+    mechanical_load    = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
   ) %>%
   filter(!is.na(roster_name), !is.na(date))
 
-if (nrow(work_data0) == 0) { log("No usable rows after sanitize (need roster_name + date).", "ERROR"); quit(status=1) }
-
 daily_sum <- work_data0 %>%
   group_by(roster_name, date) %>%
-  summarise(distance_sum = sum(distance, na.rm=TRUE),
-            hsd_sum      = sum(hsd,      na.rm=TRUE),
-            ml_sum       = sum(ml,       na.rm=TRUE),
-            .groups = "drop") %>%
+  summarise(
+    distance_sum = sum(distance_yd,         na.rm = TRUE),
+    hsd_sum      = sum(high_speed_distance, na.rm = TRUE),
+    ml_sum       = sum(mechanical_load,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
   group_by(roster_name) %>%
-  tidyr::complete(date = seq(min(date), max(date), by="1 day"),
-                  fill = list(distance_sum=0, hsd_sum=0, ml_sum=0)) %>%
+  tidyr::complete(
+    date = seq(min(date), max(date), by = "1 day"),
+    fill = list(distance_sum = 0, hsd_sum = 0, ml_sum = 0)
+  ) %>%
   ungroup()
 
 roll_features <- daily_sum %>%
@@ -232,14 +232,14 @@ roll_features <- daily_sum %>%
     hsd_prev_day      = dplyr::lag(hsd_sum, 1),
     ml_prev_day       = dplyr::lag(ml_sum, 1),
 
-    distance_7d  = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before=days(6),  .complete=TRUE),
-    distance_28d = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before=days(27), .complete=TRUE),
+    distance_7d  = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    distance_28d = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
 
-    hsd_7d  = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before=days(6),  .complete=TRUE),
-    hsd_28d = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before=days(27), .complete=TRUE),
+    hsd_7d  = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    hsd_28d = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
 
-    ml_7d  = slider::slide_index_dbl(ml_sum, date, ~sum(.x, na.rm=TRUE), .before=days(6),  .complete=TRUE),
-    ml_28d = slider::slide_index_dbl(ml_sum, date, ~sum(.x, na.rm=TRUE), .before=days(27), .complete=TRUE),
+    ml_7d  = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    ml_28d = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
 
     distance_monotony_7d = monotony_roll(distance_sum, date, 7),
     ml_monotony_7d       = monotony_roll(ml_sum,       date, 7)
@@ -260,41 +260,134 @@ work_data <- roll_features %>%
   ) %>%
   arrange(roster_name, date)
 
-log(glue("Rows after transform: {nrow(work_data)}"))
-if (nrow(work_data) > 0) {
-  cat("Date range:", as.character(min(work_data$date, na.rm=TRUE)), "→", as.character(max(work_data$date, na.rm=TRUE)), "\n")
+create_log_entry(glue("Rows after transform: {nrow(work_data)}"))
+
+# ===== Upsert helpers =====
+read_bq_table_rest <- function(tbl) {
+  refresh_token_if_needed()
+  if (!bq_table_exists(tbl)) return(tibble())
+  meta <- bq_table_meta(tbl); fields <- meta$schema$fields
+  out <- list(); pageToken <- NULL; i <- 0
+  repeat {
+    url <- sprintf("https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data",
+                   tbl$project, tbl$dataset, tbl$table)
+    resp <- httr::GET(url,
+      httr::add_headers(Authorization=paste("Bearer", GLOBAL_ACCESS_TOKEN)),
+      query = list(maxResults=10000, pageToken=pageToken)
+    )
+    httr::stop_for_status(resp)
+    ctt <- httr::content(resp, "parsed")
+    if (is.null(ctt$rows)) break
+    page <- lapply(ctt$rows, function(r) {
+      vals <- lapply(seq_along(fields), function(j) {
+        v <- r$f[[j]]$v; f <- fields[[j]]
+        if (is.null(v)) return(NA)
+        if (f$type %in% c("INTEGER","INT64")) return(as.integer(v))
+        if (f$type %in% c("FLOAT","FLOAT64")) return(as.numeric(v))
+        if (f$type == "DATE") return(as.Date(v))
+        if (f$type == "TIMESTAMP") return(as.POSIXct(as.numeric(as.character(v)), origin="1970-01-01", tz="UTC"))
+        if (f$type == "TIME") return(hms::as_hms(v))
+        as.character(v)
+      })
+      names(vals) <- vapply(fields, function(f) f$name, character(1))
+      as_tibble(vals)
+    })
+    out[[length(out)+1]] <- bind_rows(page)
+    pageToken <- ctt$nextPageToken; i <- i + 1
+    if (is.null(pageToken) || i > 200) break
+  }
+  bind_rows(out)
 }
 
-# ===== Upload (MERGE by roster_name+date via truncate-rewrite) =====
-tryCatch({
-  refresh_token()
-  ds  <- bq_dataset(project, dataset)
-  tbl <- bq_table(ds, table_out)
+ensure_table <- function(tbl, data, partition_field="date", cluster_fields=c("roster_name")) {
+  if (bq_table_exists(tbl)) return(invisible(TRUE))
+  tp <- if (!is.null(partition_field) && partition_field %in% names(data))
+    list(type="DAY", field=partition_field) else NULL
+  cl <- intersect(cluster_fields, names(data)); if (length(cl)==0) cl <- NULL
+  bq_table_create(tbl, fields = as_bq_fields(data), time_partitioning = tp, clustering_fields = cl)
+  create_log_entry(glue("Created {tbl$table} (partition={partition_field}; cluster={paste(cl, collapse=',')} )"))
+}
 
-  ensure_table(tbl, work_data, partition_field="date", cluster_fields=c("roster_name"))
-
-  if (write_mode == "TRUNCATE") {
-    bq_table_upload(tbl, work_data, write_disposition = "WRITE_TRUNCATE")
-    log("TRUNCATE upload complete.")
-  } else {
-    existing <- if (bq_table_exists(tbl)) tryCatch(bq_table_download(tbl), error=function(e) tibble()) else tibble()
-    if (nrow(existing) > 0) {
-      existing <- existing %>% mutate(date = as.Date(date))
-      merged <- existing %>%
-        anti_join(work_data %>% select(roster_name, date), by=c("roster_name","date")) %>%
-        bind_rows(work_data)
-      bq_table_upload(tbl, merged, write_disposition = "WRITE_TRUNCATE")
-      log(glue("MERGE complete; rows now: {nrow(merged)}"))
-    } else {
-      bq_table_upload(tbl, work_data, write_disposition = "WRITE_TRUNCATE")
-      log("Initial upload complete.")
-    }
+validate_against_schema <- function(data, tbl) {
+  if (!bq_table_exists(tbl)) return(data)
+  ex <- bq_table_meta(tbl)
+  sch <- vapply(ex$schema$fields, function(f) f$name, character(1))
+  drop <- setdiff(names(data), sch)
+  if (length(drop)>0) {
+    create_log_entry(paste("Dropping", length(drop), "cols not in BQ schema:", paste(head(drop, 12), collapse=", ")), "WARN")
+    data <- dplyr::select(data, -any_of(drop))
   }
+  data
+}
+
+bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
+  mode <- match.arg(mode)
+  ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
+  if (nrow(df)==0) { create_log_entry(glue("No rows to upload for {table_name}")); return(TRUE) }
+
+  df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
+  df_no_pk <- df %>% select(-pk)
+
+  ensure_table(tbl, df_no_pk, partition_field="date", cluster_fields=c("roster_name"))
+  df_no_pk <- validate_against_schema(df_no_pk, tbl)
+
+  if (mode == "TRUNCATE" || !bq_table_exists(tbl) || isTRUE(bq_table_meta(tbl)$numRows == "0")) {
+    refresh_token_if_needed()
+    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
+    nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
+    create_log_entry(glue("TRUNCATE upload complete; {table_name} rows: {nr}"))
+    return(TRUE)
+  }
+
+  existing <- read_bq_table_rest(tbl)
+  if (nrow(existing)==0) {
+    refresh_token_if_needed()
+    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
+    create_log_entry(glue("Initial upload to {table_name}"))
+    return(TRUE)
+  }
+
+  existing <- existing %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
+  df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
+  allc <- union(names(existing), names(df))
+  for (c in setdiff(allc, names(existing))) existing[[c]] <- NA
+  for (c in setdiff(allc, names(df)))       df[[c]]       <- NA
+  existing <- existing[, allc, drop=FALSE]
+  df       <- df[, allc, drop=FALSE]
+
+  combined <- bind_rows(existing, df) %>%
+    mutate(.row_id = row_number()) %>%
+    arrange(.row_id) %>%
+    group_by(pk) %>%
+    slice_tail(n=1) %>%
+    ungroup() %>%
+    select(-.row_id, -pk)
+
+  refresh_token_if_needed()
+  bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
+  nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
+  create_log_entry(glue("MERGE complete; {table_name} rows: {nr}"))
+  TRUE
+}
+
+# ===== Upload =====
+tryCatch({
+  out <- work_data %>%
+    select(roster_name, date, distance, high_speed_distance, mechanical_load,
+           distance_7d, distance_28d, distance_monotony_7d,
+           hsd_7d, hsd_28d,
+           ml_7d, ml_28d, ml_monotony_7d)
+
+  bq_upsert(out, table_out, mode = ifelse(write_mode %in% c("MERGE","TRUNCATE"), write_mode, "MERGE"))
+  create_log_entry("Ingest complete.")
 }, error=function(e){
-  log(paste("Upload failed:", e$message), "ERROR"); quit(status=1)
+  create_log_entry(paste("Upload failed:", e$message), "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
 })
 
+# ===== Wrap up =====
 dur <- round(as.numeric(difftime(Sys.time(), script_start, units="mins")), 2)
-log(glue("Total execution time: {dur} minutes"))
-log("=== WORKLOAD INGEST END ===", "END")
+create_log_entry(glue("Total execution time: {dur} minutes"))
+create_log_entry("=== WORKLOAD INGEST END ===", "END")
+upload_logs_to_bigquery()
 cat("Script completed successfully\n")
