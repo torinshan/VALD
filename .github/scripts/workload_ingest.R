@@ -41,7 +41,7 @@ log_entries <- tibble(
 )
 create_log_entry <- function(message, level="INFO") {
   ts <- Sys.time()
-  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  cat(sprintf("[%%s] [%%s] %%s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
   log_entries <<- bind_rows(log_entries, tibble(
     timestamp = ts, level = level, message = message,
     run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
@@ -116,7 +116,7 @@ read_any_tabular <- function(path) {
 # (Kept for completeness; won’t be used since we’re reading local)
 download_public_onedrive <- function(url) {
   if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
-  dl1 <- if (grepl("\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
+  dl1 <- if (grepl("\\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
   tf <- tempfile(fileext = ".xlsx")
   r1 <- httr::GET(dl1, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
   if (httr::http_error(r1)) stop(httr::http_status(r1)$message)
@@ -197,13 +197,13 @@ work_data0 <- raw %>%
   janitor::clean_names() %>%
   dplyr::select(any_of(required_cols_clean)) %>%
   mutate(
-    date = safe_parse_date(.data["date"])
+    date = safe_parse_date(.data[["date"]])
   ) %>%
   # Ensure numeric
   mutate(
-    distance_yd         = suppressWarnings(as.numeric(.data["distance_yd"] %||% NA)),
-    high_speed_distance = suppressWarnings(as.numeric(.data["high_speed_distance"] %||% NA)),
-    mechanical_load     = suppressWarnings(as.numeric(.data["mechanical_load"] %||% NA))
+    distance_yd         = suppressWarnings(as.numeric(.data[["distance_yd"]] %||% NA)),
+    high_speed_distance = suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% NA)),
+    mechanical_load     = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
   ) %>%
   { tmp <- .; bad <- sum(is.na(tmp$date)); if (bad > 0) create_log_entry(glue("Date parse: {bad} invalid entries (NA) detected; rows will be dropped"), "WARN"); tmp } %>%
   filter(!is.na(roster_name), !is.na(date))
@@ -269,7 +269,7 @@ read_bq_table_rest <- function(tbl) {
   meta <- bq_table_meta(tbl); fields <- meta$schema$fields
   out <- list(); pageToken <- NULL; i <- 0
   repeat {
-    url <- sprintf("https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets/%s/tables/%s/data",
+    url <- sprintf("https://bigquery.googleapis.com/bigquery/v2/projects/%%s/datasets/%%s/tables/%%s/data",
                    tbl$project, tbl$dataset, tbl$table)
     resp <- httr::GET(url,
       httr::add_headers(Authorization=paste("Bearer", GLOBAL_ACCESS_TOKEN)),
@@ -389,4 +389,4 @@ dur <- round(as.numeric(difftime(Sys.time(), script_start, units="mins")), 2)
 create_log_entry(glue("Total execution time: {dur} minutes"))
 create_log_entry("=== WORKLOAD INGEST END ===", "END")
 upload_logs_to_bigquery()
-cat("Script completed successfully\n")
+cat("Script completed successfully\n"),
