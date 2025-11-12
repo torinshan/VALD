@@ -123,52 +123,12 @@ download_public_onedrive <- function(url) {
   tf
 }
 
-# ===== Date helpers =====
-parse_date_robust <- function(vec) {
-  if (is.function(vec)) stop("parse_date_robust() received a function; pass the column vector instead.")
-  if (inherits(vec, "Date"))   return(vec)
-  if (inherits(vec, "POSIXt")) return(as.Date(vec))
-  if (is.numeric(vec)) return(as.Date(vec, origin = "1899-12-30"))
-  if (is.character(vec)) {
-    v <- trimws(vec); v[nchar(v) == 0] <- NA_character_
-    suppressWarnings({
-      d <- as.Date(v, format = "%Y-%m-%d")
-      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m/%d/%Y")
-      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%m-%d-%Y")
-      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d/%m/%Y")
-      d[is.na(d)] <- as.Date(v[is.na(d)], format = "%d-%m-%Y")
-    })
-    return(d)
-  }
-  rep(as.Date(NA), length(vec))
-}
-
-monotony_roll <- function(x, idx, window_days) {
-  slider::slide_index_dbl(
-    x, idx,
-    .f = ~ {
-      m <- mean(.x, na.rm = TRUE)
-      s <- sd(.x,  na.rm = TRUE)
-      if (length(na.omit(.x)) < 2 || is.na(s) || s == 0) NA_real_ else m / s
-    },
-    .before = lubridate::days(window_days - 1),
-    .complete = FALSE
-  )
-}
-
-# ===== Load file (LOCAL_FILE_PATH wins) =====
-fpath <- NULL
+# ===== Load file (LOCAL_FILE_PATH only) =====
+fpath <- local_file
 tryCatch({
-  if (nzchar(local_file)) {
-    if (!file.exists(local_file)) stop(glue("LOCAL_FILE_PATH not found: {local_file}"))
-    create_log_entry("Loading local file (repo)")
-    fpath <- local_file
-  } else if (nzchar(public_url)) {
-    create_log_entry("Downloading from OneDrive/SharePoint (public link)…")
-    fpath <- download_public_onedrive(public_url)
-  } else {
-    stop("Provide LOCAL_FILE_PATH (preferred) or ONEDRIVE_PUBLIC_URL.")
-  }
+  if (!nzchar(fpath)) stop("LOCAL_FILE_PATH is empty")
+  if (!file.exists(fpath)) stop(glue("LOCAL_FILE_PATH not found: {fpath}"))
+  create_log_entry("Loading local file (repo)")
 }, error = function(e) {
   create_log_entry(paste("File fetch failed:", e$message), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
@@ -182,30 +142,31 @@ raw <- tryCatch({
 })
 
 # ===== Transform =====
-# Your sheet has the original header names. We select the exact ones you listed,
-# then clean names (snake_case).
-required_cols <- c(
-  "Name","Date","roster_name",
-  "Distance_yd_","Mechanical_Load","High_Speed_Distance","Decel_4"
-)
-have <- intersect(names(raw), required_cols)
-if (!all(c("roster_name","Date") %in% names(raw))) {
+# Clean names first and work only with cleaned names
+cleaned_names <- janitor::make_clean_names(names(raw))
+if (!all(c("roster_name","date") %in% cleaned_names)) {
   create_log_entry(glue("CSV/XLSX columns (raw): {paste(names(raw), collapse=', ')}"))
-  create_log_entry("Missing required columns: roster_name and/or Date", "ERROR")
+  create_log_entry(glue("CSV/XLSX columns (cleaned): {paste(cleaned_names, collapse=', ')}"))
+  create_log_entry("Missing required columns: roster_name and/or date (after cleaning).", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
 
+required_cols_clean <- c(
+  "name","date","roster_name",
+  "distance_yd","mechanical_load","high_speed_distance","decel_4"
+)
+
 work_data0 <- raw %>%
-  dplyr::select(any_of(required_cols)) %>%
   janitor::clean_names() %>%
+  dplyr::select(any_of(required_cols_clean)) %>%
   mutate(
     date = parse_date_robust(.data[["date"]])
   ) %>%
   # Ensure numeric
   mutate(
-    distance_yd        = suppressWarnings(as.numeric(.data[["distance_yd_"]] %||% NA)),
-    high_speed_distance= suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% .data[["high_speed_distance_"]] %||% NA)),
-    mechanical_load    = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
+    distance_yd         = suppressWarnings(as.numeric(.data[["distance_yd"]] %||% NA)),
+    high_speed_distance = suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% NA)),
+    mechanical_load     = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
   ) %>%
   filter(!is.na(roster_name), !is.na(date))
 
@@ -319,7 +280,6 @@ validate_against_schema <- function(data, tbl) {
   }
   data
 }
-
 bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   mode <- match.arg(mode)
   ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
