@@ -187,16 +187,17 @@ work_data0 <- raw %>%
   janitor::clean_names() %>%
   dplyr::select(any_of(required_cols_clean)) %>%
   mutate(
-    date = safe_parse_date(.data["date"])
+    date = safe_parse_date(.data[["date"]])
   ) %>%
   # Ensure numeric
   mutate(
-    distance_yd         = suppressWarnings(as.numeric(.data["distance_yd"] %||% NA)),
-    high_speed_distance = suppressWarnings(as.numeric(.data["high_speed_distance"] %||% NA)),
-    mechanical_load     = suppressWarnings(as.numeric(.data["mechanical_load"] %||% NA))
+    distance_yd         = suppressWarnings(as.numeric(.data[["distance_yd"]] %||% NA)),
+    high_speed_distance = suppressWarnings(as.numeric(.data[["high_speed_distance"]] %||% NA)),
+    mechanical_load     = suppressWarnings(as.numeric(.data[["mechanical_load"]] %||% NA))
   ) %>%
   { tmp <- .; bad <- sum(is.na(tmp$date)); if (bad > 0) create_log_entry(glue("Date parse: {bad} invalid entries (NA) detected; rows will be dropped"), "WARN"); tmp } %>%
   filter(!is.na(roster_name), !is.na(date))
+
 
 daily_sum <- work_data0 %>%
   group_by(roster_name, date) %>%
@@ -378,5 +379,4 @@ dur <- round(as.numeric(difftime(Sys.time(), script_start, units="mins")), 2)
 create_log_entry(glue("Total execution time: {dur} minutes"))
 create_log_entry("=== WORKLOAD INGEST END ===", "END")
 upload_logs_to_bigquery()
-cat("Script completed successfully\n"),
-sha:"a1566308c825bace4d5e7721dcadee9a8bc45252"}
+cat("Script completed successfully\n")
