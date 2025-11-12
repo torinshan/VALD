@@ -113,16 +113,6 @@ read_any_tabular <- function(path) {
   }
 }
 
-# (Kept for completeness; won’t be used since we’re reading local)
-download_public_onedrive <- function(url) {
-  if (!nzchar(url)) stop("ONEDRIVE_PUBLIC_URL is empty")
-  dl1 <- if (grepl("\\?", url)) paste0(url, "&download=1") else paste0(url, "?download=1")
-  tf <- tempfile(fileext = ".xlsx")
-  r1 <- httr::GET(dl1, httr::write_disk(tf, overwrite = TRUE), httr::timeout(180))
-  if (httr::http_error(r1)) stop(httr::http_status(r1)$message)
-  tf
-}
-
 # ===== Date helpers =====
 parse_date_robust <- function(vec) {
   if (is.function(vec)) stop("parse_date_robust() received a function; pass the column vector instead.")
