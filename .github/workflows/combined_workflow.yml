@@ -276,7 +276,7 @@ jobs:
 
           echo "✅ Required columns present (offical_id, 'Vald Name')"
 
-      - name: Check for matching readiness data (ID + same date via roster)
+      - name: Check for matching readiness data (CORRECTED MAPPING)
         id: check
         shell: bash
         env:
@@ -289,24 +289,26 @@ jobs:
         run: |
           set -euo pipefail
           echo "🔍 Checking workload ↔ readiness matches (via roster mapping, same DATE)…"
+          echo ""
+          echo "DATA FLOW:"
+          echo "  workload_daily.roster_name (ID) = roster_mapping.offical_id"
+          echo "  roster_mapping.Vald Name (NAME) = vald_fd_jumps.full_name"
+          echo ""
 
-          # FIXED: Properly map roster_name through roster table to get offical_id
+          # CORRECTED: roster_name IS offical_id, map Vald Name to full_name
           read -r -d '' MATCH_QUERY <<'SQL'
-          WITH roster_norm AS (
+          WITH roster_map AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm,
-              LOWER(TRIM(`Vald Name`)) AS workload_name_norm
+              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           workload_with_id AS (
             SELECT DISTINCT
-              rmap.offical_id,
-              DATE(w.date) AS date
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}` w
-            JOIN roster_norm rmap
-              ON LOWER(TRIM(w.roster_name)) = rmap.workload_name_norm
-            WHERE w.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              TRIM(CAST(roster_name AS STRING)) AS offical_id,
+              DATE(date) AS date
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
+            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_recent AS (
             SELECT
@@ -332,57 +334,109 @@ jobs:
               rr.date,
               rr.readiness
             FROM readiness_recent rr
-            JOIN roster_norm rmap
+            JOIN roster_map rmap
               ON rmap.vald_full_name_norm = rr.vald_full_name_norm
             WHERE rr.readiness IS NOT NULL
           )
           SELECT
             COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
-            COUNT(*)                      AS total_matches,
-            MIN(w.date)                   AS earliest_match,
-            MAX(w.date)                   AS latest_match
+            COUNT(*) AS total_matches,
+            MIN(w.date) AS earliest_match,
+            MAX(w.date) AS latest_match
           FROM workload_with_id w
           JOIN readiness_by_id rd
             ON rd.offical_id = w.offical_id
-           AND rd.date       = w.date
+           AND rd.date = w.date
           SQL
 
           # Expand environment variables
           MATCH_QUERY="$(envsubst <<<"$MATCH_QUERY")"
 
-          echo "–––– SQL ––––"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "SQL QUERY:"
+          echo "═══════════════════════════════════════════════════════════════"
           echo "$MATCH_QUERY"
-          echo "––––––––––––––"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo ""
 
-          # Run the query with error handling
-          if ! RESULT_JSON="$(
+          # Run the query with FULL error capture
+          echo "▶ Executing BigQuery query..."
+          set +e  # Don't exit on error yet - capture it
+          RESULT_JSON=$(
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
                query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1
-          )"; then
-            echo "❌ BigQuery execution failed"
+          )
+          QUERY_EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+
+          if [ $QUERY_EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "═══════════════════════════════════════════════════════════════"
+            echo "❌ BIGQUERY EXECUTION FAILED (Exit code: $QUERY_EXIT_CODE)"
+            echo "═══════════════════════════════════════════════════════════════"
+            echo "ERROR OUTPUT:"
             echo "$RESULT_JSON"
+            echo "═══════════════════════════════════════════════════════════════"
+            echo ""
+            echo "🔍 DIAGNOSTIC ANALYSIS:"
+            
+            if echo "$RESULT_JSON" | grep -qi "not found\|does not exist"; then
+              echo "❗ Issue: Table/Dataset Not Found"
+              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}"
+              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}"
+              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}"
+            fi
+            
+            if echo "$RESULT_JSON" | grep -qi "unrecognized\|column"; then
+              echo "❗ Issue: Column Not Found"
+              echo "   'Vald Name' column must have EXACT case and space"
+            fi
+            
+            if echo "$RESULT_JSON" | grep -qi "permission\|denied"; then
+              echo "❗ Issue: Permission Denied"
+            fi
+            
+            echo ""
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=query_failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
+
+          echo "✅ Query executed successfully"
+          echo ""
 
           ATHLETES="$(echo "$RESULT_JSON" | jq -r '.[0].athletes_with_matches // 0')"
           MATCHES="$(echo   "$RESULT_JSON" | jq -r '.[0].total_matches // 0')"
           EARLIEST="$(echo  "$RESULT_JSON" | jq -r '.[0].earliest_match // "none"')"
           LATEST="$(echo    "$RESULT_JSON" | jq -r '.[0].latest_match // "none"')"
 
-          echo "📊 Result:"
-          echo "  • Athletes with matches: $ATHLETES"
-          echo "  • Total matches: $MATCHES"
-          echo "  • Date range: $EARLIEST → $LATEST"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "📊 QUERY RESULTS:"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "  Athletes with matches: $ATHLETES"
+          echo "  Total match records:   $MATCHES"
+          echo "  Date range:            $EARLIEST → $LATEST"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo ""
 
           if [ "$MATCHES" -gt 0 ]; then
-            echo "✅ Found matching readiness – models can train"
+            echo "✅ SUCCESS: Found matching readiness data"
+            echo "   → Models can be trained for $ATHLETES athletes"
+            echo ""
             echo "has_matches=true" >> "$GITHUB_OUTPUT"
             echo "match_count=$MATCHES" >> "$GITHUB_OUTPUT"
             echo "athlete_count=$ATHLETES" >> "$GITHUB_OUTPUT"
           else
-            echo "⏭️  No matching readiness data (OK) – training will be skipped"
+            echo "⚠️  NO MATCHES FOUND"
+            echo ""
+            echo "Possible reasons:"
+            echo "  1. No workload data in last 7 days"
+            echo "  2. No VALD tests in last 7 days"
+            echo "  3. Athletes have workload OR VALD, but not BOTH on same dates"
+            echo "  4. Name mismatches: roster 'Vald Name' ≠ vald_fd_jumps 'full_name'"
+            echo ""
+            echo "⏭️  Training will be skipped (this is normal if no recent data)"
+            echo ""
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
