@@ -77,24 +77,12 @@ cat("Skip training:", skip_training, "\n")
 cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
 cat("Match lookback days:", match_lookback_days, "\n\n")
 
-# Validate GCS_BUCKET is set (critical for model saving)
-if (!nzchar(gcs_bucket)) {
-  cat("❌ ERROR: GCS_BUCKET environment variable is not set.\n")
-  cat("\n")
-  cat("Models cannot be saved without a GCS bucket.\n")
-  cat("\n")
-  cat("Action required:\n")
-  cat("  1. Go to repository Settings → Secrets and variables → Actions\n")
-  cat("  2. Add repository secret 'GCS_BUCKET'\n")
-  cat("  3. Set value to your bucket name (without 'gs://' prefix)\n")
-  cat("     Example: my-vald-models-bucket\n")
-  cat("\n")
-  cat("The workflow will pass GCS_BUCKET to this script via env vars.\n")
-  cat("\n")
-  stop("GCS_BUCKET is required but not set. Cannot proceed with model training.")
+# Note: GCS_BUCKET is optional now (models saved to BigQuery instead of GCS)
+if (nzchar(gcs_bucket)) {
+  cat("✅ GCS_BUCKET set (optional for legacy RDS backups)\n\n")
+} else {
+  cat("ℹ️  GCS_BUCKET not set - models will be saved to BigQuery only\n\n")
 }
-
-cat("✅ GCS_BUCKET validation passed\n\n")
 
 ################################################################################
 # LOGGING
@@ -365,6 +353,345 @@ parse_date_robust <- function(vec) {
   # anything else -> NA
   rep(as.Date(NA), length(vec))
 }
+
+################################################################################
+# MODEL FLATTENING FUNCTIONS
+# Save model coefficients to BigQuery in long format
+################################################################################
+
+#' Extract coefficients from glmnet models (elastic_net, lasso, ridge)
+#' Returns a data frame in LONG format: one row per coefficient
+flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
+  tryCatch({
+    # Unwrap model if nested
+    fit <- model_obj
+    if (is.list(fit) && !is.null(fit$model)) fit <- fit$model
+    if (is.list(fit) && !is.null(fit$glmnet.fit)) fit <- fit$glmnet.fit
+    if (is.list(fit) && !is.null(fit$finalModel)) fit <- fit$finalModel
+    
+    # Get lambda
+    lambda <- if (inherits(fit, "cv.glmnet")) {
+      fit$lambda.min  # or lambda.1se for more regularization
+    } else if (!is.null(fit$lambda)) {
+      fit$lambda[1]
+    } else {
+      NA_real_
+    }
+    
+    # Get alpha (elastic net mixing parameter)
+    alpha <- if (grepl("lasso", model_type, ignore.case = TRUE)) {
+      1.0
+    } else if (grepl("ridge", model_type, ignore.case = TRUE)) {
+      0.0
+    } else {
+      # Try to extract from model
+      tryCatch(as.numeric(fit$call$alpha), error = function(e) NA_real_)
+    }
+    
+    # Extract coefficients
+    coef_matrix <- as.matrix(coef(fit, s = lambda))
+    coef_values <- as.numeric(coef_matrix[, 1])
+    coef_names <- rownames(coef_matrix)
+    
+    # Create long format data frame
+    coef_df <- tibble(
+      model_id = model_id,
+      athlete_id = athlete_id,
+      model_type = model_type,
+      coefficient_name = coef_names,
+      coefficient_value = coef_values,
+      coefficient_type = if_else(coefficient_name == "(Intercept)", "intercept", "predictor"),
+      is_zero = abs(coefficient_value) < 1e-10,
+      extracted_at = Sys.time()
+    )
+    
+    # Add hyperparameters as special rows
+    hyper_df <- tibble(
+      model_id = model_id,
+      athlete_id = athlete_id,
+      model_type = model_type,
+      coefficient_name = c("_lambda", "_alpha", "_n_features"),
+      coefficient_value = c(lambda, alpha, sum(!coef_df$is_zero & coef_df$coefficient_type == "predictor")),
+      coefficient_type = "hyperparameter",
+      is_zero = FALSE,
+      extracted_at = Sys.time()
+    )
+    
+    bind_rows(coef_df, hyper_df)
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to flatten glmnet model %s: %s", model_id, e$message),
+      "WARN"
+    )
+    NULL
+  })
+}
+
+#' Extract structure from Bayesian Network models
+flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
+  tryCatch({
+    # Unwrap model if nested
+    bn_model <- model_obj
+    if (is.list(bn_model) && !is.null(bn_model$model)) bn_model <- bn_model$model
+    
+    # Get nodes and edges
+    nodes <- bnlearn::nodes(bn_model)
+    arcs <- bnlearn::arcs(bn_model)
+    
+    # Create coefficient-like representation for BN structure
+    # Each arc becomes a "coefficient" representing the edge
+    if (nrow(arcs) > 0) {
+      arc_df <- tibble(
+        model_id = model_id,
+        athlete_id = athlete_id,
+        model_type = model_type,
+        coefficient_name = paste0(arcs[, "from"], " -> ", arcs[, "to"]),
+        coefficient_value = 1.0,  # Presence of edge
+        coefficient_type = "edge",
+        is_zero = FALSE,
+        extracted_at = Sys.time()
+      )
+    } else {
+      arc_df <- tibble()
+    }
+    
+    # Add structure metadata
+    meta_df <- tibble(
+      model_id = model_id,
+      athlete_id = athlete_id,
+      model_type = model_type,
+      coefficient_name = c("_n_nodes", "_n_edges"),
+      coefficient_value = c(length(nodes), nrow(arcs)),
+      coefficient_type = "hyperparameter",
+      is_zero = FALSE,
+      extracted_at = Sys.time()
+    )
+    
+    bind_rows(arc_df, meta_df)
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to flatten BN model %s: %s", model_id, e$message),
+      "WARN"
+    )
+    NULL
+  })
+}
+
+#' Main function to flatten any model type
+#' Returns data frame ready for BigQuery upload
+flatten_model <- function(model_obj, model_id, athlete_id, model_type) {
+  
+  # Normalize model_type
+  model_type_lower <- tolower(model_type)
+  
+  # Route to appropriate flattener
+  if (model_type_lower %in% c("elastic_net", "lasso", "ridge")) {
+    return(flatten_glmnet_model(model_obj, model_id, athlete_id, model_type))
+  } else if (model_type_lower == "bayesian_network") {
+    return(flatten_bn_model(model_obj, model_id, athlete_id, model_type))
+  } else {
+    create_log_entry(
+      sprintf("Unknown model type for flattening: %s", model_type),
+      "WARN"
+    )
+    return(NULL)
+  }
+}
+
+#' Upload flattened coefficients to BigQuery
+upload_model_coefficients <- function(coef_df, project, dataset) {
+  if (is.null(coef_df) || nrow(coef_df) == 0) {
+    return(FALSE)
+  }
+  
+  tryCatch({
+    # Create table reference
+    coef_table <- bq_table(project, dataset, "model_coefficients")
+    
+    # Ensure table exists
+    if (!bq_table_exists(coef_table)) {
+      # Create with partitioning by extraction date
+      bq_project_query(project, glue("
+        CREATE TABLE `{project}.{dataset}.model_coefficients` (
+          model_id STRING NOT NULL,
+          athlete_id STRING,
+          model_type STRING NOT NULL,
+          coefficient_name STRING NOT NULL,
+          coefficient_value FLOAT64,
+          coefficient_type STRING,
+          is_zero BOOLEAN,
+          extracted_at TIMESTAMP NOT NULL
+        )
+        PARTITION BY DATE(extracted_at)
+        CLUSTER BY model_id, athlete_id, coefficient_type
+        OPTIONS(
+          description='Flattened model coefficients in long format'
+        )
+      "))
+      create_log_entry("Created model_coefficients table")
+    }
+    
+    # Upload data
+    bq_table_upload(coef_table, coef_df, write_disposition = "WRITE_APPEND")
+    
+    create_log_entry(
+      sprintf("Uploaded %d coefficients for model %s", 
+              nrow(coef_df), coef_df$model_id[1])
+    )
+    
+    TRUE
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to upload coefficients: %s", e$message),
+      "ERROR"
+    )
+    FALSE
+  })
+}
+
+#' Create wide format coefficients view (optional)
+#' This is useful for exporting to CSV or R analysis
+create_wide_coefficients_view <- function(project, dataset) {
+  tryCatch({
+    # Create a view that pivots to wide format
+    # Note: This will only work if you know the coefficient names in advance
+    # For dynamic pivoting, use a scheduled query or R script
+    
+    sql <- glue("
+      CREATE OR REPLACE VIEW `{project}.{dataset}.model_coefficients_wide` AS
+      WITH coef_data AS (
+        SELECT
+          model_id,
+          athlete_id,
+          model_type,
+          coefficient_name,
+          coefficient_value,
+          extracted_at
+        FROM `{project}.{dataset}.model_coefficients`
+        WHERE coefficient_type != 'hyperparameter'
+      ),
+      hyper_data AS (
+        SELECT
+          model_id,
+          MAX(IF(coefficient_name = '_lambda', coefficient_value, NULL)) as lambda,
+          MAX(IF(coefficient_name = '_alpha', coefficient_value, NULL)) as alpha,
+          MAX(IF(coefficient_name = '_n_features', coefficient_value, NULL)) as n_features
+        FROM `{project}.{dataset}.model_coefficients`
+        WHERE coefficient_type = 'hyperparameter'
+        GROUP BY model_id
+      )
+      SELECT
+        c.model_id,
+        c.athlete_id,
+        c.model_type,
+        h.lambda,
+        h.alpha,
+        h.n_features,
+        MAX(IF(c.coefficient_name = '(Intercept)', c.coefficient_value, NULL)) as intercept,
+        -- Add more coefficients as needed
+        -- MAX(IF(c.coefficient_name = 'distance_7d', c.coefficient_value, NULL)) as coef_distance_7d,
+        MAX(c.extracted_at) as extracted_at
+      FROM coef_data c
+      LEFT JOIN hyper_data h ON c.model_id = h.model_id
+      GROUP BY c.model_id, c.athlete_id, c.model_type, h.lambda, h.alpha, h.n_features
+    ")
+    
+    bq_project_query(project, sql)
+    create_log_entry("Created model_coefficients_wide view")
+    TRUE
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to create wide view: %s", e$message),
+      "WARN"
+    )
+    FALSE
+  })
+}
+
+#' Reconstruct glmnet model from stored coefficients for prediction
+#' This allows prediction without loading RDS files from GCS
+reconstruct_glmnet_from_coefficients <- function(model_id, project, dataset) {
+  tryCatch({
+    # Load coefficients
+    sql <- glue("
+      SELECT 
+        coefficient_name,
+        coefficient_value,
+        coefficient_type
+      FROM `{project}.{dataset}.model_coefficients`
+      WHERE model_id = '{model_id}'
+    ")
+    
+    coef_data <- bq_table_download(bq_project_query(project, sql))
+    
+    if (nrow(coef_data) == 0) {
+      stop("No coefficients found for model_id: ", model_id)
+    }
+    
+    # Extract hyperparameters
+    lambda <- coef_data %>% 
+      filter(coefficient_name == "_lambda") %>% 
+      pull(coefficient_value) %>% 
+      first()
+    
+    alpha <- coef_data %>% 
+      filter(coefficient_name == "_alpha") %>% 
+      pull(coefficient_value) %>% 
+      first()
+    
+    # Extract coefficients (excluding hyperparameters)
+    coefs <- coef_data %>%
+      filter(coefficient_type %in% c("intercept", "predictor")) %>%
+      select(coefficient_name, coefficient_value)
+    
+    # Create a simple prediction function
+    # For full glmnet object reconstruction, you'd need to load the RDS
+    predict_fn <- function(new_data) {
+      # Get intercept
+      intercept <- coefs %>%
+        filter(coefficient_name == "(Intercept)") %>%
+        pull(coefficient_value) %>%
+        first()
+      
+      if (length(intercept) == 0) intercept <- 0
+      
+      # Get predictor coefficients
+      pred_coefs <- coefs %>%
+        filter(coefficient_name != "(Intercept)")
+      
+      # Calculate prediction
+      pred <- intercept
+      for (i in seq_len(nrow(pred_coefs))) {
+        feat_name <- pred_coefs$coefficient_name[i]
+        coef_val <- pred_coefs$coefficient_value[i]
+        
+        if (feat_name %in% names(new_data)) {
+          pred <- pred + coef_val * new_data[[feat_name]]
+        }
+      }
+      
+      pred
+    }
+    
+    list(
+      predict = predict_fn,
+      coefficients = coefs,
+      lambda = lambda,
+      alpha = alpha
+    )
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to reconstruct model %s: %s", model_id, e$message),
+      "ERROR"
+    )
+    NULL
+  })
+}
                  
 ################################################################################
 # FIX 3.3: CONFIGURATION AUDIT TRAIL
@@ -594,6 +921,36 @@ tryCatch({
     CLUSTER BY model_id, version_id, stage
   "))
   create_log_entry("Registry table verified: registry_stages")
+  
+  # Model Coefficients Table (for flattened models)
+  create_log_entry("Initializing model coefficients table")
+  coef_table_result <- tryCatch({
+    bq_project_query(project, glue("
+      CREATE TABLE IF NOT EXISTS `{project}.{dataset}.model_coefficients` (
+        model_id STRING NOT NULL,
+        athlete_id STRING,
+        model_type STRING NOT NULL,
+        coefficient_name STRING NOT NULL,
+        coefficient_value FLOAT64,
+        coefficient_type STRING,
+        is_zero BOOLEAN,
+        extracted_at TIMESTAMP NOT NULL
+      )
+      PARTITION BY DATE(extracted_at)
+      CLUSTER BY model_id, athlete_id, coefficient_type
+      OPTIONS(
+        description='Flattened model coefficients in long format for easy querying'
+      )
+    "))
+    create_log_entry("Registry table verified: model_coefficients")
+    
+    # Optionally create wide format view
+    create_wide_coefficients_view(project, dataset)
+    TRUE
+  }, error = function(e) {
+    create_log_entry(paste("Model coefficients table initialization warning:", e$message), "WARN")
+    FALSE
+  })
   
 }, error = function(e) {
   create_log_entry(paste("Registry initialization failed:", e$message), "ERROR")
@@ -1349,7 +1706,7 @@ for (i in seq_len(n_athletes)) {
     best_idx <- finite_idx[which.min(prim_rmse[finite_idx])]
     best_cand <- cands[[best_idx]]
     
-    # Save best model to registry
+    # Save best model to registry (NEW: No RDS/GCS, only BigQuery)
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
       if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
         create_log_entry(
@@ -1361,101 +1718,18 @@ for (i in seq_len(n_athletes)) {
           success = FALSE, 
           model_id = paste(team_name, model_name, sep=":"), 
           version_id = version_id, 
-          artifact_uri = NA,
+          artifact_uri = "bigquery:model_coefficients",
+          model_object = NULL,
           error = "model_fit_error"
-        ))
-      }
-      
-      if (!nzchar(gcs_bucket)) {
-        create_log_entry(
-          sprintf("Cannot save model for %s: GCS_BUCKET not set", model_name),
-          "ERROR",
-          reason = "gcs_bucket_missing"
-        )
-        return(list(
-          success = FALSE, 
-          model_id = paste(team_name, model_name, sep=":"), 
-          version_id = version_id, 
-          artifact_uri = NA,
-          error = "gcs_bucket_missing"
         ))
       }
       
       tryCatch({
         model_id <- paste(team_name, model_name, sep = ":")
         
-        # Save artifact to GCS
-        dir.create("artifact", showWarnings = FALSE)
-        model_save <- list(
-          model=candidate$fitted$model, 
-          type=candidate$model_type,
-          predictors=candidate$fitted$predictors, 
-          preprocessing=candidate$fitted$preprocessing,
-          date_created=Sys.time(), 
-          athlete_id=athlete_id
-        )
-        
-        # Save RDS file locally first
-        tryCatch({
-          saveRDS(model_save, "artifact/model.rds")
-          create_log_entry(sprintf("  Model serialized to RDS: %s", model_name))
-        }, error = function(e) {
-          create_log_entry(
-            sprintf("  ERROR serializing model to RDS for %s: %s", model_name, e$message),
-            "ERROR",
-            reason = "rds_serialization_failed"
-          )
-          stop(sprintf("RDS serialization failed: %s", e$message))
-        })
-        
-        sha <- digest::digest(file="artifact/model.rds", algo="sha256")
-        
-        manifest <- list(
-          model_name=model_name, 
-          version_id=version_id, 
-          created_at=as.character(Sys.time()),
-          r_version=R.version$version.string, 
-          checksum_sha256=sha, 
-          hyperparameters=candidate$hyper
-        )
-        jsonlite::write_json(manifest, "artifact/manifest.json", auto_unbox=TRUE, pretty=TRUE)
-        
-        safe_model_name <- gsub("[^A-Za-z0-9]+", "_", model_name)
-        gcs_path <- sprintf("models/%s/%s/%s/", team_name, safe_model_name, version_id)
-        
-        # Upload to GCS with detailed error handling
-        tryCatch({
-          gcs_upload("artifact/model.rds", name=paste0(gcs_path, "model.rds"))
-          create_log_entry(sprintf("  Uploaded model.rds to gs://%s/%s", gcs_bucket, gcs_path))
-        }, error = function(e) {
-          create_log_entry(
-            sprintf("  ERROR uploading model.rds to GCS for %s: %s", model_name, e$message),
-            "ERROR",
-            reason = "gcs_upload_failed"
-          )
-          create_log_entry(
-            sprintf("  GCS path: gs://%s/%smodel.rds", gcs_bucket, gcs_path),
-            "ERROR"
-          )
-          # Print stack trace if available
-          tb <- tryCatch(capture.output(traceback()), error = function(e2) NULL)
-          if (!is.null(tb) && length(tb) > 0) {
-            create_log_entry(sprintf("  Stack trace:\n%s", paste(tb, collapse="\n")), "ERROR")
-          }
-          stop(sprintf("GCS upload failed: %s", e$message))
-        })
-        
-        tryCatch({
-          gcs_upload("artifact/manifest.json", name=paste0(gcs_path, "manifest.json"))
-          create_log_entry(sprintf("  Uploaded manifest.json to GCS"))
-        }, error = function(e) {
-          create_log_entry(
-            sprintf("  WARNING: manifest.json upload failed: %s", e$message),
-            "WARN"
-          )
-        })
-        
-        artifact_uri <- sprintf("gs://%s/%smodel.rds", gcs_bucket, gcs_path)
+        # No RDS/GCS saving - coefficients will be saved to BigQuery instead
+        artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
+                               project, dataset, model_id)
         
         # Save to registry with enhanced metadata (FIX 1.3)
         tryCatch({
@@ -1489,7 +1763,7 @@ for (i in seq_len(n_athletes)) {
                pipeline_run_id, git_commit_sha)
             VALUES
               ('{model_id}','{version_id}',CURRENT_TIMESTAMP(),'github_actions',
-               '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','',
+               '{artifact_uri}','bigquery','R/glmnet','{R.version$version.string}','','',
                '{cfg_start_date}', '{cfg_end_date}',
                {n_tr}, {n_te}, '{val_method}',
                '{preds_json}',
@@ -1538,9 +1812,14 @@ for (i in seq_len(n_athletes)) {
           stop(sprintf("BigQuery registry save failed: %s", e$message))
         })
         
-        unlink("artifact", recursive=TRUE)
-        
-        list(success=TRUE, model_id=model_id, version_id=version_id, artifact_uri=artifact_uri)
+        # Return success with model object for flattening
+        list(
+          success=TRUE, 
+          model_id=model_id, 
+          version_id=version_id, 
+          artifact_uri=artifact_uri,
+          model_object=candidate$fitted$model  # Model object for coefficient flattening
+        )
       }, error = function(e) {
         # Top-level error handler with full details
         create_log_entry(
@@ -1570,48 +1849,88 @@ for (i in seq_len(n_athletes)) {
         
         # Diagnostic information
         cat("Diagnostic info:\n")
-        cat("  GCS_BUCKET:", gcs_bucket, "\n")
         cat("  Model type:", candidate$model_type, "\n")
         cat("  Athlete ID:", athlete_id, "\n")
         cat("  Version ID:", version_id, "\n")
         cat("\n")
-        
-        # Attempt to save model locally as backup
-        tryCatch({
-          local_dir <- "failed_models"
-          dir.create(local_dir, showWarnings = FALSE, recursive = TRUE)
-          local_path <- file.path(local_dir, paste0(model_name, "_", version_id, ".rds"))
-          
-          model_save <- list(
-            model=candidate$fitted$model, 
-            type=candidate$model_type,
-            predictors=candidate$fitted$predictors, 
-            preprocessing=candidate$fitted$preprocessing,
-            date_created=Sys.time(), 
-            athlete_id=athlete_id,
-            error_during_save = conditionMessage(e)
-          )
-          saveRDS(model_save, local_path)
-          
-          cat("✅ Model saved locally as backup:", local_path, "\n")
-          create_log_entry(
-            sprintf("  Model backed up locally: %s", local_path),
-            "WARN",
-            reason = "local_backup"
-          )
-        }, error = function(e2) {
-          cat("❌ Could not save local backup:", conditionMessage(e2), "\n")
-        })
-        
         cat("════════════════════════════════════════════════════\n")
         cat("\n")
         
-        list(success=FALSE, model_id=NA, version_id=NA, artifact_uri=NA, error=conditionMessage(e))
+        list(
+          success=FALSE, 
+          model_id=NA, 
+          version_id=NA, 
+          artifact_uri=NA, 
+          model_object=NULL,
+          error=conditionMessage(e)
+        )
       })
     }
     
     model_name <- paste(athlete_id, best_cand$model_type, sep = "_")
     save_result <- save_model_to_registry(athlete_id, model_name, best_cand, version_id)
+    
+    # ============================================
+    # FLATTEN AND UPLOAD COEFFICIENTS TO BIGQUERY
+    # ============================================
+    if (isTRUE(save_result$success) && !is.null(save_result$model_object)) {
+      
+      create_log_entry(sprintf("  Flattening %s model for athlete %s...", best_cand$model_type, athlete_id))
+      
+      # Flatten the model
+      coef_df <- flatten_model(
+        model_obj = save_result$model_object,
+        model_id = save_result$model_id,
+        athlete_id = athlete_id,
+        model_type = best_cand$model_type
+      )
+      
+      # Upload to BigQuery
+      if (!is.null(coef_df) && nrow(coef_df) > 0) {
+        upload_success <- upload_model_coefficients(
+          coef_df = coef_df,
+          project = project,
+          dataset = dataset
+        )
+        
+        if (upload_success) {
+          n_coefs <- sum(!coef_df$is_zero & coef_df$coefficient_type == "predictor")
+          n_total <- nrow(coef_df)
+          
+          create_log_entry(
+            sprintf("  ✓ Flattened: %d total entries (%d non-zero predictors)", 
+                    n_total, n_coefs)
+          )
+          
+          # Store flattening metadata
+          save_result$n_coefficients <- n_total
+          save_result$n_nonzero_coefficients <- n_coefs
+          save_result$flattened <- TRUE
+        } else {
+          create_log_entry(
+            sprintf("  ⚠ Failed to upload coefficients for model %s", save_result$model_id),
+            "WARN"
+          )
+          save_result$n_coefficients <- NA_integer_
+          save_result$n_nonzero_coefficients <- NA_integer_
+          save_result$flattened <- FALSE
+        }
+      } else {
+        create_log_entry(
+          sprintf("  ⚠ No coefficients extracted for model %s", save_result$model_id),
+          "WARN"
+        )
+        save_result$n_coefficients <- NA_integer_
+        save_result$n_nonzero_coefficients <- NA_integer_
+        save_result$flattened <- FALSE
+      }
+    } else {
+      # Model save failed or no model object
+      save_result$n_coefficients <- NA_integer_
+      save_result$n_nonzero_coefficients <- NA_integer_
+      save_result$flattened <- FALSE
+    }
+    # ============================================
     
     if (isTRUE(save_result$success) || is.na(save_result$success)) {
       create_log_entry(glue("  SUCCESS: {best_cand$model_type} (RMSE={round(best_cand$primary_rmse, 3)})"))
@@ -1673,6 +1992,9 @@ for (i in seq_len(n_athletes)) {
         n_predictors = length(preds),
         validation_method = val_method,
         hyperparameters = best_cand$hyper,
+        flattened = save_result$flattened %||% FALSE,
+        n_coefficients = save_result$n_coefficients %||% NA_integer_,
+        n_nonzero_coefficients = save_result$n_nonzero_coefficients %||% NA_integer_,
         trained_at = Sys.time()
       )
     } else {
