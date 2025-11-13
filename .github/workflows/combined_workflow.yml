@@ -293,21 +293,15 @@ jobs:
               TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
             FROM \
-            `
-              ${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}
-            `
+            `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(
-                `Vald Name`
-              )) AS vald_full_name_norm
+              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
             FROM \
-            `
-              ${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}
-            `
+            `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           readiness_recent AS (
             SELECT
@@ -315,9 +309,7 @@ jobs:
               LOWER(TRIM(full_name_norm)) AS vald_full_name_norm,
               CAST(readiness AS FLOAT64)  AS readiness
             FROM \
-            `
-              ${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}
-            `
+            `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_by_id AS (
@@ -480,8 +472,7 @@ jobs:
                n_train,\
                FORMAT_TIMESTAMP('%H:%M', trained_at) as time\
              FROM \
-               \
-              `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+             `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()\
              ORDER BY trained_at DESC\
              LIMIT 10" || echo "No training results yet"
@@ -495,8 +486,7 @@ jobs:
                ROUND(AVG(primary_rmse), 3) as avg_rmse,\
                FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run\
              FROM \
-               \
-              `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+             `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
 
   summary:
