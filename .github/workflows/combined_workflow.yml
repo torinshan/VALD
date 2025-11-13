@@ -41,6 +41,7 @@ jobs:
   # ============================================================================
   # JOB 1: WORKLOAD INGEST (always)
   # Reads .github/Clean_Activities_GPS.xlsx directly (no OneDrive).
+  # Expects your R script at .github/scripts/workload_ingest.R
   # ============================================================================
   ingest:
     runs-on: ubuntu-latest
@@ -268,13 +269,16 @@ jobs:
 
           echo "🔍 Validating roster mapping table..."
 
-          ROSTER_COUNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
-            query --use_legacy_sql=false --format=csv \
-            "SELECT COUNT(*) FROM \
-            `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`" | tail -n1)
+          TABLE_REF="${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}"
+          ROSTER_COUNT=$(
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+              query --use_legacy_sql=false --format=csv \
+              "$(printf 'SELECT COUNT(*) FROM \
+          `%s`' "${TABLE_REF}")" | tail -n1
+          )
 
           if [ "$ROSTER_COUNT" -eq 0 ]; then
-            echo "❌ roster_mapping is empty – need offical_id ⇄ `Vald Name` rows"
+            echo "❌ roster_mapping is empty – need offical_id ⇄ Vald Name rows"
             exit 1
           fi
           echo "✅ Roster rows: $ROSTER_COUNT"
@@ -309,14 +313,18 @@ jobs:
             SELECT DISTINCT
               TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
+            FROM \
+          \
+          `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(`Vald Name`))       AS vald_full_name_norm
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
+              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
+            FROM \
+          \
+          `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           readiness_recent AS (
             SELECT
@@ -333,7 +341,9 @@ jobs:
                   0
                 )
               ) AS readiness
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
+            FROM \
+          \
+          `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_by_id AS (
@@ -501,7 +511,9 @@ jobs:
                ROUND(primary_rmse, 3) as rmse,\
                n_train,\
                FORMAT_TIMESTAMP('%H:%M', trained_at) as time\
-             FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+             FROM \
+          \
+          `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()\
              ORDER BY trained_at DESC\
              LIMIT 10" || echo "No training results yet"
@@ -514,7 +526,9 @@ jobs:
                COUNT(*) as total_models,\
                ROUND(AVG(primary_rmse), 3) as avg_rmse,\
                FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run\
-             FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+             FROM \
+          \
+          `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
 
   # ============================================================================
