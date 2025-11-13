@@ -526,7 +526,6 @@ jobs:
             any::gargle
             any::glue
             any::digest
-            any::googleCloudStorageR
             any::glmnet
             any::bnlearn
             any::reticulate
@@ -535,62 +534,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
-
-      - name: Ensure GCS_BUCKET env is set
-        env:
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-        run: |
-          if [ -z "$GCS_BUCKET" ]; then
-            echo "❌ ERROR: GCS_BUCKET is empty. Set repository secret 'GCS_BUCKET' to the target bucket name."
-            echo "   Go to Settings → Secrets and variables → Actions → Repository secrets"
-            echo "   Add secret 'GCS_BUCKET' with value: your-bucket-name (no gs:// prefix)"
-            exit 1
-          fi
-          echo "✅ GCS_BUCKET is set: $GCS_BUCKET"
-
-      - name: Verify GCS bucket + write access
-        env:
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-        run: |
-          set -euo pipefail
-          echo "=== GCS Bucket Validation ==="
-          echo "GCS_BUCKET='$GCS_BUCKET'"
-          
-          # Check that bucket exists
-          if ! gsutil ls "gs://${GCS_BUCKET}" >/dev/null 2>&1; then
-            echo ""
-            echo "❌ Bucket gs://${GCS_BUCKET} not found or not visible to current credentials"
-            echo ""
-            echo "Troubleshooting:"
-            echo "  1. Verify bucket name is correct (no gs:// prefix)"
-            echo "  2. Check service account has Storage Object Viewer permission"
-            echo "  3. Verify GCP_SA_KEY secret is valid and has bucket access"
-            echo ""
-            echo "Available buckets for this service account:"
-            gsutil ls 2>&1 || echo "  (none visible - permission issue)"
-            exit 1
-          fi
-          echo "✅ Bucket exists and is accessible"
-          
-          # Try to write a small test object to validate permissions
-          echo "test-$(date +%s)" > /tmp/gcs_write_test.txt
-          TEST_OBJECT="ci_write_test_$(date +%s).txt"
-          
-          if ! gsutil cp /tmp/gcs_write_test.txt "gs://${GCS_BUCKET}/${TEST_OBJECT}" >/dev/null 2>&1; then
-            echo ""
-            echo "❌ Unable to write to gs://${GCS_BUCKET}"
-            echo ""
-            echo "Troubleshooting:"
-            echo "  1. Service account needs Storage Object Creator permission"
-            echo "  2. Or roles/storage.objectAdmin on the bucket"
-            echo "  3. Verify GCP_SA_KEY has write access, not just read"
-            exit 1
-          fi
-          echo "✅ GCS bucket is writable"
-          
-          # Clean up test file
-          gsutil rm "gs://${GCS_BUCKET}/${TEST_OBJECT}" >/dev/null 2>&1 || true
-          echo "✅ GCS preflight checks passed"
 
       - name: Verify BigQuery write access
         env:
@@ -644,8 +587,6 @@ jobs:
           HAS_MATCHES:       ${{ needs.check-readiness.outputs.has_matches }}
           MATCH_LOOKBACK_DAYS: '7'
           SKIP_TRAINING:     ${{ github.event.inputs.skip_training || 'false' }}
-
-          GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}
         run: Rscript ".github/scripts/readiness_models_cloud.R"
 
       - name: Show today's training summary (best-effort)

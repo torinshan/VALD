@@ -6,7 +6,6 @@ tryCatch({
     library(dplyr); library(tidyr); library(data.table)
     library(lubridate); library(slider); library(stringr)
     library(gargle); library(glue); library(digest)
-    library(googleCloudStorageR)
     library(glmnet); library(bnlearn); library(reticulate)
     library(jsonlite)
   })
@@ -24,7 +23,6 @@ Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 project    <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
 dataset    <- Sys.getenv("BQ_DATASET",  "analytics")
 location   <- Sys.getenv("BQ_LOCATION", "US")
-gcs_bucket <- Sys.getenv("GCS_BUCKET",  "")
 team_name  <- Sys.getenv("TEAM_NAME",   "sacstate-football")
 
 # Table names
@@ -64,7 +62,6 @@ match_lookback_days <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
 cat("=== CONFIGURATION ===\n")
 cat("GCP Project:", project, "\n")
 cat("BQ Dataset:", dataset, "\n")
-cat("GCS Bucket:", ifelse(nzchar(gcs_bucket), gcs_bucket, "(none)"), "\n")
 cat("Team:", team_name, "\n")
 cat("Workload table:", workload_table, "\n")
 cat("Readiness table:", readiness_table, "\n")
@@ -75,14 +72,8 @@ cat("Train fraction:", cfg_frac_train, "\n")
 cat("Min train obs:", MIN_TRAIN_OBS, "\n")
 cat("Skip training:", skip_training, "\n")
 cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
-cat("Match lookback days:", match_lookback_days, "\n\n")
-
-# Note: GCS_BUCKET is optional now (models saved to BigQuery instead of GCS)
-if (nzchar(gcs_bucket)) {
-  cat("✅ GCS_BUCKET set (optional for legacy RDS backups)\n\n")
-} else {
-  cat("ℹ️  GCS_BUCKET not set - models will be saved to BigQuery only\n\n")
-}
+cat("Match lookback days:", match_lookback_days, "\n")
+cat("Storage: BigQuery tables only\n\n")
 
 ################################################################################
 # LOGGING
@@ -141,14 +132,6 @@ tryCatch({
     client = gargle::gargle_client(),
     credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
   ))
-  if (nzchar(gcs_bucket)) {
-    gcs_auth(token = gargle::gargle2.0_token(
-      scope = 'https://www.googleapis.com/auth/devstorage.full_control',
-      client = gargle::gargle_client(),
-      credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
-    ))
-    gcs_global_bucket(gcs_bucket)
-  }
   create_log_entry("Authentication successful")
 }, error = function(e) {
   create_log_entry(paste("Authentication failed:", e$message), "ERROR")
@@ -613,7 +596,7 @@ create_wide_coefficients_view <- function(project, dataset) {
 }
 
 #' Reconstruct glmnet model from stored coefficients for prediction
-#' This allows prediction without loading RDS files from GCS
+#' Loads coefficients from BigQuery and creates a prediction function
 reconstruct_glmnet_from_coefficients <- function(model_id, project, dataset) {
   tryCatch({
     # Load coefficients
@@ -648,8 +631,7 @@ reconstruct_glmnet_from_coefficients <- function(model_id, project, dataset) {
       filter(coefficient_type %in% c("intercept", "predictor")) %>%
       select(coefficient_name, coefficient_value)
     
-    # Create a simple prediction function
-    # For full glmnet object reconstruction, you'd need to load the RDS
+    # Create prediction function from coefficients
     predict_fn <- function(new_data) {
       # Get intercept
       intercept <- coefs %>%
@@ -707,7 +689,6 @@ config_snapshot <- tibble(
   # Environment config
   gcp_project = project,
   bq_dataset = dataset,
-  gcs_bucket = ifelse(nzchar(gcs_bucket), gcs_bucket, "(none)"),
   team_name = team_name,
   
   # Table names
@@ -1706,7 +1687,7 @@ for (i in seq_len(n_athletes)) {
     best_idx <- finite_idx[which.min(prim_rmse[finite_idx])]
     best_cand <- cands[[best_idx]]
     
-    # Save best model to registry (NEW: No RDS/GCS, only BigQuery)
+    # Save best model to registry (coefficients saved to BigQuery)
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
       if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
         create_log_entry(
@@ -1727,7 +1708,7 @@ for (i in seq_len(n_athletes)) {
       tryCatch({
         model_id <- paste(team_name, model_name, sep = ":")
         
-        # No RDS/GCS saving - coefficients will be saved to BigQuery instead
+        # Coefficients saved to BigQuery model_coefficients table
         artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
                                project, dataset, model_id)
         
