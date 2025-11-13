@@ -19,36 +19,25 @@ on:
         required: false
         default: "2025-12-31"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GLOBAL CONSTANTS (not secrets)
-# ──────────────────────────────────────────────────────────────────────────────
 env:
-  # GCP project configuration
   GCP_PROJECT: sac-vald-hub
   BQ_DATASET: analytics
   BQ_LOCATION: US
 
-  # BigQuery table names (constants; do NOT set these to secrets)
   WORKLOAD_TABLE: workload_daily
-  READINESS_TABLE: vald_fd_jumps          # raw VALD table with full_name + readiness fields
-  ROSTER_TABLE: roster_mapping            # has offical_id and `Vald Name` (exact spelling)
+  READINESS_TABLE: ml_builder_readiness
+  ROSTER_TABLE: roster_mapping
   PREDICTIONS_TABLE: readiness_predictions_byname
 
-  # Other constants
   TEAM_NAME: sacstate-football
 
 jobs:
-  # ============================================================================
-  # JOB 1: WORKLOAD INGEST (always)
-  # Reads .github/Clean_Activities_GPS.xlsx directly (no OneDrive).
-  # Expects your R script at .github/scripts/workload_ingest.R
-  # ============================================================================
   ingest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true        
+          lfs: true
           fetch-depth: 1
 
       - name: Auth to Google Cloud
@@ -119,10 +108,6 @@ jobs:
     outputs:
       status: ${{ steps.ingest_check.outputs.status }}
 
-  # ============================================================================
-  # JOB 1.5: ROSTER INGEST (build roster_mapping from local Excel)
-  # Produces analytics.roster_mapping with offical_id and 'Vald Name' columns.
-  # ============================================================================
   ingest-roster:
     runs-on: ubuntu-latest
     steps:
@@ -186,11 +171,6 @@ jobs:
     outputs:
       status: ${{ steps.roster_check.outputs.status }}
 
-  # ============================================================================
-  # JOB 2: CHECK FOR READINESS DATA MATCH (ID-based via roster mapping)
-  # Joins workload.roster_name (== offical_id) to roster_mapping.offical_id,
-  # maps to `Vald Name`, then matches to vald_fd_jumps.full_name by date.
-  # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
     needs: [ingest, ingest-roster]
@@ -273,8 +253,7 @@ jobs:
           ROSTER_COUNT=$(
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
               query --use_legacy_sql=false --format=csv \
-              "$(printf 'SELECT COUNT(*) FROM \
-          `%s`' "${TABLE_REF}")" | tail -n1
+              "$(printf 'SELECT COUNT(*) FROM `%s`' "$TABLE_REF")" | tail -n1
           )
 
           if [ "$ROSTER_COUNT" -eq 0 ]; then
@@ -314,36 +293,31 @@ jobs:
               TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
             FROM \
-          \
-          `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
+            `
+              ${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}
+            `
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
+              LOWER(TRIM(
+                `Vald Name`
+              )) AS vald_full_name_norm
             FROM \
-          \
-          `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
+            `
+              ${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}
+            `
           ),
           readiness_recent AS (
             SELECT
-              DATE(date)             AS date,
-              LOWER(TRIM(full_name)) AS vald_full_name_norm,
-              SAFE_DIVIDE(
-                IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
-                IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
-                IFNULL(CAST(rsi_readiness          AS FLOAT64), 0),
-                NULLIF(
-                  IF(jump_height_readiness IS NULL, 0, 1) +
-                  IF(epf_readiness          IS NULL, 0, 1) +
-                  IF(rsi_readiness          IS NULL, 0, 1),
-                  0
-                )
-              ) AS readiness
+              DATE(date)                  AS date,
+              LOWER(TRIM(full_name_norm)) AS vald_full_name_norm,
+              CAST(readiness AS FLOAT64)  AS readiness
             FROM \
-          \
-          `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
+            `
+              ${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}
+            `
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_by_id AS (
@@ -406,10 +380,6 @@ jobs:
       athlete_count: ${{ steps.check.outputs.athlete_count }}
       reason:        ${{ steps.check.outputs.reason }}
 
-  # ============================================================================
-  # JOB 3: MODEL TRAINING (only if matches found and not manually skipped)
-  # Expects R script at .github/scripts/readiness_models_cloud.R
-  # ============================================================================
   train-models:
     runs-on: ubuntu-latest
     needs: [ingest, check-readiness]
@@ -470,7 +440,6 @@ jobs:
 
       - name: Run model training
         env:
-          # constants
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
@@ -490,7 +459,6 @@ jobs:
           MATCH_LOOKBACK_DAYS: '7'
           SKIP_TRAINING:     ${{ github.event.inputs.skip_training || 'false' }}
 
-          # secrets
           GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}
         run: Rscript ".github/scripts/readiness_models_cloud.R"
 
@@ -512,8 +480,8 @@ jobs:
                n_train,\
                FORMAT_TIMESTAMP('%H:%M', trained_at) as time\
              FROM \
-          \
-          `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+               \
+              `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()\
              ORDER BY trained_at DESC\
              LIMIT 10" || echo "No training results yet"
@@ -527,13 +495,10 @@ jobs:
                ROUND(AVG(primary_rmse), 3) as avg_rmse,\
                FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run\
              FROM \
-          \
-          `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+               \
+              `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
 
-  # ============================================================================
-  # JOB 4: SUMMARY (always)
-  # ============================================================================
   summary:
     runs-on: ubuntu-latest
     needs: [ingest, check-readiness, train-models]
