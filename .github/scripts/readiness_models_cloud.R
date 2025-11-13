@@ -735,6 +735,50 @@ if (readiness_range[1] < 0 || readiness_range[2] > 100) {
 }
 
 ################################################################################
+# SAVE ML_BUILDER_READINESS TABLE
+################################################################################
+# Create ml_builder_readiness table with full_name (not normalized) and official_id
+# This makes it easier to join with workload data for model building
+create_log_entry("Creating ml_builder_readiness table")
+
+ml_builder_readiness <- vald_fd_jumps_with_off_id %>% 
+  select(date, official_id, jump_height_readiness, epf_readiness, rsi_readiness, vald_name) %>% 
+  mutate(
+    # Calculate readiness using SAFE_DIVIDE logic
+    readiness_sum = coalesce(jump_height_readiness, 0) + coalesce(epf_readiness, 0) + coalesce(rsi_readiness, 0),
+    readiness_count = (!is.na(jump_height_readiness)) + (!is.na(epf_readiness)) + (!is.na(rsi_readiness)),
+    readiness = if_else(readiness_count > 0, readiness_sum / readiness_count, NA_real_),
+    full_name = vald_name  # Use non-normalized full name
+  ) %>% 
+  select(date, full_name, official_id, readiness) %>%
+  filter(!is.na(readiness))  # Only include rows with valid readiness scores
+
+create_log_entry(glue("ml_builder_readiness prepared: {nrow(ml_builder_readiness)} rows"))
+
+# Save to BigQuery
+tryCatch({
+  ml_readiness_tbl <- bq_table(project, dataset, "ml_builder_readiness")
+  
+  # Create table if it doesn't exist
+  if (!bq_table_exists(ml_readiness_tbl)) {
+    bq_table_create(
+      ml_readiness_tbl,
+      fields = as_bq_fields(ml_builder_readiness),
+      time_partitioning = list(type="DAY", field="date"),
+      clustering_fields = c("official_id", "full_name")
+    )
+    create_log_entry("Created ml_builder_readiness table")
+  }
+  
+  # Upload data (WRITE_TRUNCATE to replace with latest data each run)
+  bq_table_upload(ml_readiness_tbl, ml_builder_readiness, write_disposition = "WRITE_TRUNCATE")
+  create_log_entry(glue("ml_builder_readiness table saved: {nrow(ml_builder_readiness)} rows"))
+  
+}, error = function(e) {
+  create_log_entry(paste("ml_builder_readiness save failed (non-fatal):", e$message), "WARN")
+})
+
+################################################################################
 # MERGE WORKLOAD + READINESS BY (official_id, date)
 ################################################################################
 
@@ -1525,8 +1569,8 @@ health_metrics <- tibble(
   team_name = team_name,
   
   # Data availability
-  workload_rows_loaded = nrow(workload_data),
-  readiness_rows_loaded = nrow(readiness_data),
+  workload_rows_loaded = nrow(workload_daily),
+  readiness_rows_loaded = nrow(vald_fd_jumps),
   joined_rows = nrow(data_joined),
   
   # Training outcomes
