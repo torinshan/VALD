@@ -1343,6 +1343,12 @@ for (i in seq_len(n_athletes)) {
           WHEN NOT MATCHED THEN INSERT ROW
         "))
         
+        # Prepare values outside glue to avoid nested quotes
+        run_id_val <- Sys.getenv("GITHUB_RUN_ID", "manual")
+        git_sha_val <- Sys.getenv("GITHUB_SHA", "unknown")
+        preds_json <- jsonlite::toJSON(preds, auto_unbox=TRUE)
+        hyper_json <- jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)
+        
         DBI::dbExecute(con, glue("
           INSERT INTO `{project}.{dataset}.registry_versions`
             (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
@@ -1357,11 +1363,11 @@ for (i in seq_len(n_athletes)) {
              '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','',
              '{cfg_start_date}', '{cfg_end_date}',
              {n_tr}, {n_te}, '{val_method}',
-             '{jsonlite::toJSON(preds, auto_unbox=TRUE)}',
-             '{jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)}',
+             '{preds_json}',
+             '{hyper_json}',
              {candidate$train_rmse}, {candidate$cv_rmse}, {candidate$test_rmse},
-             '{Sys.getenv("GITHUB_RUN_ID", "manual")}',
-             '{Sys.getenv("GITHUB_SHA", "unknown")}')
+             '{run_id_val}',
+             '{git_sha_val}')
         "))
         
         metrics <- tibble(
