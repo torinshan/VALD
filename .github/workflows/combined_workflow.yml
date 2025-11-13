@@ -41,7 +41,6 @@ jobs:
   # ============================================================================
   # JOB 1: WORKLOAD INGEST (always)
   # Reads .github/Clean_Activities_GPS.xlsx directly (no OneDrive).
-  # Expects your R script at .github/scripts/workload_ingest.R
   # ============================================================================
   ingest:
     runs-on: ubuntu-latest
@@ -120,14 +119,81 @@ jobs:
       status: ${{ steps.ingest_check.outputs.status }}
 
   # ============================================================================
+  # JOB 1.5: ROSTER INGEST (build roster_mapping from local Excel)
+  # Produces analytics.roster_mapping with offical_id and 'Vald Name' columns.
+  # ============================================================================
+  ingest-roster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install R dependencies (roster)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache-version: 1
+          extra-packages: |
+            any::bigrquery
+            any::DBI
+            any::dplyr
+            any::readxl
+            any::stringr
+            any::tibble
+            any::janitor
+
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev jq
+
+      - name: Verify roster file exists
+        run: |
+          test -f ".github/Sac State Roster - Summer 2025.xlsx" || (echo "File not found: .github/Sac State Roster - Summer 2025.xlsx"; exit 1)
+          ls -lh ".github/Sac State Roster - Summer 2025.xlsx"
+
+      - name: Ingest roster (local xlsx → BigQuery)
+        env:
+          GCP_PROJECT:        ${{ env.GCP_PROJECT }}
+          BQ_DATASET:         ${{ env.BQ_DATASET }}
+          BQ_LOCATION:        ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE:       ${{ env.ROSTER_TABLE }}
+          ROSTER_LOCAL_FILE:  ".github/Sac State Roster - Summer 2025.xlsx"
+          ROSTER_SHEET:       "Master"
+        run: Rscript ".github/scripts/roster_ingest.R"
+
+      - name: Check roster ingest success
+        id: roster_check
+        run: |
+          echo "✅ Roster ingest completed successfully"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+    outputs:
+      status: ${{ steps.roster_check.outputs.status }}
+
+  # ============================================================================
   # JOB 2: CHECK FOR READINESS DATA MATCH (ID-based via roster mapping)
   # Joins workload.roster_name (== offical_id) to roster_mapping.offical_id,
   # maps to `Vald Name`, then matches to vald_fd_jumps.full_name by date.
   # ============================================================================
   check-readiness:
     runs-on: ubuntu-latest
-    needs: ingest
-    if: needs.ingest.outputs.status == 'success'
+    needs: [ingest, ingest-roster]
+    if: needs.ingest.outputs.status == 'success' && needs['ingest-roster'].outputs.status == 'success'
 
     steps:
       - uses: actions/checkout@v4
@@ -204,10 +270,11 @@ jobs:
 
           ROSTER_COUNT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
             query --use_legacy_sql=false --format=csv \
-            "SELECT COUNT(*) FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`" | tail -n1)
+            "SELECT COUNT(*) FROM \
+            `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`" | tail -n1)
 
           if [ "$ROSTER_COUNT" -eq 0 ]; then
-            echo "❌ roster_mapping is empty – need offical_id ⇄ \`Vald Name\` rows"
+            echo "❌ roster_mapping is empty – need offical_id ⇄ `Vald Name` rows"
             exit 1
           fi
           echo "✅ Roster rows: $ROSTER_COUNT"
@@ -242,14 +309,14 @@ jobs:
             SELECT DISTINCT
               TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
-            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}\`
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(\`Vald Name\`))       AS vald_full_name_norm
-            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}\`
+              LOWER(TRIM(`Vald Name`))       AS vald_full_name_norm
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           readiness_recent AS (
             SELECT
@@ -266,7 +333,7 @@ jobs:
                   0
                 )
               ) AS readiness
-            FROM \`${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}\`
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_by_id AS (
@@ -427,27 +494,27 @@ jobs:
           echo ""
           echo "📈 Latest Models:"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 \
-            "SELECT 
-               athlete_id,
-               roster_name,
-               model_type,
-               ROUND(primary_rmse, 3) as rmse,
-               n_train,
-               FORMAT_TIMESTAMP('%H:%M', trained_at) as time
-             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
-             WHERE DATE(trained_at) = CURRENT_DATE()
-             ORDER BY trained_at DESC
+            "SELECT \
+               athlete_id,\
+               roster_name,\
+               model_type,\
+               ROUND(primary_rmse, 3) as rmse,\
+               n_train,\
+               FORMAT_TIMESTAMP('%H:%M', trained_at) as time\
+             FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
+             WHERE DATE(trained_at) = CURRENT_DATE()\
+             ORDER BY trained_at DESC\
              LIMIT 10" || echo "No training results yet"
 
           echo ""
           echo "📊 Today's Training Stats:"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false \
-            "SELECT 
-               COUNT(DISTINCT athlete_id) as athletes_trained,
-               COUNT(*) as total_models,
-               ROUND(AVG(primary_rmse), 3) as avg_rmse,
-               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run
-             FROM \`${GCP_PROJECT}.${BQ_DATASET}.model_training_summary\`
+            "SELECT \
+               COUNT(DISTINCT athlete_id) as athletes_trained,\
+               COUNT(*) as total_models,\
+               ROUND(AVG(primary_rmse), 3) as avg_rmse,\
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run\
+             FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
              WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
 
   # ============================================================================
@@ -464,9 +531,9 @@ jobs:
           MATCH_COUNT:  ${{ needs.check-readiness.outputs.match_count }}
           ATH_COUNT:    ${{ needs.check-readiness.outputs.athlete_count }}
         run: |
-          echo "═══════════════════════════════════════════════════════════════"
+          echo "═════════════════════════════════════════════════════════════"
           echo "    WORKLOAD & MODEL PIPELINE SUMMARY"
-          echo "═══════════════════════════════════════════════════════════════"
+          echo "═════════════════════════════════════════════════════════════"
           echo ""
           echo "🔹 Workload Ingest:     ${{ needs.ingest.result }}"
           echo "🔹 Readiness Check:     ${{ needs.check-readiness.result }}"
@@ -509,3 +576,5 @@ jobs:
           else
             echo "⚠️  UNKNOWN STATUS - Check individual job logs"
             exit 1
+
+          fi
