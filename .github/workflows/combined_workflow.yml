@@ -188,10 +188,13 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Ensure jq present
+      - name: Ensure jq + envsubst present
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
+          fi
+          if ! command -v envsubst >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gettext-base
           fi
 
       - name: Preflight validation
@@ -287,29 +290,27 @@ jobs:
           set -euo pipefail
           echo "🔍 Checking workload ↔ readiness matches (by offical_id via roster, same DATE)…"
 
-          MATCH_QUERY="
+          # Build the SQL safely using a single-quoted heredoc (no backtick substitution)
+          read -r -d '' MATCH_QUERY <<'SQL'
           WITH workload AS (
             SELECT DISTINCT
               TRIM(CAST(roster_name AS STRING)) AS offical_id,
               DATE(date) AS date
-            FROM \
-            `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
               LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
-            FROM \
-            `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           readiness_recent AS (
             SELECT
-              DATE(date)                  AS date,
-              LOWER(TRIM(full_name_norm)) AS vald_full_name_norm,
-              CAST(readiness AS FLOAT64)  AS readiness
-            FROM \
-            `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
+              DATE(date) AS date,
+              LOWER(TRIM(COALESCE(full_name_norm, full_name))) AS vald_full_name_norm,
+              CAST(readiness AS FLOAT64) AS readiness
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_by_id AS (
@@ -330,14 +331,20 @@ jobs:
           JOIN readiness_by_id rd
             ON rd.offical_id = w.offical_id
            AND rd.date       = w.date
-          "
+          SQL
+
+          # Expand environment variables (backticks remain literal for BigQuery)
+          MATCH_QUERY="$(envsubst <<<"$MATCH_QUERY")"
 
           echo "–––– SQL ––––"
           echo "$MATCH_QUERY"
           echo "––––––––––––––"
 
-          if ! RESULT_JSON="$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query \
-               --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1)"; then
+          # Run the query with error handling (single execution)
+          if ! RESULT_JSON="$(
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+               query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1
+          )"; then
             echo "❌ BigQuery execution failed"
             echo "$RESULT_JSON"
             echo "has_matches=false" >> "$GITHUB_OUTPUT"
@@ -408,6 +415,7 @@ jobs:
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache-version: 1
+        # keep R packages aligned with your R script
           extra-packages: |
             any::bigrquery
             any::DBI
@@ -461,33 +469,44 @@ jobs:
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
         run: |
+          set -euo pipefail
+          if ! command -v envsubst >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gettext-base
+          fi
+
           echo ""
           echo "📈 Latest Models:"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 \
-            "SELECT \
-               athlete_id,\
-               roster_name,\
-               model_type,\
-               ROUND(primary_rmse, 3) as rmse,\
-               n_train,\
-               FORMAT_TIMESTAMP('%H:%M', trained_at) as time\
-             FROM \
-             `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
-             WHERE DATE(trained_at) = CURRENT_DATE()\
-             ORDER BY trained_at DESC\
-             LIMIT 10" || echo "No training results yet"
+
+          read -r -d '' Q1 <<'SQL'
+          SELECT
+            athlete_id,
+            roster_name,
+            model_type,
+            ROUND(primary_rmse, 3) AS rmse,
+            n_train,
+            FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
+          FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+          WHERE DATE(trained_at) = CURRENT_DATE()
+          ORDER BY trained_at DESC
+          LIMIT 10
+          SQL
+          Q1="$(envsubst <<<"$Q1")"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 "$Q1" || echo "No training results yet"
 
           echo ""
           echo "📊 Today's Training Stats:"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false \
-            "SELECT \
-               COUNT(DISTINCT athlete_id) as athletes_trained,\
-               COUNT(*) as total_models,\
-               ROUND(AVG(primary_rmse), 3) as avg_rmse,\
-               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) as last_run\
-             FROM \
-             `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`\
-             WHERE DATE(trained_at) = CURRENT_DATE()" || echo "No stats available"
+
+          read -r -d '' Q2 <<'SQL'
+          SELECT
+            COUNT(DISTINCT athlete_id) AS athletes_trained,
+            COUNT(*) AS total_models,
+            ROUND(AVG(primary_rmse), 3) AS avg_rmse,
+            FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
+          FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+          WHERE DATE(trained_at) = CURRENT_DATE()
+          SQL
+          Q2="$(envsubst <<<"$Q2")"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "$Q2" || echo "No stats available"
 
   summary:
     runs-on: ubuntu-latest
