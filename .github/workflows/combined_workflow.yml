@@ -276,6 +276,39 @@ jobs:
 
           echo "✅ Required columns present (offical_id, 'Vald Name')"
 
+      - name: Build and run BigQuery MATCH_QUERY (use backticks for identifiers with spaces)
+        shell: bash
+        env:
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+        run: |
+          set -euo pipefail
+
+          echo "Building MATCH_QUERY (with backticked identifiers escaped)..."
+
+          MATCH_QUERY=$(cat <<SQL
+          SELECT
+            r.offical_id AS offical_id,
+            r.\`Vald Name\` AS vald_name,
+            v.full_name AS vald_full_name
+          FROM \`$GCP_PROJECT.$BQ_DATASET.$ROSTER_TABLE\` AS r
+          JOIN \`$GCP_PROJECT.$BQ_DATASET.vald_fd_jumps\` AS v
+            ON r.\`Vald Name\` = v.full_name
+          WHERE 1=1;
+          SQL
+          )
+
+          # print the query so it's visible in logs (helps debugging)
+          echo "----- MATCH_QUERY -----"
+          echo "$MATCH_QUERY"
+          echo "-----------------------"
+
+          echo "▶ Executing BigQuery query..."
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+             query --use_legacy_sql=false --format=json "$MATCH_QUERY"
+
       - name: Check for matching readiness data (CORRECTED MAPPING)
         id: check
         shell: bash
