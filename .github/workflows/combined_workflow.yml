@@ -330,7 +330,8 @@ jobs:
 
           # Match the data connection logic from user's local implementation
           # Key fix: Direct name matching without case normalization
-          read -r -d '' MATCH_QUERY <<'SQL'
+          # Using cat with heredoc instead of read to avoid exit code issues
+          MATCH_QUERY=$(cat <<'SQL'
           WITH workload_with_off_id AS (
             SELECT DISTINCT
               roster_name AS official_id,
@@ -386,6 +387,7 @@ jobs:
             MAX(date) AS latest_match
           FROM merged_data
           SQL
+          )
 
           # Expand environment variables
           MATCH_QUERY="$(envsubst <<<"$MATCH_QUERY")"
