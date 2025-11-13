@@ -526,7 +526,6 @@ jobs:
             any::gargle
             any::glue
             any::digest
-            any::googleCloudStorageR
             any::glmnet
             any::bnlearn
             any::reticulate
