@@ -260,7 +260,7 @@ jobs:
           )
 
           if [ "$ROSTER_COUNT" -eq 0 ]; then
-            echo "❌ roster_mapping is empty – need offical_id ⇄ Vald Name rows"
+            echo "❌ roster_mapping is empty – need official_id ⇄ vald_name rows"
             exit 1
           fi
           echo "✅ Roster rows: $ROSTER_COUNT"
@@ -268,13 +268,13 @@ jobs:
           SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
             --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
 
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^offical_id$" || {
-            echo "❌ Column 'offical_id' missing in roster_mapping"; echo "$SCHEMA" | jq -r '.[].name'; exit 1; }
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^official_id$" || {
+            echo "❌ Column 'official_id' missing in roster_mapping"; echo "$SCHEMA" | jq -r '.[].name'; exit 1; }
 
-          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^Vald Name$" || {
-            echo "❌ Column 'Vald Name' missing in roster_mapping (case/space sensitive)"; echo "$SCHEMA" | jq -r '.[].name'; exit 1; }
+          echo "$SCHEMA" | jq -r '.[].name' | grep -q "^vald_name$" || {
+            echo "❌ Column 'vald_name' missing in roster_mapping (case sensitive)"; echo "$SCHEMA" | jq -r '.[].name'; exit 1; }
 
-          echo "✅ Required columns present (offical_id, 'Vald Name')"
+          echo "✅ Required columns present (official_id, vald_name)"
 
       - name: Build and run BigQuery MATCH_QUERY (use backticks for identifiers with spaces)
         shell: bash
@@ -286,16 +286,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Building MATCH_QUERY (with backticked identifiers escaped)..."
+          echo "Building MATCH_QUERY (with identifiers)..."
 
           MATCH_QUERY=$(cat <<SQL
           SELECT
-            r.offical_id AS offical_id,
-            r.\`Vald Name\` AS vald_name,
-            v.full_name AS vald_full_name
+            r.official_id AS official_id,
+            r.vald_name    AS vald_name,
+            v.full_name    AS vald_full_name
           FROM \`$GCP_PROJECT.$BQ_DATASET.$ROSTER_TABLE\` AS r
           JOIN \`$GCP_PROJECT.$BQ_DATASET.vald_fd_jumps\` AS v
-            ON r.\`Vald Name\` = v.full_name
+            ON r.vald_name = v.full_name
           WHERE 1=1;
           SQL
           )
@@ -324,21 +324,21 @@ jobs:
           echo "🔍 Checking workload ↔ readiness matches (via roster mapping, same DATE)…"
           echo ""
           echo "DATA FLOW:"
-          echo "  workload_daily.roster_name (ID) = roster_mapping.offical_id"
-          echo "  roster_mapping.Vald Name (NAME) = vald_fd_jumps.full_name"
+          echo "  workload_daily.roster_name (ID) = roster_mapping.official_id"
+          echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name"
           echo ""
 
-          # CORRECTED: roster_name IS offical_id, map Vald Name to full_name
+          # CORRECTED: roster_name IS official_id, map vald_name to full_name
           read -r -d '' MATCH_QUERY <<'SQL'
           WITH roster_map AS (
             SELECT
-              TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
+              TRIM(CAST(official_id AS STRING)) AS official_id,
+              LOWER(TRIM(vald_name)) AS vald_full_name_norm
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
           ),
           workload_with_id AS (
             SELECT DISTINCT
-              TRIM(CAST(roster_name AS STRING)) AS offical_id,
+              TRIM(CAST(roster_name AS STRING)) AS official_id,
               DATE(date) AS date
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
@@ -363,7 +363,7 @@ jobs:
           ),
           readiness_by_id AS (
             SELECT
-              rmap.offical_id,
+              rmap.official_id,
               rr.date,
               rr.readiness
             FROM readiness_recent rr
@@ -372,24 +372,21 @@ jobs:
             WHERE rr.readiness IS NOT NULL
           )
           SELECT
-            COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
+            COUNT(DISTINCT w.official_id) AS athletes_with_matches,
             COUNT(*) AS total_matches,
             MIN(w.date) AS earliest_match,
             MAX(w.date) AS latest_match
           FROM workload_with_id w
           JOIN readiness_by_id rd
-            ON rd.offical_id = w.offical_id
+            ON rd.official_id = w.official_id
            AND rd.date = w.date
           SQL
 
           # Expand environment variables
           MATCH_QUERY="$(envsubst <<<"$MATCH_QUERY")"
 
-          echo "═══════════════════════════════════════════════════════════════"
           echo "SQL QUERY:"
-          echo "═══════════════════════════════════════════════════════════════"
           echo "$MATCH_QUERY"
-          echo "═══════════════════════════════════════════════════════════════"
           echo ""
 
           # Run the query with FULL error capture
@@ -404,12 +401,9 @@ jobs:
 
           if [ $QUERY_EXIT_CODE -ne 0 ]; then
             echo ""
-            echo "═══════════════════════════════════════════════════════════════"
             echo "❌ BIGQUERY EXECUTION FAILED (Exit code: $QUERY_EXIT_CODE)"
-            echo "═══════════════════════════════════════════════════════════════"
             echo "ERROR OUTPUT:"
             echo "$RESULT_JSON"
-            echo "═══════════════════════════════════════════════════════════════"
             echo ""
             echo "🔍 DIAGNOSTIC ANALYSIS:"
             
@@ -422,7 +416,7 @@ jobs:
             
             if echo "$RESULT_JSON" | grep -qi "unrecognized\|column"; then
               echo "❗ Issue: Column Not Found"
-              echo "   'Vald Name' column must have EXACT case and space"
+              echo "   Ensure roster_mapping has columns: official_id, vald_name"
             fi
             
             if echo "$RESULT_JSON" | grep -qi "permission\|denied"; then
@@ -443,13 +437,10 @@ jobs:
           EARLIEST="$(echo  "$RESULT_JSON" | jq -r '.[0].earliest_match // "none"')"
           LATEST="$(echo    "$RESULT_JSON" | jq -r '.[0].latest_match // "none"')"
 
-          echo "═══════════════════════════════════════════════════════════════"
           echo "📊 QUERY RESULTS:"
-          echo "═══════════════════════════════════════════════════════════════"
           echo "  Athletes with matches: $ATHLETES"
           echo "  Total match records:   $MATCHES"
           echo "  Date range:            $EARLIEST → $LATEST"
-          echo "═══════════════════════════════════════════════════════════════"
           echo ""
 
           if [ "$MATCHES" -gt 0 ]; then
@@ -466,7 +457,7 @@ jobs:
             echo "  1. No workload data in last 7 days"
             echo "  2. No VALD tests in last 7 days"
             echo "  3. Athletes have workload OR VALD, but not BOTH on same dates"
-            echo "  4. Name mismatches: roster 'Vald Name' ≠ vald_fd_jumps 'full_name'"
+            echo "  4. Name mismatches: roster 'vald_name' ≠ vald_fd_jumps 'full_name'"
             echo ""
             echo "⏭️  Training will be skipped (this is normal if no recent data)"
             echo ""
