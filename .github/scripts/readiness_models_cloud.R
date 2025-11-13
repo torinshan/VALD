@@ -3,7 +3,8 @@
 ################################################################################
 # READINESS MODELS — Cloud Version with Model Registry
 # Uses VALD -> Roster mapping inside SQL to produce offical_id for readiness,
-# and treats workload.roster_name as offical_id. Joins on (offical_id, date).
+# and maps workload.roster_name through roster table to get offical_id.
+# Joins on (offical_id, date).
 #
 # FIXES APPLIED:
 # - 1.3: Registry tables with primary keys and partitioning
@@ -15,6 +16,7 @@
 # - 3.7: Semantic versioning for models
 # - 4.1: Consolidated SQL template
 # - 4.2: Extracted constants/magic numbers
+# - 4.3: Fixed roster mapping joins (workload.roster_name -> roster -> offical_id)
 ################################################################################
 
 # ===== Packages =====
@@ -437,15 +439,24 @@ if (nzchar(has_matches_hint)) {
 if (!nzchar(has_matches_hint)) {
   create_log_entry("No HAS_MATCHES hint; performing readiness match check")
   
-  # Build SQL from template
+  # Build SQL from template (FIX: roster_name must be mapped through roster table)
   match_sql <- glue("
-    WITH workload AS (
+    WITH roster_norm AS (
+      SELECT
+        TRIM(CAST(offical_id AS STRING)) AS offical_id,
+        LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm,
+        LOWER(TRIM(`Vald Name`))         AS workload_name_norm
+      FROM `{project}.{dataset}.{roster_table}`
+    ),
+    workload_with_id AS (
       SELECT DISTINCT
-        TRIM(CAST(roster_name AS STRING)) AS offical_id,
-        DATE(date) AS date
-      FROM `{project}.{dataset}.{workload_table}`
-      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
-        AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
+        rmap.offical_id,
+        DATE(w.date) AS date
+      FROM `{project}.{dataset}.{workload_table}` w
+      JOIN roster_norm rmap
+        ON LOWER(TRIM(w.roster_name)) = rmap.workload_name_norm
+      WHERE w.date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+        AND w.date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
     readiness_raw AS (
       SELECT
@@ -466,12 +477,6 @@ if (!nzchar(has_matches_hint)) {
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
-    roster_norm AS (
-      SELECT
-        TRIM(CAST(offical_id AS STRING)) AS offical_id,
-        LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm
-      FROM `{project}.{dataset}.{roster_table}`
-    ),
     readiness_by_id AS (
       SELECT
         rmap.offical_id,
@@ -483,7 +488,7 @@ if (!nzchar(has_matches_hint)) {
     SELECT 
       COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
       COUNT(*) AS total_matches
-    FROM workload w
+    FROM workload_with_id w
     JOIN readiness_by_id rd
       ON rd.offical_id = w.offical_id
      AND rd.date       = w.date
@@ -603,19 +608,27 @@ tryCatch({
 # LOAD DATA (WITH MAPPING IN SQL)
 ################################################################################
 
-# FIX 2.6: Workload with consistent normalization
+# FIX 2.6: Workload with consistent normalization (FIXED: join through roster)
 create_log_entry("Loading workload data from BigQuery")
 workload_result <- retry_operation(
   {
     sql <- glue("
+      WITH roster_norm AS (
+        SELECT
+          TRIM(CAST(offical_id AS STRING)) AS offical_id,
+          LOWER(TRIM(`Vald Name`))         AS workload_name_norm
+        FROM `{project}.{dataset}.{roster_table}`
+      )
       SELECT 
-        TRIM(CAST(roster_name AS STRING)) AS offical_id,
-        DATE(date) AS date,
-        distance, high_speed_distance, mechanical_load,
-        distance_7d, distance_28d, distance_monotony_7d,
-        hsd_7d, hsd_28d, ml_7d, ml_28d, ml_monotony_7d
-      FROM `{project}.{dataset}.{workload_table}`
-      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+        rmap.offical_id,
+        DATE(w.date) AS date,
+        w.distance, w.high_speed_distance, w.mechanical_load,
+        w.distance_7d, w.distance_28d, w.distance_monotony_7d,
+        w.hsd_7d, w.hsd_28d, w.ml_7d, w.ml_28d, w.ml_monotony_7d
+      FROM `{project}.{dataset}.{workload_table}` w
+      JOIN roster_norm rmap
+        ON LOWER(TRIM(w.roster_name)) = rmap.workload_name_norm
+      WHERE w.date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
     bq_table_download(bq_project_query(project, sql))
   },
