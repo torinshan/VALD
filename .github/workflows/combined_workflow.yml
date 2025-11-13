@@ -25,7 +25,7 @@ env:
   BQ_LOCATION: US
 
   WORKLOAD_TABLE: workload_daily
-  READINESS_TABLE: ml_builder_readiness
+  READINESS_TABLE: vald_fd_jumps
   ROSTER_TABLE: roster_mapping
   PREDICTIONS_TABLE: readiness_predictions_byname
 
@@ -288,28 +288,41 @@ jobs:
           ROSTER_TABLE:   ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
-          echo "🔍 Checking workload ↔ readiness matches (by offical_id via roster, same DATE)…"
+          echo "🔍 Checking workload ↔ readiness matches (via roster mapping, same DATE)…"
 
-          # Build the SQL safely using a single-quoted heredoc (no backtick substitution)
+          # FIXED: Properly map roster_name through roster table to get offical_id
           read -r -d '' MATCH_QUERY <<'SQL'
-          WITH workload AS (
-            SELECT DISTINCT
-              TRIM(CAST(roster_name AS STRING)) AS offical_id,
-              DATE(date) AS date
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-          ),
-          roster_norm AS (
+          WITH roster_norm AS (
             SELECT
               TRIM(CAST(offical_id AS STRING)) AS offical_id,
-              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm
+              LOWER(TRIM(`Vald Name`)) AS vald_full_name_norm,
+              LOWER(TRIM(`Vald Name`)) AS workload_name_norm
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
+          ),
+          workload_with_id AS (
+            SELECT DISTINCT
+              rmap.offical_id,
+              DATE(w.date) AS date
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}` w
+            JOIN roster_norm rmap
+              ON LOWER(TRIM(w.roster_name)) = rmap.workload_name_norm
+            WHERE w.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
           readiness_recent AS (
             SELECT
               DATE(date) AS date,
-              LOWER(TRIM(COALESCE(full_name_norm, full_name))) AS vald_full_name_norm,
-              CAST(readiness AS FLOAT64) AS readiness
+              LOWER(TRIM(full_name)) AS vald_full_name_norm,
+              SAFE_DIVIDE(
+                IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
+                IFNULL(CAST(epf_readiness AS FLOAT64), 0) +
+                IFNULL(CAST(rsi_readiness AS FLOAT64), 0),
+                NULLIF(
+                  IF(jump_height_readiness IS NULL, 0, 1) +
+                  IF(epf_readiness IS NULL, 0, 1) +
+                  IF(rsi_readiness IS NULL, 0, 1),
+                  0
+                )
+              ) AS readiness
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
           ),
@@ -321,26 +334,27 @@ jobs:
             FROM readiness_recent rr
             JOIN roster_norm rmap
               ON rmap.vald_full_name_norm = rr.vald_full_name_norm
+            WHERE rr.readiness IS NOT NULL
           )
           SELECT
             COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
             COUNT(*)                      AS total_matches,
             MIN(w.date)                   AS earliest_match,
             MAX(w.date)                   AS latest_match
-          FROM workload w
+          FROM workload_with_id w
           JOIN readiness_by_id rd
             ON rd.offical_id = w.offical_id
            AND rd.date       = w.date
           SQL
 
-          # Expand environment variables (backticks remain literal for BigQuery)
+          # Expand environment variables
           MATCH_QUERY="$(envsubst <<<"$MATCH_QUERY")"
 
           echo "–––– SQL ––––"
           echo "$MATCH_QUERY"
           echo "––––––––––––––"
 
-          # Run the query with error handling (single execution)
+          # Run the query with error handling
           if ! RESULT_JSON="$(
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
                query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1
@@ -415,7 +429,6 @@ jobs:
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache-version: 1
-        # keep R packages aligned with your R script
           extra-packages: |
             any::bigrquery
             any::DBI
@@ -462,7 +475,7 @@ jobs:
           GCS_BUCKET:        ${{ secrets.GCS_BUCKET }}
         run: Rscript ".github/scripts/readiness_models_cloud.R"
 
-      - name: Show today’s training summary (best-effort)
+      - name: Show today's training summary (best-effort)
         if: success()
         env:
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
