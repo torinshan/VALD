@@ -1,22 +1,4 @@
 #!/usr/bin/env Rscript
-
-################################################################################
-# READINESS MODELS — Cloud Version with Model Registry
-# Uses VALD -> Roster mapping inside SQL to produce offical_id for readiness,
-# and treats workload.roster_name as offical_id. Joins on (offical_id, date).
-#
-# FIXES APPLIED:
-# - 1.3: Registry tables with primary keys and partitioning
-# - 2.3: Pipeline health metrics tracking
-# - 2.4: Predictions APPEND strategy with run timestamps
-# - 2.6: Consistent athlete ID normalization
-# - 2.7: Date validation with MM/DD/YYYY format preference
-# - 3.3: Configuration audit trail
-# - 3.7: Semantic versioning for models
-# - 4.1: Consolidated SQL template
-# - 4.2: Extracted constants/magic numbers
-################################################################################
-
 # ===== Packages =====
 tryCatch({
   suppressPackageStartupMessages({
@@ -441,7 +423,7 @@ if (!nzchar(has_matches_hint)) {
   match_sql <- glue("
     WITH workload AS (
       SELECT DISTINCT
-        TRIM(CAST(roster_name AS STRING)) AS offical_id,
+        TRIM(CAST(roster_name AS STRING)) AS official_id,
         DATE(date) AS date
       FROM `{project}.{dataset}.{workload_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
@@ -468,24 +450,24 @@ if (!nzchar(has_matches_hint)) {
     ),
     roster_norm AS (
       SELECT
-        TRIM(CAST(offical_id AS STRING)) AS offical_id,
-        LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm
+        TRIM(CAST(official_id AS STRING)) AS official_id,
+        LOWER(TRIM(vald_name))         AS vald_full_name_norm
       FROM `{project}.{dataset}.{roster_table}`
     ),
     readiness_by_id AS (
       SELECT
-        rmap.offical_id,
+        rmap.official_id,
         rr.date
       FROM readiness_raw rr
       JOIN roster_norm rmap
         ON rmap.vald_full_name_norm = rr.vald_full_name_norm
     )
     SELECT 
-      COUNT(DISTINCT w.offical_id) AS athletes_with_matches,
+      COUNT(DISTINCT w.official_id) AS athletes_with_matches,
       COUNT(*) AS total_matches
     FROM workload w
     JOIN readiness_by_id rd
-      ON rd.offical_id = w.offical_id
+      ON rd.official_id = w.official_id
      AND rd.date       = w.date
   ")
   
@@ -609,7 +591,7 @@ workload_result <- retry_operation(
   {
     sql <- glue("
       SELECT 
-        TRIM(CAST(roster_name AS STRING)) AS offical_id,
+        TRIM(CAST(roster_name AS STRING)) AS official_id,
         DATE(date) AS date,
         distance, high_speed_distance, mechanical_load,
         distance_7d, distance_28d, distance_monotony_7d,
@@ -635,7 +617,7 @@ workload_data <- validate_dates(workload_data, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_data)} rows"))
 
 # Validate required columns
-required_workload_cols <- c("offical_id", "date", "distance", "high_speed_distance", "mechanical_load")
+required_workload_cols <- c("official_id", "date", "distance", "high_speed_distance", "mechanical_load")
 missing_cols <- setdiff(required_workload_cols, names(workload_data))
 if (length(missing_cols) > 0) {
   create_log_entry(paste("ERROR: Missing columns in workload data:", paste(missing_cols, collapse=", ")), "ERROR")
@@ -643,14 +625,14 @@ if (length(missing_cols) > 0) {
 }
 
 # Check for null athlete IDs
-null_id_count <- sum(is.na(workload_data$offical_id) | workload_data$offical_id == "")
+null_id_count <- sum(is.na(workload_data$official_id) | workload_data$official_id == "")
 if (null_id_count > 0) {
-  create_log_entry(sprintf("WARN: %d workload rows with missing/empty offical_id (will be filtered)", 
+  create_log_entry(sprintf("WARN: %d workload rows with missing/empty official_id (will be filtered)", 
                            null_id_count), "WARN")
-  workload_data <- workload_data %>% filter(!is.na(offical_id) & nzchar(offical_id))
+  workload_data <- workload_data %>% filter(!is.na(official_id) & nzchar(official_id))
 }
 
-# Readiness: VALD -> roster -> offical_id
+# Readiness: VALD -> roster -> official_id
 create_log_entry("Loading readiness data from BigQuery (via roster mapping)")
 readiness_result <- retry_operation(
   {
@@ -675,12 +657,12 @@ readiness_result <- retry_operation(
       ),
       roster_norm AS (
         SELECT
-          TRIM(CAST(offical_id AS STRING)) AS offical_id,
-          LOWER(TRIM(`Vald Name`))         AS vald_full_name_norm
+          TRIM(CAST(official_id AS STRING)) AS official_id,
+          LOWER(TRIM(vald_name))         AS vald_full_name_norm
         FROM `{project}.{dataset}.{roster_table}`
       )
       SELECT
-        rmap.offical_id,
+        rmap.official_id,
         rr.date,
         rr.readiness
       FROM readiness_raw rr
@@ -714,11 +696,11 @@ if (readiness_range[1] < 0 || readiness_range[2] > 100) {
 }
 
 ################################################################################
-# MERGE WORKLOAD + READINESS BY (offical_id, date)
+# MERGE WORKLOAD + READINESS BY (official_id, date)
 ################################################################################
-create_log_entry("Merging workload and readiness data (offical_id + date)")
+create_log_entry("Merging workload and readiness data (official_id + date)")
 data_joined <- workload_data %>%
-  left_join(readiness_data, by = c("offical_id","date")) %>%
+  left_join(readiness_data, by = c("official_id","date")) %>%
   filter(!is.na(readiness))
 
 create_log_entry(glue("Joined data: {nrow(data_joined)} rows with readiness"))
@@ -740,13 +722,13 @@ assign_split <- function(df, frac_train = 0.80) {
   df
 }
 data_split <- data_joined %>%
-  group_by(offical_id) %>% group_modify(~assign_split(.x, cfg_frac_train)) %>% ungroup()
+  group_by(official_id) %>% group_modify(~assign_split(.x, cfg_frac_train)) %>% ungroup()
 
 # Prepare modeling table
 response_var <- "readiness"
 data_model <- data_split %>%
   transmute(
-    offical_id,
+    official_id,
     date,
     is_test,
     distance              = distance,
@@ -769,7 +751,7 @@ all_predictors <- c(
   "distance_montony","ml_montony"
 )
 data_clean <- as.data.table(data_model)
-create_log_entry(glue("Model input: {nrow(data_clean)} rows, {length(unique(data_clean$offical_id))} athletes"))
+create_log_entry(glue("Model input: {nrow(data_clean)} rows, {length(unique(data_clean$official_id))} athletes"))
 
 # Hyperparams (FIX 4.2: using constants)
 lambda_grid    <- exp(seq(log(1e-4), log(100), length.out = LAMBDA_GRID_SIZE_FULL))
@@ -1142,7 +1124,7 @@ run_bayes_net <- function(train_df, test_df, preds, val_method) {
 # TRAIN MODELS FOR ALL ATHLETES
 ################################################################################
 create_log_entry("Starting model training loop")
-athletes <- unique(na.omit(data_clean$offical_id))
+athletes <- unique(na.omit(data_clean$official_id))
 n_athletes <- length(athletes)
 create_log_entry(glue("Training models for {n_athletes} athletes"))
 
@@ -1188,7 +1170,7 @@ for (i in seq_len(n_athletes)) {
   create_log_entry(glue("[{i}/{n_athletes}] Training models for {athlete_id}"))
   
   tryCatch({
-    ath_data  <- data_clean[offical_id == athlete_id]
+    ath_data  <- data_clean[official_id == athlete_id]
     ath_train <- ath_data[is_test == 1]
     ath_test  <- ath_data[is_test == 2]
     
@@ -1399,8 +1381,8 @@ for (i in seq_len(n_athletes)) {
         })
         
         pred_meta <- rbind(
-          ath_train[, .(offical_id, date, readiness, is_test)],
-          ath_test[,  .(offical_id, date, readiness, is_test)]
+          ath_train[, .(official_id, date, readiness, is_test)],
+          ath_test[,  .(official_id, date, readiness, is_test)]
         )
         
         pred_df <- pred_meta %>%
@@ -1472,7 +1454,7 @@ if (length(all_predictions) > 0) {
     bq_table_create(tbl, 
                     fields = as_bq_fields(preds_df),
                     time_partitioning = list(type="DAY", field="prediction_run_timestamp"),
-                    clustering_fields = c("offical_id", "date", "model_id"))
+                    clustering_fields = c("official_id", "date", "model_id"))
   }
   
   # WRITE_APPEND preserves historical predictions
