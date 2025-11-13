@@ -582,16 +582,16 @@ tryCatch({
 })
 
 ################################################################################
-# LOAD DATA (WITH MAPPING IN SQL)
+# LOAD DATA (MATCHING LOCAL IMPLEMENTATION)
 ################################################################################
 
-# FIX 2.6: Workload with consistent normalization
+# Load workload_daily from BigQuery
 create_log_entry("Loading workload data from BigQuery")
-workload_result <- retry_operation(
+workload_daily_result <- retry_operation(
   {
     sql <- glue("
       SELECT 
-        TRIM(CAST(roster_name AS STRING)) AS official_id,
+        roster_name,
         DATE(date) AS date,
         distance, high_speed_distance, mechanical_load,
         distance_7d, distance_28d, distance_monotony_7d,
@@ -606,90 +606,129 @@ workload_result <- retry_operation(
   operation_name = "workload data load"
 )
 
-if (!workload_result$success) {
+if (!workload_daily_result$success) {
   create_log_entry("Workload data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-workload_data <- workload_result$result
+workload_daily <- workload_daily_result$result
 
 # FIX 2.7: Validate and parse dates
-workload_data <- validate_dates(workload_data, "date", "workload")
-create_log_entry(glue("Workload data loaded: {nrow(workload_data)} rows"))
+workload_daily <- validate_dates(workload_daily, "date", "workload")
+create_log_entry(glue("Workload data loaded: {nrow(workload_daily)} rows"))
+
+# Load vald_fd_jumps from BigQuery
+create_log_entry("Loading VALD FD jumps data from BigQuery")
+vald_fd_jumps_result <- retry_operation(
+  {
+    sql <- glue("
+      SELECT
+        full_name,
+        DATE(date) AS date,
+        jump_height_readiness,
+        epf_readiness,
+        rsi_readiness
+      FROM `{project}.{dataset}.{readiness_table}`
+      WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
+    ")
+    bq_table_download(bq_project_query(project, sql))
+  },
+  max_attempts = MAX_RETRY_ATTEMPTS,
+  wait_seconds = RETRY_WAIT_SECONDS,
+  operation_name = "VALD FD jumps data load"
+)
+
+if (!vald_fd_jumps_result$success) {
+  create_log_entry("VALD FD jumps data load failed after retries", "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+}
+vald_fd_jumps <- vald_fd_jumps_result$result
+
+# FIX 2.7: Validate and parse dates
+vald_fd_jumps <- validate_dates(vald_fd_jumps, "date", "VALD FD jumps")
+create_log_entry(glue("VALD FD jumps data loaded: {nrow(vald_fd_jumps)} rows"))
+
+# Load roster_mapping from BigQuery
+create_log_entry("Loading roster mapping from BigQuery")
+roster_mapping_result <- retry_operation(
+  {
+    sql <- glue("
+      SELECT
+        official_id,
+        vald_name
+      FROM `{project}.{dataset}.{roster_table}`
+    ")
+    bq_table_download(bq_project_query(project, sql))
+  },
+  max_attempts = MAX_RETRY_ATTEMPTS,
+  wait_seconds = RETRY_WAIT_SECONDS,
+  operation_name = "roster mapping load"
+)
+
+if (!roster_mapping_result$success) {
+  create_log_entry("Roster mapping load failed after retries", "ERROR")
+  upload_logs_to_bigquery(); quit(status=1)
+}
+roster_mapping <- roster_mapping_result$result
+create_log_entry(glue("Roster mapping loaded: {nrow(roster_mapping)} rows"))
+
+################################################################################
+# CONNECT DATA (AS PER USER'S LOCAL IMPLEMENTATION)
+################################################################################
+
+# Step 1: workload_with_off_id = workload_daily %>% mutate(official_id = roster_name) %>% select(-roster_name)
+create_log_entry("Creating workload_with_off_id")
+workload_with_off_id <- workload_daily %>% 
+  mutate(official_id = roster_name) %>%
+  select(-roster_name)
 
 # Validate required columns
 required_workload_cols <- c("official_id", "date", "distance", "high_speed_distance", "mechanical_load")
-missing_cols <- setdiff(required_workload_cols, names(workload_data))
+missing_cols <- setdiff(required_workload_cols, names(workload_with_off_id))
 if (length(missing_cols) > 0) {
   create_log_entry(paste("ERROR: Missing columns in workload data:", paste(missing_cols, collapse=", ")), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
 
 # Check for null athlete IDs
-null_id_count <- sum(is.na(workload_data$official_id) | workload_data$official_id == "")
+null_id_count <- sum(is.na(workload_with_off_id$official_id) | workload_with_off_id$official_id == "")
 if (null_id_count > 0) {
   create_log_entry(sprintf("WARN: %d workload rows with missing/empty official_id (will be filtered)", 
                            null_id_count), "WARN")
-  workload_data <- workload_data %>% filter(!is.na(official_id) & nzchar(official_id))
+  workload_with_off_id <- workload_with_off_id %>% filter(!is.na(official_id) & nzchar(official_id))
 }
 
-# Readiness: VALD -> roster -> official_id
-create_log_entry("Loading readiness data from BigQuery (via roster mapping)")
-readiness_result <- retry_operation(
-  {
-    sql <- glue("
-      WITH readiness_raw AS (
-        SELECT
-          DATE(date) AS date,
-          LOWER(TRIM(full_name)) AS vald_full_name_norm,
-          SAFE_DIVIDE(
-            IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
-            IFNULL(CAST(epf_readiness          AS FLOAT64), 0) +
-            IFNULL(CAST(rsi_readiness          AS FLOAT64), 0),
-            NULLIF(
-              IF(jump_height_readiness IS NULL, 0, 1) +
-              IF(epf_readiness          IS NULL, 0, 1) +
-              IF(rsi_readiness          IS NULL, 0, 1),
-              0
-            )
-          ) AS readiness
-        FROM `{project}.{dataset}.{readiness_table}`
-        WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
-      ),
-      roster_norm AS (
-        SELECT
-          TRIM(CAST(official_id AS STRING)) AS official_id,
-          LOWER(TRIM(vald_name))         AS vald_full_name_norm
-        FROM `{project}.{dataset}.{roster_table}`
-      )
-      SELECT
-        rmap.official_id,
-        rr.date,
-        rr.readiness
-      FROM readiness_raw rr
-      JOIN roster_norm rmap
-        ON rmap.vald_full_name_norm = rr.vald_full_name_norm
-      WHERE rr.readiness IS NOT NULL
-    ")
-    bq_table_download(bq_project_query(project, sql))
-  },
-  max_attempts = MAX_RETRY_ATTEMPTS,
-  wait_seconds = RETRY_WAIT_SECONDS,
-  operation_name = "readiness data load"
-)
+# Step 2: vald_fd_jumps_with_off_id = vald_fd_jumps %>% 
+#         mutate(vald_name = full_name) %>% select(-full_name) %>% 
+#         left_join(roster_mapping, by = "vald_name") %>% filter(!is.na(official_id))
+create_log_entry("Creating vald_fd_jumps_with_off_id via roster mapping")
+vald_fd_jumps_with_off_id <- vald_fd_jumps %>% 
+  mutate(vald_name = full_name) %>%
+  select(-full_name) %>% 
+  left_join(roster_mapping, by = "vald_name") %>% 
+  filter(!is.na(official_id))
 
-if (!readiness_result$success) {
-  create_log_entry("Readiness data load failed after retries", "ERROR")
-  upload_logs_to_bigquery(); quit(status=1)
-}
-readiness_data <- readiness_result$result %>%
-  mutate(readiness = as.numeric(readiness))
+create_log_entry(glue("VALD FD jumps with official_id: {nrow(vald_fd_jumps_with_off_id)} rows"))
 
-# FIX 2.7: Validate dates
-readiness_data <- validate_dates(readiness_data, "date", "readiness")
-create_log_entry(glue("Readiness data loaded: {nrow(readiness_data)} rows"))
+# Step 3: Calculate readiness from individual components using SAFE_DIVIDE logic
+#         readiness = vald_fd_jumps_with_off_id %>% 
+#         select(date,official_id,jump_height_readiness,epf_readiness,rsi_readiness) %>% 
+#         mutate(readiness = (jump_height_readiness + epf_readiness + rsi_readiness) / 3 ) %>% 
+#         select(-jump_height_readiness,-epf_readiness,-rsi_readiness)
+create_log_entry("Calculating readiness scores")
+readiness <- vald_fd_jumps_with_off_id %>% 
+  select(date, official_id, jump_height_readiness, epf_readiness, rsi_readiness) %>% 
+  mutate(
+    # Use SAFE_DIVIDE logic: sum non-NULL values, divide by count of non-NULL values
+    readiness_sum = coalesce(jump_height_readiness, 0) + coalesce(epf_readiness, 0) + coalesce(rsi_readiness, 0),
+    readiness_count = (!is.na(jump_height_readiness)) + (!is.na(epf_readiness)) + (!is.na(rsi_readiness)),
+    readiness = if_else(readiness_count > 0, readiness_sum / readiness_count, NA_real_)
+  ) %>% 
+  select(date, official_id, readiness)
+
+create_log_entry(glue("Readiness data calculated: {nrow(readiness)} rows"))
 
 # Check readiness value bounds
-readiness_range <- range(readiness_data$readiness, na.rm=TRUE)
+readiness_range <- range(readiness$readiness, na.rm=TRUE)
 if (readiness_range[1] < 0 || readiness_range[2] > 100) {
   create_log_entry(sprintf("WARN: Readiness values outside expected 0-100 range: [%.2f, %.2f]", 
                            readiness_range[1], readiness_range[2]), "WARN")
@@ -698,17 +737,24 @@ if (readiness_range[1] < 0 || readiness_range[2] > 100) {
 ################################################################################
 # MERGE WORKLOAD + READINESS BY (official_id, date)
 ################################################################################
-create_log_entry("Merging workload and readiness data (official_id + date)")
-data_joined <- workload_data %>%
-  left_join(readiness_data, by = c("official_id","date")) %>%
-  filter(!is.na(readiness))
 
-create_log_entry(glue("Joined data: {nrow(data_joined)} rows with readiness"))
-if (nrow(data_joined) == 0) {
+# Step 4: merged_data = readiness %>% 
+#         left_join(workload_with_off_id, by = c("official_id" = "official_id", "date" = "date")) %>% 
+#         filter(!is.na(distance))
+create_log_entry("Merging readiness and workload data by official_id and date")
+merged_data <- readiness %>% 
+  left_join(workload_with_off_id, by = c("official_id" = "official_id", "date" = "date")) %>% 
+  filter(!is.na(distance))
+
+create_log_entry(glue("Merged data: {nrow(merged_data)} rows with both readiness and workload"))
+if (nrow(merged_data) == 0) {
   create_log_entry("No matched workload-readiness rows after join", "INFO", reason="no_readiness_match")
   upload_logs_to_bigquery()
   cat("⏭️  TRAINING SKIPPED (no matches after join)\n"); quit(status=0)
 }
+
+# Use merged_data for modeling (rename to data_joined for compatibility with rest of script)
+data_joined <- merged_data
 
 ################################################################################
 # SPLIT, PREP, MODELING

@@ -328,25 +328,34 @@ jobs:
           echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name"
           echo ""
 
-          # CORRECTED: roster_name IS official_id, map vald_name to full_name
+          # Match the data connection logic from user's local implementation
+          # Key fix: Direct name matching without case normalization
           read -r -d '' MATCH_QUERY <<'SQL'
-          WITH roster_map AS (
-            SELECT
-              TRIM(CAST(official_id AS STRING)) AS official_id,
-              LOWER(TRIM(vald_name)) AS vald_full_name_norm
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}`
-          ),
-          workload_with_id AS (
+          WITH workload_with_off_id AS (
             SELECT DISTINCT
-              TRIM(CAST(roster_name AS STRING)) AS official_id,
+              roster_name AS official_id,
               DATE(date) AS date
             FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              AND roster_name IS NOT NULL
           ),
-          readiness_recent AS (
+          vald_fd_jumps_with_off_id AS (
             SELECT
-              DATE(date) AS date,
-              LOWER(TRIM(full_name)) AS vald_full_name_norm,
+              DATE(v.date) AS date,
+              r.official_id,
+              v.jump_height_readiness,
+              v.epf_readiness,
+              v.rsi_readiness
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}` v
+            LEFT JOIN `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}` r
+              ON v.full_name = r.vald_name
+            WHERE v.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+              AND r.official_id IS NOT NULL
+          ),
+          readiness AS (
+            SELECT
+              date,
+              official_id,
               SAFE_DIVIDE(
                 IFNULL(CAST(jump_height_readiness AS FLOAT64), 0) +
                 IFNULL(CAST(epf_readiness AS FLOAT64), 0) +
@@ -358,28 +367,24 @@ jobs:
                   0
                 )
               ) AS readiness
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+            FROM vald_fd_jumps_with_off_id
           ),
-          readiness_by_id AS (
+          merged_data AS (
             SELECT
-              rmap.official_id,
-              rr.date,
-              rr.readiness
-            FROM readiness_recent rr
-            JOIN roster_map rmap
-              ON rmap.vald_full_name_norm = rr.vald_full_name_norm
-            WHERE rr.readiness IS NOT NULL
+              r.official_id,
+              r.date
+            FROM readiness r
+            JOIN workload_with_off_id w
+              ON r.official_id = w.official_id
+             AND r.date = w.date
+            WHERE r.readiness IS NOT NULL
           )
           SELECT
-            COUNT(DISTINCT w.official_id) AS athletes_with_matches,
+            COUNT(DISTINCT official_id) AS athletes_with_matches,
             COUNT(*) AS total_matches,
-            MIN(w.date) AS earliest_match,
-            MAX(w.date) AS latest_match
-          FROM workload_with_id w
-          JOIN readiness_by_id rd
-            ON rd.official_id = w.official_id
-           AND rd.date = w.date
+            MIN(date) AS earliest_match,
+            MAX(date) AS latest_match
+          FROM merged_data
           SQL
 
           # Expand environment variables
