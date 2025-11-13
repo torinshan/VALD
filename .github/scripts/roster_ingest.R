@@ -36,30 +36,34 @@ pluck_col <- function(df, candidates) {
 
 # Candidates observed/expected:
 # - "Offical ID" (as spelled) -> clean_names => "offical_id"
+# - "official_id" (correct spelling) -> "official_id"
 # - Sometimes "Offical ID2"   -> "offical_id2"
 # - "Vald Name"               -> "vald_name"
-id1   <- pluck_col(clean, c("offical_id", "official_id", "id"))
-id2   <- pluck_col(clean, c("offical_id2", "official_id2"))
+# - Other variants: full_name, name
+id1   <- pluck_col(clean, c("official_id", "offical_id", "id"))
+id2   <- pluck_col(clean, c("official_id2", "offical_id2"))
 valdn <- pluck_col(clean, c("vald_name", "vald_full_name", "full_name", "name"))
 
 if (is.null(id1) && is.null(id2)) {
-  stop("Could not find an ID column (expected something like 'Offical ID' or 'Offical ID2').")
+  stop("Could not find an ID column (expected something like 'Offical ID' or 'Official ID').")
 }
 if (is.null(valdn)) {
-  stop("Could not find a 'Vald Name' column (expected something like 'Vald Name').")
+  stop("Could not find a 'Vald Name' column (expected something like 'Vald Name' or 'full_name').")
 }
 
+# Build dataframe that matches the BigQuery roster_mapping schema:
+# - official_id
+# - vald_name
 df <- tibble(
-  offical_id = coalesce(as.character(id1), as.character(id2)),
-  vald_name  = as.character(valdn)
-) |> 
+  official_id = coalesce(as.character(id1), as.character(id2)),
+  vald_name   = as.character(valdn)
+) %>%
   mutate(
-    offical_id = str_trim(offical_id),
-    vald_name  = str_squish(vald_name)
-  ) |> 
-  filter(offical_id != "", vald_name != "") |> 
-  distinct() |> 
-  rename(`Vald Name` = vald_name)
+    official_id = str_trim(official_id),
+    vald_name   = str_squish(vald_name)
+  ) %>%
+  filter(!is.na(official_id), official_id != "", !is.na(vald_name), vald_name != "") %>%
+  distinct()
 
 message("Prepared ", nrow(df), " roster rows for upload.")
 if (nrow(df) == 0) stop("No valid roster rows to upload after cleaning.")
@@ -75,6 +79,10 @@ con <- dbConnect(
 on.exit(try(dbDisconnect(con), silent = TRUE))
 
 message("Writing to BigQuery: ", project, ".", dataset, ".", table_name)
+
+# Write the table. Ensure the dataframe column names match the BigQuery schema:
+# official_id, vald_name
+# Use DBI::dbWriteTable which wraps bigrquery::bq_table_upload
 dbWriteTable(
   con,
   name = table_name,
@@ -82,7 +90,7 @@ dbWriteTable(
   overwrite = TRUE
 )
 
-# Correct query format string
+# Confirm upload
 query <- sprintf("SELECT COUNT(*) AS c FROM `%s.%s.%s`", project, dataset, table_name)
 res <- dbGetQuery(con, query)
 message("Upload complete. Row count in ", table_name, ": ", res$c[1])
