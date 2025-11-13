@@ -4,84 +4,83 @@ suppressPackageStartupMessages({
   library(readxl)
   library(dplyr)
   library(stringr)
-  library(tibble)
   library(janitor)
   library(bigrquery)
   library(DBI)
+  library(tibble)
 })
 
-# Env vars
-PROJECT   <- Sys.getenv("GCP_PROJECT", unset = NA)
-DATASET   <- Sys.getenv("BQ_DATASET",  unset = NA)
-LOCATION  <- Sys.getenv("BQ_LOCATION", unset = "US")
-TABLE     <- Sys.getenv("ROSTER_TABLE", unset = "roster_mapping")
-XL_PATH   <- Sys.getenv("ROSTER_LOCAL_FILE", unset = ".github/Sac State Roster - Summer 2025.xlsx")
-XL_SHEET  <- Sys.getenv("ROSTER_SHEET",     unset = "Master")
+# Environment
+project      <- Sys.getenv("GCP_PROJECT")
+dataset      <- Sys.getenv("BQ_DATASET")
+location     <- Sys.getenv("BQ_LOCATION", unset = "US")
+table_name   <- Sys.getenv("ROSTER_TABLE", unset = "roster_mapping")
+xlsx_path    <- Sys.getenv("ROSTER_LOCAL_FILE", unset = ".github/Sac State Roster - Summer 2025.xlsx")
+xlsx_sheet   <- Sys.getenv("ROSTER_SHEET", unset = "Master")
 
-if (is.na(PROJECT) || is.na(DATASET)) {
-  stop("GCP_PROJECT and BQ_DATASET environment variables are required", call. = FALSE)
+stopifnot(nzchar(project), nzchar(dataset), nzchar(location))
+
+message("Reading roster from: ", xlsx_path, " (sheet=", xlsx_sheet, ")")
+raw <- readxl::read_excel(xlsx_path, sheet = xlsx_sheet)
+
+# Clean column names for matching while preserving originals separately
+clean <- janitor::clean_names(raw)
+
+# Helper to safely pluck a column if present, else NULL
+pluck_col <- function(df, candidates) {
+  for (nm in candidates) {
+    if (nm %in% names(df)) return(df[[nm]])
+  }
+  NULL
 }
 
-message("Roster ingest starting…")
-message("  Project:  ", PROJECT)
-message("  Dataset:  ", DATASET)
-message("  Table:    ", TABLE)
-message("  Location: ", LOCATION)
-message("  File:     ", XL_PATH)
-message("  Sheet:    ", XL_SHEET)
+# Candidates observed/expected:
+# - "Offical ID" (as spelled) -> clean_names => "offical_id"
+# - Sometimes "Offical ID2"   -> "offical_id2"
+# - "Vald Name"               -> "vald_name"
+id1   <- pluck_col(clean, c("offical_id", "official_id", "id"))
+id2   <- pluck_col(clean, c("offical_id2", "official_id2"))
+valdn <- pluck_col(clean, c("vald_name", "vald_full_name", "full_name", "name"))
 
-if (!file.exists(XL_PATH)) {
-  stop(sprintf("Roster file not found: %s", XL_PATH), call. = FALSE)
+if (is.null(id1) && is.null(id2)) {
+  stop("Could not find an ID column (expected something like 'Offical ID' or 'Offical ID2').")
+}
+if (is.null(valdn)) {
+  stop("Could not find a 'Vald Name' column (expected something like 'Vald Name').")
 }
 
-# Read and clean column names to snake_case
-raw <- readxl::read_xlsx(path = XL_PATH, sheet = XL_SHEET)
-df  <- janitor::clean_names(raw)
-
-# Expect cleaned columns like:
-# team, roster_name, simple_name, offical_id, initial_name, first_name, last_name,
-# vald_name, kinexon_name, perch_name, data_hub_name, position, position_class,
-# offical_id2, starters
-
-# Build mapping with strict non-empty values
-map <- df %>%
+df <- tibble(
+  offical_id = coalesce(as.character(id1), as.character(id2)),
+  vald_name  = as.character(valdn)
+) |> 
   mutate(
-    offical_id = coalesce(.data$offical_id, .data$offical_id2),
-    offical_id = as.character(offical_id),
     offical_id = str_trim(offical_id),
-    vald_name  = as.character(.data$vald_name),
-    vald_name  = str_trim(vald_name)
-  ) %>%
-  transmute(offical_id, vald_name) %>%
-  filter(!is.na(offical_id), offical_id != "",
-         !is.na(vald_name),  vald_name  != "") %>%
-  distinct()
+    vald_name  = str_squish(vald_name)
+  ) |> 
+  filter(offical_id != "", vald_name != "") |> 
+  distinct() |> 
+  rename(`Vald Name` = vald_name)
 
-if (nrow(map) == 0) {
-  stop("No valid rows found for roster mapping (need offical_id and vald_name)", call. = FALSE)
-}
+message("Prepared ", nrow(df), " roster rows for upload.")
+if (nrow(df) == 0) stop("No valid roster rows to upload after cleaning.")
 
-# Rename to match required BigQuery schema: offical_id and 'Vald Name'
-names(map) <- c("offical_id", "Vald Name")
+# Connect to BigQuery (ADC from GitHub Action)
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = project,
+  dataset = dataset,
+  billing = project,
+  location = location
+)
+on.exit(try(dbDisconnect(con), silent = TRUE))
 
-message(sprintf("Prepared %d unique roster mapping rows", nrow(map)))
-
-# Ensure dataset exists (using ADC from runner)
-bigrquery::bq_auth(path = Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", unset = ""))
-
-ds <- bigrquery::bq_dataset(PROJECT, DATASET)
-if (!bigrquery::bq_dataset_exists(ds)) {
-  message("Creating dataset: ", sprintf("%s.%s", PROJECT, DATASET))
-  bigrquery::bq_dataset_create(ds, location = LOCATION)
-}
-
-# Upload table (truncate/replace)
-tbl <- bigrquery::bq_table(ds, TABLE)
-bigrquery::bq_table_upload(
-  tbl,
-  map,
-  create_disposition = "CREATE_IF_NEEDED",
-  write_disposition  = "WRITE_TRUNCATE"
+message("Writing to BigQuery: ", project, ".", dataset, ".", table_name)
+dbWriteTable(
+  con,
+  name = table_name,
+  value = df,
+  overwrite = TRUE
 )
 
-message("Roster mapping uploaded to BigQuery: ", sprintf("%s.%s.%s", PROJECT, DATASET, TABLE))
+res <- dbGetQuery(con, sprintf("SELECT COUNT(*) AS c FROM `%%s.%%s.%%s`", project, dataset, table_name))
+message("Upload complete. Row count in ", table_name, ": ", res$c[1])
