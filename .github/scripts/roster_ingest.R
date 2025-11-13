@@ -38,9 +38,10 @@ if (!file.exists(XL_PATH)) {
 raw <- readxl::read_xlsx(path = XL_PATH, sheet = XL_SHEET)
 df  <- janitor::clean_names(raw)
 
-# Expect cleaned columns like: team, roster_name, simple_name, offical_id,
-# initial_name, first_name, last_name, vald_name, kinexon_name, perch_name,
-# data_hub_name, position, position_class, offical_id2, starters
+# Expect cleaned columns like:
+# team, roster_name, simple_name, offical_id, initial_name, first_name, last_name,
+# vald_name, kinexon_name, perch_name, data_hub_name, position, position_class,
+# offical_id2, starters
 
 # Build mapping with strict non-empty values
 map <- df %>%
@@ -52,17 +53,21 @@ map <- df %>%
     vald_name  = str_trim(vald_name)
   ) %>%
   transmute(offical_id, vald_name) %>%
-  filter(!is.na(offical_id), offical_id != "", !is.na(vald_name), vald_name != "") %>%
+  filter(!is.na(offical_id), offical_id != "",
+         !is.na(vald_name),  vald_name  != "") %>%
   distinct()
 
 if (nrow(map) == 0) {
   stop("No valid rows found for roster mapping (need offical_id and vald_name)", call. = FALSE)
 }
 
+# Rename to match required BigQuery schema: offical_id and 'Vald Name'
+names(map) <- c("offical_id", "Vald Name")
+
 message(sprintf("Prepared %d unique roster mapping rows", nrow(map)))
 
-# Ensure dataset exists
-bq_auth_configure(path = Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", unset = ""))
+# Ensure dataset exists (using ADC from runner)
+bigrquery::bq_auth(path = Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", unset = ""))
 
 ds <- bigrquery::bq_dataset(PROJECT, DATASET)
 if (!bigrquery::bq_dataset_exists(ds)) {
@@ -73,10 +78,10 @@ if (!bigrquery::bq_dataset_exists(ds)) {
 # Upload table (truncate/replace)
 tbl <- bigrquery::bq_table(ds, TABLE)
 bigrquery::bq_table_upload(
-   tbl,
-   map,
-   create_disposition = "CREATE_IF_NEEDED",
-   write_disposition  = "WRITE_TRUNCATE"
- )
+  tbl,
+  map,
+  create_disposition = "CREATE_IF_NEEDED",
+  write_disposition  = "WRITE_TRUNCATE"
+)
 
 message("Roster mapping uploaded to BigQuery: ", sprintf("%s.%s.%s", PROJECT, DATASET, TABLE))
