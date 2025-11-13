@@ -77,6 +77,25 @@ cat("Skip training:", skip_training, "\n")
 cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
 cat("Match lookback days:", match_lookback_days, "\n\n")
 
+# Validate GCS_BUCKET is set (critical for model saving)
+if (!nzchar(gcs_bucket)) {
+  cat("❌ ERROR: GCS_BUCKET environment variable is not set.\n")
+  cat("\n")
+  cat("Models cannot be saved without a GCS bucket.\n")
+  cat("\n")
+  cat("Action required:\n")
+  cat("  1. Go to repository Settings → Secrets and variables → Actions\n")
+  cat("  2. Add repository secret 'GCS_BUCKET'\n")
+  cat("  3. Set value to your bucket name (without 'gs://' prefix)\n")
+  cat("     Example: my-vald-models-bucket\n")
+  cat("\n")
+  cat("The workflow will pass GCS_BUCKET to this script via env vars.\n")
+  cat("\n")
+  stop("GCS_BUCKET is required but not set. Cannot proceed with model training.")
+}
+
+cat("✅ GCS_BUCKET validation passed\n\n")
+
 ################################################################################
 # LOGGING
 ################################################################################
@@ -1332,12 +1351,33 @@ for (i in seq_len(n_athletes)) {
     
     # Save best model to registry
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
-      if (is.null(candidate$fitted) || candidate$fitted$type == "error" || !nzchar(gcs_bucket)) {
+      if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
+        create_log_entry(
+          sprintf("Cannot save model for %s: model fitting failed or returned error", model_name),
+          "ERROR",
+          reason = "model_fit_error"
+        )
         return(list(
           success = FALSE, 
           model_id = paste(team_name, model_name, sep=":"), 
           version_id = version_id, 
-          artifact_uri = NA
+          artifact_uri = NA,
+          error = "model_fit_error"
+        ))
+      }
+      
+      if (!nzchar(gcs_bucket)) {
+        create_log_entry(
+          sprintf("Cannot save model for %s: GCS_BUCKET not set", model_name),
+          "ERROR",
+          reason = "gcs_bucket_missing"
+        )
+        return(list(
+          success = FALSE, 
+          model_id = paste(team_name, model_name, sep=":"), 
+          version_id = version_id, 
+          artifact_uri = NA,
+          error = "gcs_bucket_missing"
         ))
       }
       
@@ -1354,7 +1394,20 @@ for (i in seq_len(n_athletes)) {
           date_created=Sys.time(), 
           athlete_id=athlete_id
         )
-        saveRDS(model_save, "artifact/model.rds")
+        
+        # Save RDS file locally first
+        tryCatch({
+          saveRDS(model_save, "artifact/model.rds")
+          create_log_entry(sprintf("  Model serialized to RDS: %s", model_name))
+        }, error = function(e) {
+          create_log_entry(
+            sprintf("  ERROR serializing model to RDS for %s: %s", model_name, e$message),
+            "ERROR",
+            reason = "rds_serialization_failed"
+          )
+          stop(sprintf("RDS serialization failed: %s", e$message))
+        })
+        
         sha <- digest::digest(file="artifact/model.rds", algo="sha256")
         
         manifest <- list(
@@ -1370,78 +1423,190 @@ for (i in seq_len(n_athletes)) {
         safe_model_name <- gsub("[^A-Za-z0-9]+", "_", model_name)
         gcs_path <- sprintf("models/%s/%s/%s/", team_name, safe_model_name, version_id)
         
-        gcs_upload("artifact/model.rds", name=paste0(gcs_path, "model.rds"))
-        gcs_upload("artifact/manifest.json", name=paste0(gcs_path, "manifest.json"))
+        # Upload to GCS with detailed error handling
+        tryCatch({
+          gcs_upload("artifact/model.rds", name=paste0(gcs_path, "model.rds"))
+          create_log_entry(sprintf("  Uploaded model.rds to gs://%s/%s", gcs_bucket, gcs_path))
+        }, error = function(e) {
+          create_log_entry(
+            sprintf("  ERROR uploading model.rds to GCS for %s: %s", model_name, e$message),
+            "ERROR",
+            reason = "gcs_upload_failed"
+          )
+          create_log_entry(
+            sprintf("  GCS path: gs://%s/%smodel.rds", gcs_bucket, gcs_path),
+            "ERROR"
+          )
+          # Print stack trace if available
+          tb <- tryCatch(capture.output(traceback()), error = function(e2) NULL)
+          if (!is.null(tb) && length(tb) > 0) {
+            create_log_entry(sprintf("  Stack trace:\n%s", paste(tb, collapse="\n")), "ERROR")
+          }
+          stop(sprintf("GCS upload failed: %s", e$message))
+        })
+        
+        tryCatch({
+          gcs_upload("artifact/manifest.json", name=paste0(gcs_path, "manifest.json"))
+          create_log_entry(sprintf("  Uploaded manifest.json to GCS"))
+        }, error = function(e) {
+          create_log_entry(
+            sprintf("  WARNING: manifest.json upload failed: %s", e$message),
+            "WARN"
+          )
+        })
+        
         artifact_uri <- sprintf("gs://%s/%smodel.rds", gcs_bucket, gcs_path)
         
         # Save to registry with enhanced metadata (FIX 1.3)
-        con <- DBI::dbConnect(bigrquery::bigquery(), project = project, dataset = dataset)
+        tryCatch({
+          con <- DBI::dbConnect(bigrquery::bigquery(), project = project, dataset = dataset)
+          
+          DBI::dbExecute(con, glue("
+            MERGE `{project}.{dataset}.registry_models` T 
+            USING (SELECT '{model_id}' AS model_id, '{model_name}' AS model_name,
+                          '{team_name}' AS team, 'auto' AS owner, 
+                          'Athlete readiness model' AS description,
+                          CURRENT_TIMESTAMP() AS created_at) S
+            ON T.model_id = S.model_id
+            WHEN NOT MATCHED THEN INSERT ROW
+          "))
+          create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
+          
+          # Prepare values outside glue to avoid nested quotes
+          run_id_val <- Sys.getenv("GITHUB_RUN_ID", "manual")
+          git_sha_val <- Sys.getenv("GITHUB_SHA", "unknown")
+          preds_json <- jsonlite::toJSON(preds, auto_unbox=TRUE)
+          hyper_json <- jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)
+          
+          DBI::dbExecute(con, glue("
+            INSERT INTO `{project}.{dataset}.registry_versions`
+              (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
+               framework, r_version, package_info, notes,
+               training_data_start_date, training_data_end_date,
+               n_training_samples, n_test_samples, validation_method,
+               predictor_list, hyperparameters,
+               train_rmse, cv_rmse, test_rmse,
+               pipeline_run_id, git_commit_sha)
+            VALUES
+              ('{model_id}','{version_id}',CURRENT_TIMESTAMP(),'github_actions',
+               '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','',
+               '{cfg_start_date}', '{cfg_end_date}',
+               {n_tr}, {n_te}, '{val_method}',
+               '{preds_json}',
+               '{hyper_json}',
+               {candidate$train_rmse}, {candidate$cv_rmse}, {candidate$test_rmse},
+               '{run_id_val}',
+               '{git_sha_val}')
+          "))
+          create_log_entry(sprintf("  Saved to registry_versions: %s", version_id))
+          
+          metrics <- tibble(
+            model_id = model_id, 
+            version_id = version_id,
+            metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
+            metric_value = c(candidate$train_rmse, candidate$cv_rmse, candidate$test_rmse, candidate$primary_rmse),
+            split = c("train","cv","test","primary"), 
+            logged_at = Sys.time()
+          )
+          bq_table_upload(
+            bq_table(project, dataset, "registry_metrics"), 
+            metrics, 
+            write_disposition="WRITE_APPEND"
+          )
+          create_log_entry(sprintf("  Saved metrics to registry_metrics"))
+          
+          DBI::dbExecute(con, glue("
+            INSERT INTO `{project}.{dataset}.registry_stages`
+              (model_id, version_id, stage, set_at, set_by, reason)
+            VALUES
+              ('{model_id}','{version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
+          "))
+          create_log_entry(sprintf("  Saved to registry_stages: Staging"))
+          
+          DBI::dbDisconnect(con)
+        }, error = function(e) {
+          create_log_entry(
+            sprintf("  ERROR saving to BigQuery registry for %s: %s", model_name, e$message),
+            "ERROR",
+            reason = "bigquery_registry_failed"
+          )
+          # Print stack trace
+          tb <- tryCatch(capture.output(traceback()), error = function(e2) NULL)
+          if (!is.null(tb) && length(tb) > 0) {
+            create_log_entry(sprintf("  Stack trace:\n%s", paste(tb, collapse="\n")), "ERROR")
+          }
+          stop(sprintf("BigQuery registry save failed: %s", e$message))
+        })
         
-        DBI::dbExecute(con, glue("
-          MERGE `{project}.{dataset}.registry_models` T 
-          USING (SELECT '{model_id}' AS model_id, '{model_name}' AS model_name,
-                        '{team_name}' AS team, 'auto' AS owner, 
-                        'Athlete readiness model' AS description,
-                        CURRENT_TIMESTAMP() AS created_at) S
-          ON T.model_id = S.model_id
-          WHEN NOT MATCHED THEN INSERT ROW
-        "))
-        
-        # Prepare values outside glue to avoid nested quotes
-        run_id_val <- Sys.getenv("GITHUB_RUN_ID", "manual")
-        git_sha_val <- Sys.getenv("GITHUB_SHA", "unknown")
-        preds_json <- jsonlite::toJSON(preds, auto_unbox=TRUE)
-        hyper_json <- jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)
-        
-        DBI::dbExecute(con, glue("
-          INSERT INTO `{project}.{dataset}.registry_versions`
-            (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
-             framework, r_version, package_info, notes,
-             training_data_start_date, training_data_end_date,
-             n_training_samples, n_test_samples, validation_method,
-             predictor_list, hyperparameters,
-             train_rmse, cv_rmse, test_rmse,
-             pipeline_run_id, git_commit_sha)
-          VALUES
-            ('{model_id}','{version_id}',CURRENT_TIMESTAMP(),'github_actions',
-             '{artifact_uri}','{sha}','R/glmnet','{R.version$version.string}','','',
-             '{cfg_start_date}', '{cfg_end_date}',
-             {n_tr}, {n_te}, '{val_method}',
-             '{preds_json}',
-             '{hyper_json}',
-             {candidate$train_rmse}, {candidate$cv_rmse}, {candidate$test_rmse},
-             '{run_id_val}',
-             '{git_sha_val}')
-        "))
-        
-        metrics <- tibble(
-          model_id = model_id, 
-          version_id = version_id,
-          metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
-          metric_value = c(candidate$train_rmse, candidate$cv_rmse, candidate$test_rmse, candidate$primary_rmse),
-          split = c("train","cv","test","primary"), 
-          logged_at = Sys.time()
-        )
-        bq_table_upload(
-          bq_table(project, dataset, "registry_metrics"), 
-          metrics, 
-          write_disposition="WRITE_APPEND"
-        )
-        
-        DBI::dbExecute(con, glue("
-          INSERT INTO `{project}.{dataset}.registry_stages`
-            (model_id, version_id, stage, set_at, set_by, reason)
-          VALUES
-            ('{model_id}','{version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
-        "))
-        
-        DBI::dbDisconnect(con)
         unlink("artifact", recursive=TRUE)
         
         list(success=TRUE, model_id=model_id, version_id=version_id, artifact_uri=artifact_uri)
       }, error = function(e) {
-        create_log_entry(paste("Model save failed for", model_name, ":", e$message), "ERROR")
-        list(success=FALSE, model_id=NA, version_id=NA, artifact_uri=NA)
+        # Top-level error handler with full details
+        create_log_entry(
+          sprintf("Model save FAILED for %s: %s", model_name, conditionMessage(e)),
+          "ERROR",
+          reason = "model_save_error"
+        )
+        
+        # Print full error details
+        cat("\n")
+        cat("════════════════════════════════════════════════════\n")
+        cat("ERROR DETAILS for model:", model_name, "\n")
+        cat("════════════════════════════════════════════════════\n")
+        cat("Error message:", conditionMessage(e), "\n")
+        cat("\n")
+        
+        # Print call stack if available
+        tb <- tryCatch({
+          capture.output(traceback())
+        }, error = function(e2) NULL)
+        
+        if (!is.null(tb) && length(tb) > 0) {
+          cat("Call stack:\n")
+          cat(paste(tb, collapse="\n"), "\n")
+          cat("\n")
+        }
+        
+        # Diagnostic information
+        cat("Diagnostic info:\n")
+        cat("  GCS_BUCKET:", gcs_bucket, "\n")
+        cat("  Model type:", candidate$model_type, "\n")
+        cat("  Athlete ID:", athlete_id, "\n")
+        cat("  Version ID:", version_id, "\n")
+        cat("\n")
+        
+        # Attempt to save model locally as backup
+        tryCatch({
+          local_dir <- "failed_models"
+          dir.create(local_dir, showWarnings = FALSE, recursive = TRUE)
+          local_path <- file.path(local_dir, paste0(model_name, "_", version_id, ".rds"))
+          
+          model_save <- list(
+            model=candidate$fitted$model, 
+            type=candidate$model_type,
+            predictors=candidate$fitted$predictors, 
+            preprocessing=candidate$fitted$preprocessing,
+            date_created=Sys.time(), 
+            athlete_id=athlete_id,
+            error_during_save = conditionMessage(e)
+          )
+          saveRDS(model_save, local_path)
+          
+          cat("✅ Model saved locally as backup:", local_path, "\n")
+          create_log_entry(
+            sprintf("  Model backed up locally: %s", local_path),
+            "WARN",
+            reason = "local_backup"
+          )
+        }, error = function(e2) {
+          cat("❌ Could not save local backup:", conditionMessage(e2), "\n")
+        })
+        
+        cat("════════════════════════════════════════════════════\n")
+        cat("\n")
+        
+        list(success=FALSE, model_id=NA, version_id=NA, artifact_uri=NA, error=conditionMessage(e))
       })
     }
     
