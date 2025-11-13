@@ -82,5 +82,7 @@ dbWriteTable(
   overwrite = TRUE
 )
 
-res <- dbGetQuery(con, sprintf("SELECT COUNT(*) AS c FROM `%%s.%%s.%%s`", project, dataset, table_name))
+# Correct query format string
+query <- sprintf("SELECT COUNT(*) AS c FROM `%s.%s.%s`", project, dataset, table_name)
+res <- dbGetQuery(con, query)
 message("Upload complete. Row count in ", table_name, ": ", res$c[1])
