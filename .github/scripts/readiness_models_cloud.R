@@ -824,7 +824,9 @@ if (!nzchar(has_matches_hint)) {
 }
 
 ################################################################################
-# FIX 1.3: INIT REGISTRY TABLES (with primary keys and partitioning)
+# FIX 1.3: INIT REGISTRY TABLES (with partitioning and clustering)
+# Note: PRIMARY KEY constraints removed to fix BigQuery MERGE failures.
+# Uniqueness is enforced via MERGE logic instead of table constraints.
 ################################################################################
 create_log_entry("Initializing model registry tables")
 tryCatch({
@@ -832,6 +834,7 @@ tryCatch({
   if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
   
   # Registry Models
+  # Stores metadata for each model (one row per model_id)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_models` (
       model_id STRING NOT NULL,
@@ -847,6 +850,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_models")
   
   # Registry Versions
+  # Stores version information for each model (one row per model_id + version_id)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_versions` (
       model_id STRING NOT NULL,
@@ -878,6 +882,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_versions")
   
   # Registry Metrics
+  # Stores performance metrics for model versions (multiple rows per version)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_metrics` (
       model_id STRING NOT NULL,
@@ -893,6 +898,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_metrics")
   
   # Registry Stages
+  # Tracks model lifecycle stages (e.g., dev, staging, production)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_stages` (
       model_id STRING NOT NULL,
