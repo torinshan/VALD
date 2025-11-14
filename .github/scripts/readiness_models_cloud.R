@@ -144,6 +144,24 @@ tryCatch({
 # HELPER FUNCTIONS
 ################################################################################
 
+# Safe accessor for nested list/object fields to avoid "$ operator is invalid for atomic vectors" error
+safe_get_field <- function(obj, field_path) {
+  # field_path is a character vector like c("jobReference", "jobId")
+  # Returns NULL if any level is not a list or doesn't exist
+  tryCatch({
+    result <- obj
+    for (field in field_path) {
+      if (!is.list(result) || is.null(result[[field]])) {
+        return(NULL)
+      }
+      result <- result[[field]]
+    }
+    result
+  }, error = function(e) {
+    NULL
+  })
+}
+
 # FIX 2.6: Consistent normalization function
 normalize_athlete_id <- function(x) {
   # Consistent with SQL: TRIM(CAST(x AS STRING))
@@ -250,47 +268,55 @@ fetch_and_log_bq_job_details <- function(job_id_full, operation_name = "BigQuery
       })
       
       if (!is.null(job_json)) {
-        # Log job status
-        if (!is.null(job_json$status$state)) {
-          create_log_entry(sprintf("  📊 Job state: %s", job_json$status$state), "ERROR")
+        # Log job status using safe accessor
+        job_state <- safe_get_field(job_json, c("status", "state"))
+        if (!is.null(job_state)) {
+          create_log_entry(sprintf("  📊 Job state: %s", job_state), "ERROR")
         }
         
         # Log error details if present
-        if (!is.null(job_json$status$errorResult)) {
-          err <- job_json$status$errorResult
+        error_result <- safe_get_field(job_json, c("status", "errorResult"))
+        if (!is.null(error_result) && is.list(error_result)) {
           create_log_entry("  ❌ BigQuery Error Details:", "ERROR")
-          create_log_entry(sprintf("     Reason: %s", err$reason %||% "unknown"), "ERROR")
-          create_log_entry(sprintf("     Message: %s", err$message %||% "unknown"), "ERROR")
-          if (!is.null(err$location)) {
-            create_log_entry(sprintf("     Location: %s", err$location), "ERROR")
+          create_log_entry(sprintf("     Reason: %s", error_result$reason %||% "unknown"), "ERROR")
+          create_log_entry(sprintf("     Message: %s", error_result$message %||% "unknown"), "ERROR")
+          if (!is.null(error_result$location)) {
+            create_log_entry(sprintf("     Location: %s", error_result$location), "ERROR")
           }
         }
         
         # Log all errors if present
-        if (!is.null(job_json$status$errors) && length(job_json$status$errors) > 0) {
+        errors_list <- safe_get_field(job_json, c("status", "errors"))
+        if (!is.null(errors_list) && length(errors_list) > 0) {
           create_log_entry("  ❌ All job errors:", "ERROR")
-          for (i in seq_along(job_json$status$errors)) {
-            err <- job_json$status$errors[[i]]
-            create_log_entry(sprintf("     [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+          for (i in seq_along(errors_list)) {
+            err <- errors_list[[i]]
+            if (is.list(err)) {
+              create_log_entry(sprintf("     [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+            }
           }
         }
         
         # Log job configuration for debugging schema issues
-        if (!is.null(job_json$configuration)) {
-          if (!is.null(job_json$configuration$load)) {
-            load_conf <- job_json$configuration$load
+        configuration <- safe_get_field(job_json, c("configuration"))
+        if (!is.null(configuration) && is.list(configuration)) {
+          load_conf <- safe_get_field(configuration, c("load"))
+          if (!is.null(load_conf) && is.list(load_conf)) {
             create_log_entry("  📋 Load job configuration:", "INFO")
-            if (!is.null(load_conf$destinationTable)) {
+            dest_table <- safe_get_field(load_conf, c("destinationTable"))
+            if (!is.null(dest_table) && is.list(dest_table)) {
               create_log_entry(sprintf("     Destination: %s:%s.%s", 
-                load_conf$destinationTable$projectId %||% "?",
-                load_conf$destinationTable$datasetId %||% "?",
-                load_conf$destinationTable$tableId %||% "?"), "INFO")
+                dest_table$projectId %||% "?",
+                dest_table$datasetId %||% "?",
+                dest_table$tableId %||% "?"), "INFO")
             }
-            if (!is.null(load_conf$sourceFormat)) {
-              create_log_entry(sprintf("     Source format: %s", load_conf$sourceFormat), "INFO")
+            source_format <- safe_get_field(load_conf, c("sourceFormat"))
+            if (!is.null(source_format)) {
+              create_log_entry(sprintf("     Source format: %s", source_format), "INFO")
             }
-            if (!is.null(load_conf$writeDisposition)) {
-              create_log_entry(sprintf("     Write disposition: %s", load_conf$writeDisposition), "INFO")
+            write_disp <- safe_get_field(load_conf, c("writeDisposition"))
+            if (!is.null(write_disp)) {
+              create_log_entry(sprintf("     Write disposition: %s", write_disp), "INFO")
             }
           }
         }
@@ -328,11 +354,13 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
         }
       }
     } else if (is.list(job_or_error) && inherits(job_or_error, "bq_job")) {
-      # If we have a job object, try to extract error details
-      # Check if jobReference is a list before accessing nested properties
-      if (is.list(job_or_error$jobReference) && !is.null(job_or_error$jobReference$jobId)) {
-        job_id <- job_or_error$jobReference$jobId
-        job_location <- job_or_error$jobReference$location %||% location
+      # If we have a job object, try to extract error details using safe accessors
+      # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
+      job_id <- safe_get_field(job_or_error, c("jobReference", "jobId"))
+      job_location <- safe_get_field(job_or_error, c("jobReference", "location"))
+      
+      if (!is.null(job_id)) {
+        job_location <- job_location %||% location
         job_id_full <- paste0(job_id, ".", job_location)
         
         create_log_entry(sprintf("  📋 BigQuery Job ID: %s", job_id_full), "ERROR")
@@ -341,18 +369,17 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
         fetch_and_log_bq_job_details(job_id_full, operation_name)
       }
       
-      if (is.list(job_or_error$status) && !is.null(job_or_error$status$errorResult)) {
-        error_result <- job_or_error$status$errorResult
-        if (is.list(error_result)) {
-          create_log_entry(sprintf("  ❌ Error reason: %s", error_result$reason %||% "unknown"), "ERROR")
-          create_log_entry(sprintf("  ❌ Error message: %s", error_result$message %||% "unknown"), "ERROR")
-        }
+      error_result <- safe_get_field(job_or_error, c("status", "errorResult"))
+      if (!is.null(error_result) && is.list(error_result)) {
+        create_log_entry(sprintf("  ❌ Error reason: %s", error_result$reason %||% "unknown"), "ERROR")
+        create_log_entry(sprintf("  ❌ Error message: %s", error_result$message %||% "unknown"), "ERROR")
       }
       
-      if (is.list(job_or_error$status) && !is.null(job_or_error$status$errors) && length(job_or_error$status$errors) > 0) {
+      errors_list <- safe_get_field(job_or_error, c("status", "errors"))
+      if (!is.null(errors_list) && length(errors_list) > 0) {
         create_log_entry("  ❌ All errors:", "ERROR")
-        for (i in seq_along(job_or_error$status$errors)) {
-          err <- job_or_error$status$errors[[i]]
+        for (i in seq_along(errors_list)) {
+          err <- errors_list[[i]]
           if (is.list(err)) {
             create_log_entry(sprintf("    [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
           }
@@ -1973,17 +2000,21 @@ for (i in seq_len(n_athletes)) {
                 
                 # If the upload returns a job object, wait for it and check status
                 if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
-                  if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
-                    job_id <- upload_job$jobReference$jobId
-                    job_location <- upload_job$jobReference$location %||% location
+                  # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
+                  job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
+                  job_location <- safe_get_field(upload_job, c("jobReference", "location"))
+                  
+                  if (!is.null(job_id)) {
+                    job_location <- job_location %||% location
                     create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
                     
                     # Wait for job completion and check status
                     tryCatch({
                       completed_job <- bq_job_wait(upload_job, quiet = TRUE)
                       
-                      # Check if job failed
-                      if (is.list(completed_job$status) && !is.null(completed_job$status$errorResult)) {
+                      # Check if job failed using safe accessor
+                      error_result <- safe_get_field(completed_job, c("status", "errorResult"))
+                      if (!is.null(error_result)) {
                         create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
                         log_bq_job_error(completed_job, "registry_models upload")
                         stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
@@ -2063,17 +2094,21 @@ for (i in seq_len(n_athletes)) {
                 
                 # If the upload returns a job object, wait for it and check status
                 if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
-                  if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
-                    job_id <- upload_job$jobReference$jobId
-                    job_location <- upload_job$jobReference$location %||% location
+                  # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
+                  job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
+                  job_location <- safe_get_field(upload_job, c("jobReference", "location"))
+                  
+                  if (!is.null(job_id)) {
+                    job_location <- job_location %||% location
                     create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
                     
                     # Wait for job completion and check status
                     tryCatch({
                       completed_job <- bq_job_wait(upload_job, quiet = TRUE)
                       
-                      # Check if job failed
-                      if (is.list(completed_job$status) && !is.null(completed_job$status$errorResult)) {
+                      # Check if job failed using safe accessor
+                      error_result <- safe_get_field(completed_job, c("status", "errorResult"))
+                      if (!is.null(error_result)) {
                         create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
                         log_bq_job_error(completed_job, "registry_versions upload")
                         stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
