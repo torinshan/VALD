@@ -96,7 +96,7 @@ tryCatch({
     log("✓ All", missing_vald_id_result$total_rows, "records have vald_id")
   }
 }, error = function(e) {
-  log("Error checking vald_id:", conditionMessage(e))
+  log("Error checking vald_id:", e$message)
 })
 
 # Check 2: Team/Position mapping validation
@@ -106,7 +106,7 @@ log("Checking team/position mapping from vald_roster...")
 roster_exists <- tryCatch({
   DBI::dbExistsTable(con, Id(project = project, dataset = dataset, table = roster_tbl))
 }, error = function(e) {
-  log("Error checking roster table:", conditionMessage(e))
+  log("Error checking roster table:", e$message)
   FALSE
 })
 
@@ -205,7 +205,7 @@ if (roster_exists) {
       log("✓ All records have valid team/position mappings")
     }
   }, error = function(e) {
-    log("Error checking team/position mappings:", conditionMessage(e))
+    log("Error checking team/position mappings:", e$message)
   })
 } else {
   log("WARNING: vald_roster table not found - skipping team/position validation")
@@ -262,7 +262,7 @@ tryCatch({
     log("✓ No duplicate test_ids found")
   }
 }, error = function(e) {
-  log("Error in duplicate detection:", conditionMessage(e))
+  log("Error in duplicate detection:", e$message)
 })
 
 log("Data quality checks completed")

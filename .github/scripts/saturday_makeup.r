@@ -27,7 +27,7 @@ tryCatch({
     library(lifecycle)
   })
 }, error = function(e) {
-  cat("Error loading required packages:", conditionMessage(e), "\n")
+  cat("Error loading required packages:", e$message, "\n")
   cat("Please ensure all required packages are installed\n")
   quit(status = 1)
 })
@@ -84,7 +84,7 @@ tryCatch({
   }
   
 }, error = function(e) {
-  cat("BigQuery authentication failed:", conditionMessage(e), "\n")
+  cat("BigQuery authentication failed:", e$message, "\n")
   quit(status = 1)
 })
 
@@ -146,7 +146,7 @@ upload_logs_to_bigquery <- function() {
     return(TRUE)
     
   }, error = function(e) {
-    cat("Failed to upload logs to BigQuery:", conditionMessage(e), "\n")
+    cat("Failed to upload logs to BigQuery:", e$message, "\n")
     return(FALSE)
   })
 }
@@ -171,7 +171,7 @@ tryCatch({
   set_credentials(client_id, client_secret, tenant_id, region)
   create_log_entry("VALD API credentials configured successfully")
 }, error = function(e) {
-  create_log_entry(paste("VALD API setup failed:", conditionMessage(e)), "ERROR")
+  create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
   quit(status = 1)
 })
 
@@ -221,7 +221,7 @@ extract_test_ids_from_table <- function(table_name) {
     return(result)
     
   }, error = function(e) {
-    create_log_entry(paste("Error extracting test_IDs from", table_name, ":", conditionMessage(e)), "ERROR")
+    create_log_entry(paste("Error extracting test_IDs from", table_name, ":", e$message), "ERROR")
     return(data.frame(test_ID = character(0), source_table = character(0)))
   })
 }
@@ -269,7 +269,7 @@ process_missing_forcedecks_data <- function(missing_test_ids, existing_data) {
     return(processed_data)
     
   }, error = function(e) {
-    create_log_entry(paste("Error retrieving missing ForceDecks data:", conditionMessage(e)), "ERROR")
+    create_log_entry(paste("Error retrieving missing ForceDecks data:", e$message), "ERROR")
     return(NULL)
   })
 }
@@ -886,7 +886,7 @@ process_missing_nordbord_data <- function(missing_test_ids) {
         create_log_entry(paste("No data returned for NordBord test_ID:", test_id), "WARN")
       }
     }, error = function(e) {
-      create_log_entry(paste("Error retrieving NordBord test_ID", test_id, ":", conditionMessage(e)), "ERROR")
+      create_log_entry(paste("Error retrieving NordBord test_ID", test_id, ":", e$message), "ERROR")
     })
     
     # Add small delay to avoid rate limiting
@@ -931,7 +931,7 @@ rate_limited_api_call <- function(api_function, ..., description = "API call") {
   result <- tryCatch({
     api_function(...)
   }, error = function(e) {
-    create_log_entry(paste("Rate-limited API call failed for", description, ":", conditionMessage(e)), "ERROR")
+    create_log_entry(paste("Rate-limited API call failed for", description, ":", e$message), "ERROR")
     NULL
   })
   
@@ -1055,7 +1055,7 @@ standardize_data_types <- function(data, table_name) {
           }
         }
       }, error = function(e) {
-        create_log_entry(paste("Failed to convert", col_name, "to", target_type, ":", conditionMessage(e)), "ERROR")
+        create_log_entry(paste("Failed to convert", col_name, "to", target_type, ":", e$message), "ERROR")
       })
     }
   }
@@ -1129,7 +1129,7 @@ enhanced_upload_to_bq <- function(data, table_name, write_disposition = "WRITE_A
       return(TRUE)
       
     }, error = function(e) {
-      error_msg <- as.character(conditionMessage(e))
+      error_msg <- as.character(e$message)
       create_log_entry(paste("Upload attempt", attempt, "failed for", table_name, ":", error_msg), "ERROR")
       
       if (attempt < max_retries) {
@@ -1197,7 +1197,7 @@ tryCatch({
     create_log_entry("No ForceDecks tests retrieved from API", "WARN")
   }
 }, error = function(e) {
-  create_log_entry(paste("Error retrieving ForceDecks tests:", conditionMessage(e)), "ERROR")
+  create_log_entry(paste("Error retrieving ForceDecks tests:", e$message), "ERROR")
   forcedecks_test_ids <- data.frame(test_ID = character(0), source_api = character(0))
 })
 
@@ -1215,7 +1215,7 @@ tryCatch({
     create_log_entry("No NordBord tests retrieved from API", "WARN")
   }
 }, error = function(e) {
-  create_log_entry(paste("Error retrieving NordBord tests:", conditionMessage(e)), "ERROR")
+  create_log_entry(paste("Error retrieving NordBord tests:", e$message), "ERROR")
   nordbord_test_ids <- data.frame(test_ID = character(0), source_api = character(0))
 })
 
@@ -1508,7 +1508,7 @@ upload_logs_to_bigquery()
 tryCatch({
   DBI::dbDisconnect(con)
 }, error = function(e) {
-  create_log_entry(paste("Warning: Could not close BigQuery connection:", conditionMessage(e)), "WARN")
+  create_log_entry(paste("Warning: Could not close BigQuery connection:", e$message), "WARN")
 })
 
 cat("Saturday data reconciliation completed successfully\n")
