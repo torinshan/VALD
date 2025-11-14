@@ -1762,7 +1762,9 @@ for (i in seq_len(n_athletes)) {
                           'Athlete readiness model' AS description,
                           CURRENT_TIMESTAMP() AS created_at) S
             ON T.model_id = S.model_id
-            WHEN NOT MATCHED THEN INSERT ROW
+            WHEN NOT MATCHED THEN
+              INSERT (model_id, model_name, team, owner, description, created_at)
+              VALUES (S.model_id, S.model_name, S.team, S.owner, S.description, S.created_at)
           ")
           
           create_log_entry(sprintf("  Executing SQL for registry_models..."))
