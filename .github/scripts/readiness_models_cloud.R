@@ -237,25 +237,30 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
           create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s", project, job_id_match[1]), "ERROR")
         }
       }
-    } else if (inherits(job_or_error, "bq_job")) {
+    } else if (is.list(job_or_error) && inherits(job_or_error, "bq_job")) {
       # If we have a job object, try to extract error details
-      if (!is.null(job_or_error$jobReference$jobId)) {
+      # Check if jobReference is a list before accessing nested properties
+      if (is.list(job_or_error$jobReference) && !is.null(job_or_error$jobReference$jobId)) {
         job_id <- job_or_error$jobReference$jobId
         create_log_entry(sprintf("  📋 BigQuery Job ID: %s.%s", job_id, location), "ERROR")
         create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s.%s", project, job_id, location), "ERROR")
       }
       
-      if (!is.null(job_or_error$status$errorResult)) {
+      if (is.list(job_or_error$status) && !is.null(job_or_error$status$errorResult)) {
         error_result <- job_or_error$status$errorResult
-        create_log_entry(sprintf("  ❌ Error reason: %s", error_result$reason %||% "unknown"), "ERROR")
-        create_log_entry(sprintf("  ❌ Error message: %s", error_result$message %||% "unknown"), "ERROR")
+        if (is.list(error_result)) {
+          create_log_entry(sprintf("  ❌ Error reason: %s", error_result$reason %||% "unknown"), "ERROR")
+          create_log_entry(sprintf("  ❌ Error message: %s", error_result$message %||% "unknown"), "ERROR")
+        }
       }
       
-      if (!is.null(job_or_error$status$errors) && length(job_or_error$status$errors) > 0) {
+      if (is.list(job_or_error$status) && !is.null(job_or_error$status$errors) && length(job_or_error$status$errors) > 0) {
         create_log_entry("  ❌ All errors:", "ERROR")
         for (i in seq_along(job_or_error$status$errors)) {
           err <- job_or_error$status$errors[[i]]
-          create_log_entry(sprintf("    [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+          if (is.list(err)) {
+            create_log_entry(sprintf("    [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+          }
         }
       }
     }
@@ -1872,8 +1877,8 @@ for (i in seq_len(n_athletes)) {
                 upload_job <- bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
                 
                 # If the upload returns a job object, log the job ID
-                if (!is.null(upload_job) && inherits(upload_job, "bq_job")) {
-                  if (!is.null(upload_job$jobReference$jobId)) {
+                if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
+                  if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
                     job_id <- upload_job$jobReference$jobId
                     create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
                   }
@@ -1942,8 +1947,8 @@ for (i in seq_len(n_athletes)) {
                 upload_job <- bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
                 
                 # If the upload returns a job object, log the job ID
-                if (!is.null(upload_job) && inherits(upload_job, "bq_job")) {
-                  if (!is.null(upload_job$jobReference$jobId)) {
+                if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
+                  if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
                     job_id <- upload_job$jobReference$jobId
                     create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
                   }
