@@ -1752,30 +1752,48 @@ for (i in seq_len(n_athletes)) {
         escaped_model_name <- escape_bq_string(model_name)
         escaped_version_id <- escape_bq_string(version_id)
         
-        # Save to registry with enhanced error handling
+        # Save to registry with free tier compatible approach
         tryCatch({
-          # Step 1: Save to registry_models
-          sql_models <- glue("
-            MERGE `{project}.{dataset}.registry_models` T 
-            USING (SELECT '{escaped_model_id}' AS model_id, '{escaped_model_name}' AS model_name,
-                          '{team_name}' AS team, 'auto' AS owner, 
-                          'Athlete readiness model' AS description,
-                          CURRENT_TIMESTAMP() AS created_at) S
-            ON T.model_id = S.model_id
-            WHEN NOT MATCHED THEN
-              INSERT (model_id, model_name, team, owner, description, created_at)
-              VALUES (S.model_id, S.model_name, S.team, S.owner, S.description, S.created_at)
-          ")
+          # Step 1: Save to registry_models using streaming inserts (not DML)
           
-          create_log_entry(sprintf("  Executing SQL for registry_models..."))
+          create_log_entry(sprintf("  Saving to registry_models (free tier compatible)..."))
           result <- retry_operation(
             {
               tryCatch({
-                bq_project_query(project, sql_models, use_legacy_sql = FALSE)
+                # FREE TIER FIX: Check if model exists (SELECT allowed on free tier)
+                check_sql <- glue("
+                  SELECT COUNT(*) as count 
+                  FROM `{project}.{dataset}.registry_models` 
+                  WHERE model_id = '{escaped_model_id}'
+                ")
+                
+                check_result <- bq_project_query(project, check_sql, use_legacy_sql = FALSE)
+                check_df <- bq_table_download(check_result)
+                
+                if (check_df$count[1] > 0) {
+                  # Model already exists - skip (or could update via delete+insert if needed)
+                  create_log_entry(sprintf("  Model already exists in registry, skipping insert"))
+                  return(TRUE)
+                }
+                
+                # Model doesn't exist - insert using streaming API (NOT DML - works on free tier!)
+                new_row <- tibble(
+                  model_id = escaped_model_id,
+                  model_name = escaped_model_name,
+                  team = team_name,
+                  owner = "auto",
+                  description = "Athlete readiness model",
+                  created_at = Sys.time()
+                )
+                
+                tbl <- bq_table(project, dataset, "registry_models")
+                
+                # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
+                bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
+                
                 TRUE
               }, error = function(e) {
-                create_log_entry(sprintf("  SQL that failed:\n%s", sql_models), "ERROR")
-                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Registry save error: %s", e$message), "ERROR")
                 stop(sprintf("registry_models insert failed: %s", e$message))
               })
             },
@@ -1790,37 +1808,45 @@ for (i in seq_len(n_athletes)) {
           }
           create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
           
-          # Step 2: Save to registry_versions
-          sql_versions <- glue("
-            INSERT INTO `{project}.{dataset}.registry_versions`
-              (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
-               framework, r_version, package_info, notes,
-               training_data_start_date, training_data_end_date,
-               n_training_samples, n_test_samples, validation_method,
-               predictor_list, hyperparameters,
-               train_rmse, cv_rmse, test_rmse,
-               pipeline_run_id, git_commit_sha)
-            VALUES
-              ('{escaped_model_id}','{escaped_version_id}',CURRENT_TIMESTAMP(),'github_actions',
-               '{escape_bq_string(artifact_uri)}','bigquery','R/glmnet','{escape_bq_string(R.version$version.string)}','','',
-               '{cfg_start_date}', '{cfg_end_date}',
-               {n_tr}, {n_te}, '{val_method}',
-               '{preds_json}',
-               '{hyper_json}',
-               {train_rmse_val}, {cv_rmse_val}, {test_rmse_val},
-               '{run_id_val}',
-               '{git_sha_val}')
-          ")
-          
-          create_log_entry(sprintf("  Executing SQL for registry_versions..."))
+          # Step 2: Save to registry_versions using streaming insert (not DML)
+          create_log_entry(sprintf("  Saving to registry_versions (free tier compatible)..."))
           result <- retry_operation(
             {
               tryCatch({
-                bq_project_query(project, sql_versions, use_legacy_sql = FALSE)
+                # Prepare version row for streaming insert
+                version_row <- tibble(
+                  model_id = escaped_model_id,
+                  version_id = escaped_version_id,
+                  created_at = Sys.time(),
+                  created_by = "github_actions",
+                  artifact_uri = artifact_uri,
+                  artifact_sha256 = "bigquery",
+                  framework = "R/glmnet",
+                  r_version = R.version$version.string,
+                  package_info = "",
+                  notes = "",
+                  training_data_start_date = cfg_start_date,
+                  training_data_end_date = cfg_end_date,
+                  n_training_samples = as.integer(n_tr),
+                  n_test_samples = as.integer(n_te),
+                  validation_method = val_method,
+                  predictor_list = preds_json,
+                  hyperparameters = hyper_json,
+                  train_rmse = train_rmse_val,
+                  cv_rmse = cv_rmse_val,
+                  test_rmse = test_rmse_val,
+                  pipeline_run_id = run_id_val,
+                  git_commit_sha = git_sha_val
+                )
+                
+                tbl <- bq_table(project, dataset, "registry_versions")
+                
+                # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
+                bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
+                
                 TRUE
               }, error = function(e) {
-                create_log_entry(sprintf("  SQL that failed:\n%s", sql_versions), "ERROR")
-                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Registry versions save error: %s", e$message), "ERROR")
                 stop(sprintf("registry_versions insert failed: %s", e$message))
               })
             },
