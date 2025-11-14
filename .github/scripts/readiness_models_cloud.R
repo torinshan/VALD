@@ -219,23 +219,31 @@ validate_dates <- function(df, date_col, context) {
   df
 }
 
-# Retry helper
+# Retry helper with exponential backoff
 retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS, 
                            wait_seconds = RETRY_WAIT_SECONDS, 
-                           operation_name = "operation") {
+                           operation_name = "operation",
+                           exponential_backoff = TRUE) {
   for (attempt in 1:max_attempts) {
     result <- tryCatch({
       force(expr)
       return(list(success = TRUE, result = expr))
     }, error = function(e) {
       if (attempt < max_attempts) {
+        # Use exponential backoff: wait_seconds * 2^(attempt-1)
+        wait_time <- if (exponential_backoff) {
+          wait_seconds * (2 ^ (attempt - 1))
+        } else {
+          wait_seconds
+        }
+        
         create_log_entry(
           sprintf("%s failed (attempt %d/%d): %s. Retrying in %d seconds...", 
-                  operation_name, attempt, max_attempts, e$message, wait_seconds),
+                  operation_name, attempt, max_attempts, e$message, wait_time),
           "WARN",
           reason = "retry_transient_error"
         )
-        Sys.sleep(wait_seconds)
+        Sys.sleep(wait_time)
         NULL
       } else {
         create_log_entry(
@@ -1756,14 +1764,26 @@ for (i in seq_len(n_athletes)) {
           ")
           
           create_log_entry(sprintf("  Executing SQL for registry_models..."))
-          result <- tryCatch({
-            bq_project_query(project, sql_models, use_legacy_sql = FALSE)
-            TRUE
-          }, error = function(e) {
-            create_log_entry(sprintf("  SQL that failed:\n%s", sql_models), "ERROR")
-            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
-            stop(sprintf("registry_models insert failed: %s", e$message))
-          })
+          result <- retry_operation(
+            {
+              tryCatch({
+                bq_project_query(project, sql_models, use_legacy_sql = FALSE)
+                TRUE
+              }, error = function(e) {
+                create_log_entry(sprintf("  SQL that failed:\n%s", sql_models), "ERROR")
+                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+                stop(sprintf("registry_models insert failed: %s", e$message))
+              })
+            },
+            max_attempts = 3,
+            wait_seconds = 2,
+            operation_name = "registry_models save",
+            exponential_backoff = TRUE
+          )
+          
+          if (!result$success) {
+            stop(sprintf("Failed to save to registry_models after retries: %s", result$error))
+          }
           create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
           
           # Step 2: Save to registry_versions
@@ -1789,14 +1809,26 @@ for (i in seq_len(n_athletes)) {
           ")
           
           create_log_entry(sprintf("  Executing SQL for registry_versions..."))
-          result <- tryCatch({
-            bq_project_query(project, sql_versions, use_legacy_sql = FALSE)
-            TRUE
-          }, error = function(e) {
-            create_log_entry(sprintf("  SQL that failed:\n%s", sql_versions), "ERROR")
-            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
-            stop(sprintf("registry_versions insert failed: %s", e$message))
-          })
+          result <- retry_operation(
+            {
+              tryCatch({
+                bq_project_query(project, sql_versions, use_legacy_sql = FALSE)
+                TRUE
+              }, error = function(e) {
+                create_log_entry(sprintf("  SQL that failed:\n%s", sql_versions), "ERROR")
+                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+                stop(sprintf("registry_versions insert failed: %s", e$message))
+              })
+            },
+            max_attempts = 3,
+            wait_seconds = 2,
+            operation_name = "registry_versions save",
+            exponential_backoff = TRUE
+          )
+          
+          if (!result$success) {
+            stop(sprintf("Failed to save to registry_versions after retries: %s", result$error))
+          }
           create_log_entry(sprintf("  Saved to registry_versions: %s", version_id))
           
           # Step 3: Save metrics
@@ -1815,17 +1847,30 @@ for (i in seq_len(n_athletes)) {
           )
           
           create_log_entry(sprintf("  Uploading metrics to registry_metrics..."))
-          tryCatch({
-            bq_table_upload(
-              bq_table(project, dataset, "registry_metrics"), 
-              metrics, 
-              write_disposition="WRITE_APPEND"
-            )
-          }, error = function(e) {
-            create_log_entry(sprintf("  Metrics upload error: %s", e$message), "ERROR")
-            create_log_entry(sprintf("  Metrics data: %s", paste(capture.output(str(metrics)), collapse="\n")), "ERROR")
-            stop(sprintf("registry_metrics upload failed: %s", e$message))
-          })
+          result <- retry_operation(
+            {
+              tryCatch({
+                bq_table_upload(
+                  bq_table(project, dataset, "registry_metrics"), 
+                  metrics, 
+                  write_disposition="WRITE_APPEND"
+                )
+                TRUE
+              }, error = function(e) {
+                create_log_entry(sprintf("  Metrics upload error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Metrics data: %s", paste(capture.output(str(metrics)), collapse="\n")), "ERROR")
+                stop(sprintf("registry_metrics upload failed: %s", e$message))
+              })
+            },
+            max_attempts = 3,
+            wait_seconds = 2,
+            operation_name = "registry_metrics upload",
+            exponential_backoff = TRUE
+          )
+          
+          if (!result$success) {
+            stop(sprintf("Failed to upload metrics after retries: %s", result$error))
+          }
           create_log_entry(sprintf("  Saved metrics to registry_metrics"))
           
           # Step 4: Save to registry_stages
@@ -1837,14 +1882,26 @@ for (i in seq_len(n_athletes)) {
           ")
           
           create_log_entry(sprintf("  Executing SQL for registry_stages..."))
-          result <- tryCatch({
-            bq_project_query(project, sql_stages, use_legacy_sql = FALSE)
-            TRUE
-          }, error = function(e) {
-            create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
-            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
-            stop(sprintf("registry_stages insert failed: %s", e$message))
-          })
+          result <- retry_operation(
+            {
+              tryCatch({
+                bq_project_query(project, sql_stages, use_legacy_sql = FALSE)
+                TRUE
+              }, error = function(e) {
+                create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
+                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+                stop(sprintf("registry_stages insert failed: %s", e$message))
+              })
+            },
+            max_attempts = 3,
+            wait_seconds = 2,
+            operation_name = "registry_stages save",
+            exponential_backoff = TRUE
+          )
+          
+          if (!result$success) {
+            stop(sprintf("Failed to save to registry_stages after retries: %s", result$error))
+          }
           create_log_entry(sprintf("  Saved to registry_stages: Staging"))
           
         }, error = function(e) {
