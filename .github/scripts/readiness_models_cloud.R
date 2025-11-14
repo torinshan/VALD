@@ -839,8 +839,7 @@ tryCatch({
       team STRING,
       owner STRING,
       description STRING,
-      created_at TIMESTAMP NOT NULL,
-      PRIMARY KEY (model_id) NOT ENFORCED
+      created_at TIMESTAMP NOT NULL
     )
     PARTITION BY DATE(created_at)
     CLUSTER BY team, model_id
@@ -871,8 +870,7 @@ tryCatch({
       test_rmse FLOAT64,
       pipeline_run_id STRING,
       git_commit_sha STRING,
-      notes STRING,
-      PRIMARY KEY (model_id, version_id) NOT ENFORCED
+      notes STRING
     )
     PARTITION BY DATE(created_at)
     CLUSTER BY model_id, version_id
@@ -887,8 +885,7 @@ tryCatch({
       metric_name STRING NOT NULL,
       metric_value FLOAT64,
       split STRING NOT NULL,
-      logged_at TIMESTAMP NOT NULL,
-      PRIMARY KEY (model_id, version_id, metric_name, split) NOT ENFORCED
+      logged_at TIMESTAMP NOT NULL
     )
     PARTITION BY DATE(logged_at)
     CLUSTER BY model_id, version_id, metric_name
@@ -903,8 +900,7 @@ tryCatch({
       stage STRING NOT NULL,
       set_at TIMESTAMP NOT NULL,
       set_by STRING,
-      reason STRING,
-      PRIMARY KEY (model_id, version_id, stage) NOT ENFORCED
+      reason STRING
     )
     PARTITION BY DATE(set_at)
     CLUSTER BY model_id, version_id, stage
