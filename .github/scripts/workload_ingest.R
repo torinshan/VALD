@@ -134,16 +134,18 @@ parse_date_robust <- function(vec) {
   rep(as.Date(NA), length(vec))
 }
 
-monotony_roll <- function(x, idx, window_days) {
+monotony_roll <- function(x, idx, window_days, complete = TRUE) {
   slider::slide_index_dbl(
     x, idx,
     .f = ~ {
-      m <- mean(.x, na.rm = TRUE)
-      s <- sd(.x,  na.rm = TRUE)
-      if (length(na.omit(.x)) < 2 || is.na(s) || s == 0) NA_real_ else m / s
+      v <- as.numeric(.x); v <- v[is.finite(v)]
+      if (length(v) < 2) return(NA_real_)
+      s <- stats::sd(v); m <- mean(v)
+      if (!is.finite(s) || s == 0) return(NA_real_)
+      m / s
     },
     .before = lubridate::days(window_days - 1),
-    .complete = FALSE
+    .complete = complete
   )
 }
 
@@ -223,21 +225,24 @@ roll_features <- daily_sum %>%
     ml_prev_day       = dplyr::lag(ml_sum, 1),
 
     distance_7d  = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
-    distance_28d = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
+    distance_28d = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
     hsd_7d  = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
-    hsd_28d = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
+    hsd_28d = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
     ml_7d  = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
-    ml_28d = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = TRUE),
+    ml_28d = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
     distance_monotony_7d = monotony_roll(distance_sum, date, 7),
-    ml_monotony_7d       = monotony_roll(ml_sum,       date, 7)
+    hsd_monotony_7d      = monotony_roll(hsd_sum,      date, 7),
+    ml_monotony_7d       = monotony_roll(ml_sum,       date, 7),
+    
+    is_rest_day = (distance_sum == 0 & hsd_sum == 0 & ml_sum == 0)
   ) %>%
   ungroup()
 
 work_data <- roll_features %>%
-  filter(distance_sum > 0, !is.na(distance_monotony_7d), !is.na(ml_monotony_7d)) %>%
+  filter(!is.na(distance_7d) & !is.na(hsd_7d) & !is.na(ml_7d)) %>%
   transmute(
     roster_name,
     date,
@@ -245,12 +250,13 @@ work_data <- roll_features %>%
     high_speed_distance = hsd_prev_day,
     mechanical_load     = ml_prev_day,
     distance_7d, distance_28d, distance_monotony_7d,
-    hsd_7d, hsd_28d,
-    ml_7d, ml_28d, ml_monotony_7d
+    hsd_7d, hsd_28d, hsd_monotony_7d,
+    ml_7d, ml_28d, ml_monotony_7d,
+    is_rest_day
   ) %>%
   arrange(roster_name, date)
 
-create_log_entry(glue("Rows after transform: {nrow(work_data)}"))
+create_log_entry(glue("Rows after 7d filter (drop only first 6 days per athlete): {nrow(work_data)}"))
 
 # ===== Upsert helpers =====
 read_bq_table_rest <- function(tbl) {
@@ -364,8 +370,9 @@ tryCatch({
   out <- work_data %>%
     select(roster_name, date, distance, high_speed_distance, mechanical_load,
            distance_7d, distance_28d, distance_monotony_7d,
-           hsd_7d, hsd_28d,
-           ml_7d, ml_28d, ml_monotony_7d)
+           hsd_7d, hsd_28d, hsd_monotony_7d,
+           ml_7d, ml_28d, ml_monotony_7d,
+           is_rest_day)
 
   bq_upsert(out, table_out, mode = ifelse(write_mode %in% c("MERGE","TRUNCATE"), write_mode, "MERGE"))
   create_log_entry("Ingest complete.")
