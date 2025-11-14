@@ -221,6 +221,94 @@ validate_dates <- function(df, date_col, context) {
   df
 }
 
+# Helper to fetch and log BigQuery job details by job ID
+fetch_and_log_bq_job_details <- function(job_id_full, operation_name = "BigQuery operation") {
+  tryCatch({
+    if (is.null(job_id_full) || !nzchar(job_id_full)) {
+      create_log_entry("  ⚠️  No job ID provided to fetch details", "WARN")
+      return(FALSE)
+    }
+    
+    create_log_entry(sprintf("  🔍 Fetching BigQuery job details for: %s", job_id_full), "INFO")
+    
+    # Try to get job details using bq command line tool
+    cmd <- sprintf("bq --format=json show -j %s:%s 2>&1", project, job_id_full)
+    result <- tryCatch({
+      system(cmd, intern = TRUE)
+    }, error = function(e) {
+      create_log_entry(sprintf("  ⚠️  Failed to run bq command: %s", e$message), "WARN")
+      return(NULL)
+    })
+    
+    if (!is.null(result) && length(result) > 0) {
+      # Try to parse JSON response
+      job_json <- tryCatch({
+        jsonlite::fromJSON(paste(result, collapse = "\n"))
+      }, error = function(e) {
+        create_log_entry(sprintf("  ⚠️  Failed to parse job JSON: %s", e$message), "WARN")
+        return(NULL)
+      })
+      
+      if (!is.null(job_json)) {
+        # Log job status
+        if (!is.null(job_json$status$state)) {
+          create_log_entry(sprintf("  📊 Job state: %s", job_json$status$state), "ERROR")
+        }
+        
+        # Log error details if present
+        if (!is.null(job_json$status$errorResult)) {
+          err <- job_json$status$errorResult
+          create_log_entry("  ❌ BigQuery Error Details:", "ERROR")
+          create_log_entry(sprintf("     Reason: %s", err$reason %||% "unknown"), "ERROR")
+          create_log_entry(sprintf("     Message: %s", err$message %||% "unknown"), "ERROR")
+          if (!is.null(err$location)) {
+            create_log_entry(sprintf("     Location: %s", err$location), "ERROR")
+          }
+        }
+        
+        # Log all errors if present
+        if (!is.null(job_json$status$errors) && length(job_json$status$errors) > 0) {
+          create_log_entry("  ❌ All job errors:", "ERROR")
+          for (i in seq_along(job_json$status$errors)) {
+            err <- job_json$status$errors[[i]]
+            create_log_entry(sprintf("     [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+          }
+        }
+        
+        # Log job configuration for debugging schema issues
+        if (!is.null(job_json$configuration)) {
+          if (!is.null(job_json$configuration$load)) {
+            load_conf <- job_json$configuration$load
+            create_log_entry("  📋 Load job configuration:", "INFO")
+            if (!is.null(load_conf$destinationTable)) {
+              create_log_entry(sprintf("     Destination: %s:%s.%s", 
+                load_conf$destinationTable$projectId %||% "?",
+                load_conf$destinationTable$datasetId %||% "?",
+                load_conf$destinationTable$tableId %||% "?"), "INFO")
+            }
+            if (!is.null(load_conf$sourceFormat)) {
+              create_log_entry(sprintf("     Source format: %s", load_conf$sourceFormat), "INFO")
+            }
+            if (!is.null(load_conf$writeDisposition)) {
+              create_log_entry(sprintf("     Write disposition: %s", load_conf$writeDisposition), "INFO")
+            }
+          }
+        }
+        
+        return(TRUE)
+      }
+    }
+    
+    # If bq command failed, log the command for manual execution
+    create_log_entry(sprintf("  🔍 Manual inspection: %s", cmd), "ERROR")
+    return(FALSE)
+    
+  }, error = function(e) {
+    create_log_entry(sprintf("  ⚠️  Error fetching job details: %s", e$message), "WARN")
+    return(FALSE)
+  })
+}
+
 # Helper to extract and log BigQuery job error details
 log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation") {
   tryCatch({
@@ -231,10 +319,12 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
       
       # Try to parse job ID from error message if present
       if (grepl("job_[a-zA-Z0-9_-]+", error_msg)) {
-        job_id_match <- regmatches(error_msg, regexpr("job_[a-zA-Z0-9_-]+\\.US", error_msg))
+        job_id_match <- regmatches(error_msg, regexpr("job_[a-zA-Z0-9_-]+\\.[A-Z]+", error_msg))
         if (length(job_id_match) > 0) {
           create_log_entry(sprintf("  📋 BigQuery Job ID: %s", job_id_match[1]), "ERROR")
-          create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s", project, job_id_match[1]), "ERROR")
+          
+          # Actively fetch job details from BigQuery
+          fetch_and_log_bq_job_details(job_id_match[1], operation_name)
         }
       }
     } else if (is.list(job_or_error) && inherits(job_or_error, "bq_job")) {
@@ -242,8 +332,13 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
       # Check if jobReference is a list before accessing nested properties
       if (is.list(job_or_error$jobReference) && !is.null(job_or_error$jobReference$jobId)) {
         job_id <- job_or_error$jobReference$jobId
-        create_log_entry(sprintf("  📋 BigQuery Job ID: %s.%s", job_id, location), "ERROR")
-        create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s.%s", project, job_id, location), "ERROR")
+        job_location <- job_or_error$jobReference$location %||% location
+        job_id_full <- paste0(job_id, ".", job_location)
+        
+        create_log_entry(sprintf("  📋 BigQuery Job ID: %s", job_id_full), "ERROR")
+        
+        # Actively fetch job details from BigQuery
+        fetch_and_log_bq_job_details(job_id_full, operation_name)
       }
       
       if (is.list(job_or_error$status) && !is.null(job_or_error$status$errorResult)) {
@@ -1876,11 +1971,31 @@ for (i in seq_len(n_athletes)) {
                 # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
                 upload_job <- bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
                 
-                # If the upload returns a job object, log the job ID
+                # If the upload returns a job object, wait for it and check status
                 if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
                   if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
                     job_id <- upload_job$jobReference$jobId
-                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
+                    job_location <- upload_job$jobReference$location %||% location
+                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
+                    
+                    # Wait for job completion and check status
+                    tryCatch({
+                      completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                      
+                      # Check if job failed
+                      if (is.list(completed_job$status) && !is.null(completed_job$status$errorResult)) {
+                        create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
+                        log_bq_job_error(completed_job, "registry_models upload")
+                        stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
+                      }
+                      
+                      create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
+                    }, error = function(wait_err) {
+                      create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
+                      # Try to fetch job details even if wait failed
+                      log_bq_job_error(upload_job, "registry_models upload")
+                      stop(wait_err)
+                    })
                   }
                 }
                 
@@ -1946,11 +2061,31 @@ for (i in seq_len(n_athletes)) {
                 # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
                 upload_job <- bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
                 
-                # If the upload returns a job object, log the job ID
+                # If the upload returns a job object, wait for it and check status
                 if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
                   if (is.list(upload_job$jobReference) && !is.null(upload_job$jobReference$jobId)) {
                     job_id <- upload_job$jobReference$jobId
-                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
+                    job_location <- upload_job$jobReference$location %||% location
+                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
+                    
+                    # Wait for job completion and check status
+                    tryCatch({
+                      completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                      
+                      # Check if job failed
+                      if (is.list(completed_job$status) && !is.null(completed_job$status$errorResult)) {
+                        create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
+                        log_bq_job_error(completed_job, "registry_versions upload")
+                        stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
+                      }
+                      
+                      create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
+                    }, error = function(wait_err) {
+                      create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
+                      # Try to fetch job details even if wait failed
+                      log_bq_job_error(upload_job, "registry_versions upload")
+                      stop(wait_err)
+                    })
                   }
                 }
                 
