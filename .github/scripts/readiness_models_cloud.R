@@ -55,9 +55,10 @@ MAX_RETRY_ATTEMPTS <- as.integer(Sys.getenv("MAX_RETRY_ATTEMPTS", "3"))
 RETRY_WAIT_SECONDS <- as.integer(Sys.getenv("RETRY_WAIT_SECONDS", "5"))
 
 # Workflow fork controls
-skip_training       <- tolower(Sys.getenv("SKIP_TRAINING", "false")) %in% c("1","true","yes")
-has_matches_hint    <- Sys.getenv("HAS_MATCHES", "")
-match_lookback_days <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
+skip_training          <- tolower(Sys.getenv("SKIP_TRAINING", "false")) %in% c("1","true","yes")
+skip_registry_versions <- tolower(Sys.getenv("SKIP_REGISTRY_VERSIONS", "false")) %in% c("1","true","yes")
+has_matches_hint       <- Sys.getenv("HAS_MATCHES", "")
+match_lookback_days    <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
 
 cat("=== CONFIGURATION ===\n")
 cat("GCP Project:", project, "\n")
@@ -71,6 +72,7 @@ cat("Date range:", format(cfg_start_date, "%m/%d/%Y"), "to", format(cfg_end_date
 cat("Train fraction:", cfg_frac_train, "\n")
 cat("Min train obs:", MIN_TRAIN_OBS, "\n")
 cat("Skip training:", skip_training, "\n")
+cat("Skip registry versions:", skip_registry_versions, "\n")
 cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
 cat("Match lookback days:", match_lookback_days, "\n")
 cat("Storage: BigQuery tables only\n\n")
@@ -219,7 +221,51 @@ validate_dates <- function(df, date_col, context) {
   df
 }
 
-# Retry helper with exponential backoff
+# Helper to extract and log BigQuery job error details
+log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation") {
+  tryCatch({
+    # Try to extract job information from the error or job object
+    if (inherits(job_or_error, "error") || inherits(job_or_error, "simpleError")) {
+      error_msg <- conditionMessage(job_or_error)
+      create_log_entry(sprintf("  ❌ %s error: %s", operation_name, error_msg), "ERROR")
+      
+      # Try to parse job ID from error message if present
+      if (grepl("job_[a-zA-Z0-9_-]+", error_msg)) {
+        job_id_match <- regmatches(error_msg, regexpr("job_[a-zA-Z0-9_-]+\\.US", error_msg))
+        if (length(job_id_match) > 0) {
+          create_log_entry(sprintf("  📋 BigQuery Job ID: %s", job_id_match[1]), "ERROR")
+          create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s", project, job_id_match[1]), "ERROR")
+        }
+      }
+    } else if (inherits(job_or_error, "bq_job")) {
+      # If we have a job object, try to extract error details
+      if (!is.null(job_or_error$jobReference$jobId)) {
+        job_id <- job_or_error$jobReference$jobId
+        create_log_entry(sprintf("  📋 BigQuery Job ID: %s.%s", job_id, location), "ERROR")
+        create_log_entry(sprintf("  🔍 Inspect with: bq show -j %s:%s.%s", project, job_id, location), "ERROR")
+      }
+      
+      if (!is.null(job_or_error$status$errorResult)) {
+        error_result <- job_or_error$status$errorResult
+        create_log_entry(sprintf("  ❌ Error reason: %s", error_result$reason %||% "unknown"), "ERROR")
+        create_log_entry(sprintf("  ❌ Error message: %s", error_result$message %||% "unknown"), "ERROR")
+      }
+      
+      if (!is.null(job_or_error$status$errors) && length(job_or_error$status$errors) > 0) {
+        create_log_entry("  ❌ All errors:", "ERROR")
+        for (i in seq_along(job_or_error$status$errors)) {
+          err <- job_or_error$status$errors[[i]]
+          create_log_entry(sprintf("    [%d] %s: %s", i, err$reason %||% "unknown", err$message %||% "unknown"), "ERROR")
+        }
+      }
+    }
+  }, error = function(e) {
+    # If we can't parse the error, just log that
+    create_log_entry(sprintf("  ⚠️  Could not parse BigQuery error details: %s", e$message), "WARN")
+  })
+}
+
+# Retry helper with exponential backoff and enhanced BigQuery error logging
 retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS, 
                            wait_seconds = RETRY_WAIT_SECONDS, 
                            operation_name = "operation",
@@ -243,6 +289,12 @@ retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS,
           "WARN",
           reason = "retry_transient_error"
         )
+        
+        # Log detailed BigQuery error if it's a BQ-related error
+        if (grepl("bigquery|bq_|job_", e$message, ignore.case = TRUE)) {
+          log_bq_job_error(e, operation_name)
+        }
+        
         Sys.sleep(wait_time)
         NULL
       } else {
@@ -252,6 +304,12 @@ retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS,
           "ERROR",
           reason = "retry_exhausted"
         )
+        
+        # Log detailed BigQuery error on final failure
+        if (grepl("bigquery|bq_|job_", e$message, ignore.case = TRUE)) {
+          log_bq_job_error(e, operation_name)
+        }
+        
         return(list(success = FALSE, error = e$message))
       }
     })
@@ -1734,6 +1792,25 @@ for (i in seq_len(n_athletes)) {
       tryCatch({
         model_id <- paste(team_name, model_name, sep = ":")
         
+        # Check if registry writes should be skipped
+        if (skip_registry_versions) {
+          create_log_entry(
+            sprintf("  ⏭️  SKIP_REGISTRY_VERSIONS=true - skipping registry writes for %s", model_name),
+            "WARN",
+            reason = "skip_registry_versions_enabled"
+          )
+          
+          # Return success without saving to allow training to continue
+          return(list(
+            success = TRUE,
+            model_id = model_id,
+            version_id = version_id,
+            artifact_uri = "skipped",
+            model_object = candidate$fitted$model,
+            skipped = TRUE
+          ))
+        }
+        
         # Coefficients saved to BigQuery model_coefficients table
         artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
                                project, dataset, model_id)
@@ -1788,12 +1865,28 @@ for (i in seq_len(n_athletes)) {
                 
                 tbl <- bq_table(project, dataset, "registry_models")
                 
+                # Log the data being uploaded for debugging
+                create_log_entry(sprintf("    Uploading model row: model_id=%s", escaped_model_id))
+                
                 # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
-                bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
+                upload_job <- bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
+                
+                # If the upload returns a job object, log the job ID
+                if (!is.null(upload_job) && inherits(upload_job, "bq_job")) {
+                  if (!is.null(upload_job$jobReference$jobId)) {
+                    job_id <- upload_job$jobReference$jobId
+                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
+                  }
+                }
                 
                 TRUE
               }, error = function(e) {
                 create_log_entry(sprintf("  Registry save error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
+                
+                # Log detailed BigQuery error
+                log_bq_job_error(e, "registry_models upload")
+                
                 stop(sprintf("registry_models insert failed: %s", e$message))
               })
             },
@@ -1841,12 +1934,29 @@ for (i in seq_len(n_athletes)) {
                 
                 tbl <- bq_table(project, dataset, "registry_versions")
                 
+                # Log the data being uploaded for debugging
+                create_log_entry(sprintf("    Uploading version row: model_id=%s, version_id=%s", 
+                                        escaped_model_id, escaped_version_id))
+                
                 # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
-                bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
+                upload_job <- bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
+                
+                # If the upload returns a job object, log the job ID
+                if (!is.null(upload_job) && inherits(upload_job, "bq_job")) {
+                  if (!is.null(upload_job$jobReference$jobId)) {
+                    job_id <- upload_job$jobReference$jobId
+                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, location))
+                  }
+                }
                 
                 TRUE
               }, error = function(e) {
                 create_log_entry(sprintf("  Registry versions save error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
+                
+                # Log detailed BigQuery error
+                log_bq_job_error(e, "registry_versions upload")
+                
                 stop(sprintf("registry_versions insert failed: %s", e$message))
               })
             },
