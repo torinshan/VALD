@@ -1687,6 +1687,22 @@ for (i in seq_len(n_athletes)) {
     best_idx <- finite_idx[which.min(prim_rmse[finite_idx])]
     best_cand <- cands[[best_idx]]
     
+    # Helper function to safely convert numeric values for BigQuery
+    safe_numeric_for_bq <- function(x) {
+      if (is.null(x) || !is.numeric(x)) return("NULL")
+      if (is.na(x) || is.nan(x) || is.infinite(x)) return("NULL")
+      return(as.character(x))
+    }
+    
+    # Helper function to escape strings for BigQuery
+    escape_bq_string <- function(x) {
+      if (is.null(x) || is.na(x)) return("")
+      # Escape single quotes and backslashes
+      x <- gsub("\\\\", "\\\\\\\\", x)
+      x <- gsub("'", "\\\\'", x)
+      return(x)
+    }
+    
     # Save best model to registry (coefficients saved to BigQuery)
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
       if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
@@ -1712,28 +1728,46 @@ for (i in seq_len(n_athletes)) {
         artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
                                project, dataset, model_id)
         
-        # Save to registry with enhanced metadata (FIX 1.3)
+        # Validate numeric values before saving
+        train_rmse_val <- safe_numeric_for_bq(candidate$train_rmse)
+        cv_rmse_val <- safe_numeric_for_bq(candidate$cv_rmse)
+        test_rmse_val <- safe_numeric_for_bq(candidate$test_rmse)
+        
+        # Prepare values and escape strings
+        run_id_val <- escape_bq_string(Sys.getenv("GITHUB_RUN_ID", "manual"))
+        git_sha_val <- escape_bq_string(Sys.getenv("GITHUB_SHA", "unknown"))
+        preds_json <- escape_bq_string(jsonlite::toJSON(preds, auto_unbox=TRUE))
+        hyper_json <- escape_bq_string(jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE))
+        escaped_model_id <- escape_bq_string(model_id)
+        escaped_model_name <- escape_bq_string(model_name)
+        escaped_version_id <- escape_bq_string(version_id)
+        
+        # Save to registry with enhanced error handling
         tryCatch({
-          con <- DBI::dbConnect(bigrquery::bigquery(), project = project, dataset = dataset)
-          
-          DBI::dbExecute(con, glue("
+          # Step 1: Save to registry_models
+          sql_models <- glue("
             MERGE `{project}.{dataset}.registry_models` T 
-            USING (SELECT '{model_id}' AS model_id, '{model_name}' AS model_name,
+            USING (SELECT '{escaped_model_id}' AS model_id, '{escaped_model_name}' AS model_name,
                           '{team_name}' AS team, 'auto' AS owner, 
                           'Athlete readiness model' AS description,
                           CURRENT_TIMESTAMP() AS created_at) S
             ON T.model_id = S.model_id
             WHEN NOT MATCHED THEN INSERT ROW
-          "))
+          ")
+          
+          create_log_entry(sprintf("  Executing SQL for registry_models..."))
+          result <- tryCatch({
+            bq_project_query(project, sql_models, use_legacy_sql = FALSE)
+            TRUE
+          }, error = function(e) {
+            create_log_entry(sprintf("  SQL that failed:\n%s", sql_models), "ERROR")
+            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+            stop(sprintf("registry_models insert failed: %s", e$message))
+          })
           create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
           
-          # Prepare values outside glue to avoid nested quotes
-          run_id_val <- Sys.getenv("GITHUB_RUN_ID", "manual")
-          git_sha_val <- Sys.getenv("GITHUB_SHA", "unknown")
-          preds_json <- jsonlite::toJSON(preds, auto_unbox=TRUE)
-          hyper_json <- jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE)
-          
-          DBI::dbExecute(con, glue("
+          # Step 2: Save to registry_versions
+          sql_versions <- glue("
             INSERT INTO `{project}.{dataset}.registry_versions`
               (model_id, version_id, created_at, created_by, artifact_uri, artifact_sha256,
                framework, r_version, package_info, notes,
@@ -1743,53 +1777,84 @@ for (i in seq_len(n_athletes)) {
                train_rmse, cv_rmse, test_rmse,
                pipeline_run_id, git_commit_sha)
             VALUES
-              ('{model_id}','{version_id}',CURRENT_TIMESTAMP(),'github_actions',
-               '{artifact_uri}','bigquery','R/glmnet','{R.version$version.string}','','',
+              ('{escaped_model_id}','{escaped_version_id}',CURRENT_TIMESTAMP(),'github_actions',
+               '{escape_bq_string(artifact_uri)}','bigquery','R/glmnet','{escape_bq_string(R.version$version.string)}','','',
                '{cfg_start_date}', '{cfg_end_date}',
                {n_tr}, {n_te}, '{val_method}',
                '{preds_json}',
                '{hyper_json}',
-               {candidate$train_rmse}, {candidate$cv_rmse}, {candidate$test_rmse},
+               {train_rmse_val}, {cv_rmse_val}, {test_rmse_val},
                '{run_id_val}',
                '{git_sha_val}')
-          "))
+          ")
+          
+          create_log_entry(sprintf("  Executing SQL for registry_versions..."))
+          result <- tryCatch({
+            bq_project_query(project, sql_versions, use_legacy_sql = FALSE)
+            TRUE
+          }, error = function(e) {
+            create_log_entry(sprintf("  SQL that failed:\n%s", sql_versions), "ERROR")
+            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+            stop(sprintf("registry_versions insert failed: %s", e$message))
+          })
           create_log_entry(sprintf("  Saved to registry_versions: %s", version_id))
           
+          # Step 3: Save metrics
           metrics <- tibble(
             model_id = model_id, 
             version_id = version_id,
             metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
-            metric_value = c(candidate$train_rmse, candidate$cv_rmse, candidate$test_rmse, candidate$primary_rmse),
+            metric_value = c(
+              if (!is.finite(candidate$train_rmse)) NA_real_ else candidate$train_rmse,
+              if (!is.finite(candidate$cv_rmse)) NA_real_ else candidate$cv_rmse,
+              if (!is.finite(candidate$test_rmse)) NA_real_ else candidate$test_rmse,
+              if (!is.finite(candidate$primary_rmse)) NA_real_ else candidate$primary_rmse
+            ),
             split = c("train","cv","test","primary"), 
             logged_at = Sys.time()
           )
-          bq_table_upload(
-            bq_table(project, dataset, "registry_metrics"), 
-            metrics, 
-            write_disposition="WRITE_APPEND"
-          )
+          
+          create_log_entry(sprintf("  Uploading metrics to registry_metrics..."))
+          tryCatch({
+            bq_table_upload(
+              bq_table(project, dataset, "registry_metrics"), 
+              metrics, 
+              write_disposition="WRITE_APPEND"
+            )
+          }, error = function(e) {
+            create_log_entry(sprintf("  Metrics upload error: %s", e$message), "ERROR")
+            create_log_entry(sprintf("  Metrics data: %s", paste(capture.output(str(metrics)), collapse="\n")), "ERROR")
+            stop(sprintf("registry_metrics upload failed: %s", e$message))
+          })
           create_log_entry(sprintf("  Saved metrics to registry_metrics"))
           
-          DBI::dbExecute(con, glue("
+          # Step 4: Save to registry_stages
+          sql_stages <- glue("
             INSERT INTO `{project}.{dataset}.registry_stages`
               (model_id, version_id, stage, set_at, set_by, reason)
             VALUES
-              ('{model_id}','{version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
-          "))
+              ('{escaped_model_id}','{escaped_version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
+          ")
+          
+          create_log_entry(sprintf("  Executing SQL for registry_stages..."))
+          result <- tryCatch({
+            bq_project_query(project, sql_stages, use_legacy_sql = FALSE)
+            TRUE
+          }, error = function(e) {
+            create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
+            create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
+            stop(sprintf("registry_stages insert failed: %s", e$message))
+          })
           create_log_entry(sprintf("  Saved to registry_stages: Staging"))
           
-          DBI::dbDisconnect(con)
         }, error = function(e) {
           create_log_entry(
             sprintf("  ERROR saving to BigQuery registry for %s: %s", model_name, e$message),
             "ERROR",
             reason = "bigquery_registry_failed"
           )
-          # Print stack trace
-          tb <- tryCatch(capture.output(traceback()), error = function(e2) NULL)
-          if (!is.null(tb) && length(tb) > 0) {
-            create_log_entry(sprintf("  Stack trace:\n%s", paste(tb, collapse="\n")), "ERROR")
-          }
+          # Print detailed error information
+          create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
           stop(sprintf("BigQuery registry save failed: %s", e$message))
         })
         
