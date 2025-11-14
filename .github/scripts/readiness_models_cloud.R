@@ -824,7 +824,9 @@ if (!nzchar(has_matches_hint)) {
 }
 
 ################################################################################
-# FIX 1.3: INIT REGISTRY TABLES (with primary keys and partitioning)
+# FIX 1.3: INIT REGISTRY TABLES (with partitioning and clustering)
+# Note: PRIMARY KEY constraints removed to fix BigQuery MERGE failures.
+# Uniqueness is enforced via MERGE logic instead of table constraints.
 ################################################################################
 create_log_entry("Initializing model registry tables")
 tryCatch({
@@ -832,6 +834,7 @@ tryCatch({
   if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
   
   # Registry Models
+  # Stores metadata for each model (one row per model_id)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_models` (
       model_id STRING NOT NULL,
@@ -839,8 +842,7 @@ tryCatch({
       team STRING,
       owner STRING,
       description STRING,
-      created_at TIMESTAMP NOT NULL,
-      PRIMARY KEY (model_id) NOT ENFORCED
+      created_at TIMESTAMP NOT NULL
     )
     PARTITION BY DATE(created_at)
     CLUSTER BY team, model_id
@@ -848,6 +850,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_models")
   
   # Registry Versions
+  # Stores version information for each model (one row per model_id + version_id)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_versions` (
       model_id STRING NOT NULL,
@@ -871,8 +874,7 @@ tryCatch({
       test_rmse FLOAT64,
       pipeline_run_id STRING,
       git_commit_sha STRING,
-      notes STRING,
-      PRIMARY KEY (model_id, version_id) NOT ENFORCED
+      notes STRING
     )
     PARTITION BY DATE(created_at)
     CLUSTER BY model_id, version_id
@@ -880,6 +882,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_versions")
   
   # Registry Metrics
+  # Stores performance metrics for model versions (multiple rows per version)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_metrics` (
       model_id STRING NOT NULL,
@@ -887,8 +890,7 @@ tryCatch({
       metric_name STRING NOT NULL,
       metric_value FLOAT64,
       split STRING NOT NULL,
-      logged_at TIMESTAMP NOT NULL,
-      PRIMARY KEY (model_id, version_id, metric_name, split) NOT ENFORCED
+      logged_at TIMESTAMP NOT NULL
     )
     PARTITION BY DATE(logged_at)
     CLUSTER BY model_id, version_id, metric_name
@@ -896,6 +898,7 @@ tryCatch({
   create_log_entry("Registry table verified: registry_metrics")
   
   # Registry Stages
+  # Tracks model lifecycle stages (e.g., dev, staging, production)
   bq_project_query(project, glue("
     CREATE TABLE IF NOT EXISTS `{project}.{dataset}.registry_stages` (
       model_id STRING NOT NULL,
@@ -903,8 +906,7 @@ tryCatch({
       stage STRING NOT NULL,
       set_at TIMESTAMP NOT NULL,
       set_by STRING,
-      reason STRING,
-      PRIMARY KEY (model_id, version_id, stage) NOT ENFORCED
+      reason STRING
     )
     PARTITION BY DATE(set_at)
     CLUSTER BY model_id, version_id, stage
