@@ -10,7 +10,7 @@ tryCatch({
     library(valdr); library(gargle); library(rlang); library(lifecycle)
     library(glue); library(slider); library(R.utils)
   })
-}, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
+}, error = function(e) { cat("Error loading packages:", conditionMessage(e), "\n"); quit(status=1) })
 
 # Disable BigQuery Storage API to avoid readsessions permission
 options(bigrquery.use_bqstorage = FALSE)
@@ -194,7 +194,7 @@ upload_schema_mismatches <- function() {
     create_log_entry(paste("Logged", nrow(schema_mismatches), "schema mismatches"))
     TRUE
   }, error = function(e) {
-    cat("Schema mismatch upload failed:", e$message, "\n")
+    cat("Schema mismatch upload failed:", conditionMessage(e), "\n")
     FALSE
   })
 }
@@ -280,9 +280,9 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       return(result)
     }, error = function(e) {
       # Check if error message indicates pagination issues
-      if (grepl("pagination|cursor|timeout", e$message, ignore.case = TRUE)) {
+      if (grepl("pagination|cursor|timeout", conditionMessage(e), ignore.case = TRUE)) {
         create_log_entry(paste(
-          "Pagination error detected in", description, ":", e$message
+          "Pagination error detected in", description, ":", conditionMessage(e)
         ), "ERROR")
       }
       stop(e)
@@ -310,7 +310,7 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
     }
   }, error = function(e) {
     if (!timed_out) {
-      create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
+      create_log_entry(paste(description, "fetch ERROR:", conditionMessage(e)), "ERROR")
     }
   })
   
@@ -394,7 +394,7 @@ validate_and_fix_schema <- function(data, table_name, ds) {
     
   }, error = function(e) {
     create_log_entry(paste(
-      "Error validating schema for", table_name, ":", e$message
+      "Error validating schema for", table_name, ":", conditionMessage(e)
     ), "WARN")
   })
   
@@ -424,7 +424,7 @@ tryCatch({
     stop("Could not obtain access token from gcloud")
   }
 }, error = function(e) {
-  cat("BigQuery authentication failed:", e$message, "\n")
+  cat("BigQuery authentication failed:", conditionMessage(e), "\n")
   quit(status = 1)
 })
 
@@ -461,7 +461,7 @@ upload_logs_to_bigquery <- function() {
     if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
-  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+  }, error=function(e){ cat("Log upload failed:", conditionMessage(e), "\n"); FALSE })
 }
 
 script_start_time <- Sys.time()
@@ -545,7 +545,7 @@ read_bq_table <- function(table_name) {
     }
     result
   }, error = function(e) {
-    create_log_entry(paste("Error reading", table_name, ":", e$message), "ERROR")
+    create_log_entry(paste("Error reading", table_name, ":", conditionMessage(e)), "ERROR")
     data.frame()
   })
 }
@@ -804,7 +804,7 @@ tryCatch({
   set_start_date("2024-01-01T00:00:00Z")
   create_log_entry("VALD API credentials configured successfully")
 }, error = function(e) {
-  create_log_entry(paste("VALD API setup failed:", e$message), "ERROR")
+  create_log_entry(paste("VALD API setup failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery()
   upload_schema_mismatches()
   quit(status = 1)
@@ -957,7 +957,7 @@ if (nrow(Vald_roster_backfill) > 0) {
         create_log_entry(paste("All records in", table_name, "have team data"))
       }
     }, error = function(e) {
-      create_log_entry(paste("Error during backfill for", table_name, ":", e$message), "WARN")
+      create_log_entry(paste("Error during backfill for", table_name, ":", conditionMessage(e)), "WARN")
     })
   }
   if (total_backfilled > 0) {

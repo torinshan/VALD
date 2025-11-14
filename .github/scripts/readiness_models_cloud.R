@@ -10,7 +10,7 @@ tryCatch({
     library(jsonlite)
   })
 }, error = function(e) { 
-  cat("Error loading packages:", e$message, "\n"); quit(status=1)
+  cat("Error loading packages:", conditionMessage(e), "\n"); quit(status=1)
 })
 
 # Disable BigQuery Storage API
@@ -113,7 +113,7 @@ upload_logs_to_bigquery <- function() {
     }
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
-  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+  }, error=function(e){ cat("Log upload failed:", conditionMessage(e), "\n"); FALSE })
 }
 
 script_start <- Sys.time()
@@ -136,7 +136,7 @@ tryCatch({
   ))
   create_log_entry("Authentication successful")
 }, error = function(e) {
-  create_log_entry(paste("Authentication failed:", e$message), "ERROR")
+  create_log_entry(paste("Authentication failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
@@ -236,7 +236,7 @@ fetch_and_log_bq_job_details <- function(job_id_full, operation_name = "BigQuery
     result <- tryCatch({
       system(cmd, intern = TRUE)
     }, error = function(e) {
-      create_log_entry(sprintf("  ⚠️  Failed to run bq command: %s", e$message), "WARN")
+      create_log_entry(sprintf("  ⚠️  Failed to run bq command: %s", conditionMessage(e)), "WARN")
       return(NULL)
     })
     
@@ -245,7 +245,7 @@ fetch_and_log_bq_job_details <- function(job_id_full, operation_name = "BigQuery
       job_json <- tryCatch({
         jsonlite::fromJSON(paste(result, collapse = "\n"))
       }, error = function(e) {
-        create_log_entry(sprintf("  ⚠️  Failed to parse job JSON: %s", e$message), "WARN")
+        create_log_entry(sprintf("  ⚠️  Failed to parse job JSON: %s", conditionMessage(e)), "WARN")
         return(NULL)
       })
       
@@ -304,7 +304,7 @@ fetch_and_log_bq_job_details <- function(job_id_full, operation_name = "BigQuery
     return(FALSE)
     
   }, error = function(e) {
-    create_log_entry(sprintf("  ⚠️  Error fetching job details: %s", e$message), "WARN")
+    create_log_entry(sprintf("  ⚠️  Error fetching job details: %s", conditionMessage(e)), "WARN")
     return(FALSE)
   })
 }
@@ -361,7 +361,7 @@ log_bq_job_error <- function(job_or_error, operation_name = "BigQuery operation"
     }
   }, error = function(e) {
     # If we can't parse the error, just log that
-    create_log_entry(sprintf("  ⚠️  Could not parse BigQuery error details: %s", e$message), "WARN")
+    create_log_entry(sprintf("  ⚠️  Could not parse BigQuery error details: %s", conditionMessage(e)), "WARN")
   })
 }
 
@@ -385,13 +385,13 @@ retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS,
         
         create_log_entry(
           sprintf("%s failed (attempt %d/%d): %s. Retrying in %d seconds...", 
-                  operation_name, attempt, max_attempts, e$message, wait_time),
+                  operation_name, attempt, max_attempts, conditionMessage(e), wait_time),
           "WARN",
           reason = "retry_transient_error"
         )
         
         # Log detailed BigQuery error if it's a BQ-related error
-        if (grepl("bigquery|bq_|job_", e$message, ignore.case = TRUE)) {
+        if (grepl("bigquery|bq_|job_", conditionMessage(e), ignore.case = TRUE)) {
           log_bq_job_error(e, operation_name)
         }
         
@@ -400,17 +400,17 @@ retry_operation <- function(expr, max_attempts = MAX_RETRY_ATTEMPTS,
       } else {
         create_log_entry(
           sprintf("%s failed after %d attempts: %s", 
-                  operation_name, max_attempts, e$message),
+                  operation_name, max_attempts, conditionMessage(e)),
           "ERROR",
           reason = "retry_exhausted"
         )
         
         # Log detailed BigQuery error on final failure
-        if (grepl("bigquery|bq_|job_", e$message, ignore.case = TRUE)) {
+        if (grepl("bigquery|bq_|job_", conditionMessage(e), ignore.case = TRUE)) {
           log_bq_job_error(e, operation_name)
         }
         
-        return(list(success = FALSE, error = e$message))
+        return(list(success = FALSE, error = conditionMessage(e)))
       }
     })
     if (!is.null(result)) return(result)
@@ -570,7 +570,7 @@ flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
     
   }, error = function(e) {
     create_log_entry(
-      sprintf("Failed to flatten glmnet model %s: %s", model_id, e$message),
+      sprintf("Failed to flatten glmnet model %s: %s", model_id, conditionMessage(e)),
       "WARN"
     )
     NULL
@@ -621,7 +621,7 @@ flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
     
   }, error = function(e) {
     create_log_entry(
-      sprintf("Failed to flatten BN model %s: %s", model_id, e$message),
+      sprintf("Failed to flatten BN model %s: %s", model_id, conditionMessage(e)),
       "WARN"
     )
     NULL
@@ -694,7 +694,7 @@ upload_model_coefficients <- function(coef_df, project, dataset) {
     
   }, error = function(e) {
     create_log_entry(
-      sprintf("Failed to upload coefficients: %s", e$message),
+      sprintf("Failed to upload coefficients: %s", conditionMessage(e)),
       "ERROR"
     )
     FALSE
@@ -754,7 +754,7 @@ create_wide_coefficients_view <- function(project, dataset) {
     
   }, error = function(e) {
     create_log_entry(
-      sprintf("Failed to create wide view: %s", e$message),
+      sprintf("Failed to create wide view: %s", conditionMessage(e)),
       "WARN"
     )
     FALSE
@@ -834,7 +834,7 @@ reconstruct_glmnet_from_coefficients <- function(model_id, project, dataset) {
     
   }, error = function(e) {
     create_log_entry(
-      sprintf("Failed to reconstruct model %s: %s", model_id, e$message),
+      sprintf("Failed to reconstruct model %s: %s", model_id, conditionMessage(e)),
       "ERROR"
     )
     NULL
@@ -885,7 +885,7 @@ tryCatch({
   bq_table_upload(config_tbl, config_snapshot, write_disposition = "WRITE_APPEND")
   create_log_entry("Configuration snapshot saved")
 }, error = function(e) {
-  create_log_entry(paste("Config snapshot save failed (non-fatal):", e$message), "WARN")
+  create_log_entry(paste("Config snapshot save failed (non-fatal):", conditionMessage(e)), "WARN")
 })
 
 ################################################################################
@@ -967,7 +967,7 @@ if (!nzchar(has_matches_hint)) {
   mres <- tryCatch(
     bq_table_download(bq_project_query(project, match_sql)),
     error = function(e) { 
-      create_log_entry(paste("Readiness match query failed:", e$message), "WARN", reason="query_failed")
+      create_log_entry(paste("Readiness match query failed:", conditionMessage(e)), "WARN", reason="query_failed")
       NULL 
     }
   )
@@ -1097,12 +1097,12 @@ tryCatch({
     create_wide_coefficients_view(project, dataset)
     TRUE
   }, error = function(e) {
-    create_log_entry(paste("Model coefficients table initialization warning:", e$message), "WARN")
+    create_log_entry(paste("Model coefficients table initialization warning:", conditionMessage(e)), "WARN")
     FALSE
   })
   
 }, error = function(e) {
-  create_log_entry(paste("Registry initialization failed:", e$message), "ERROR")
+  create_log_entry(paste("Registry initialization failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
@@ -1300,7 +1300,7 @@ tryCatch({
   create_log_entry(glue("ml_builder_readiness table saved: {nrow(ml_builder_readiness)} rows"))
   
 }, error = function(e) {
-  create_log_entry(paste("ml_builder_readiness save failed (non-fatal):", e$message), "WARN")
+  create_log_entry(paste("ml_builder_readiness save failed (non-fatal):", conditionMessage(e)), "WARN")
 })
 
 ################################################################################
@@ -2001,13 +2001,13 @@ for (i in seq_len(n_athletes)) {
                 
                 TRUE
               }, error = function(e) {
-                create_log_entry(sprintf("  Registry save error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Registry save error: %s", conditionMessage(e)), "ERROR")
                 create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
                 
                 # Log detailed BigQuery error
                 log_bq_job_error(e, "registry_models upload")
                 
-                stop(sprintf("registry_models insert failed: %s", e$message))
+                stop(sprintf("registry_models insert failed: %s", conditionMessage(e)))
               })
             },
             max_attempts = 3,
@@ -2091,13 +2091,13 @@ for (i in seq_len(n_athletes)) {
                 
                 TRUE
               }, error = function(e) {
-                create_log_entry(sprintf("  Registry versions save error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Registry versions save error: %s", conditionMessage(e)), "ERROR")
                 create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
                 
                 # Log detailed BigQuery error
                 log_bq_job_error(e, "registry_versions upload")
                 
-                stop(sprintf("registry_versions insert failed: %s", e$message))
+                stop(sprintf("registry_versions insert failed: %s", conditionMessage(e)))
               })
             },
             max_attempts = 3,
@@ -2137,9 +2137,9 @@ for (i in seq_len(n_athletes)) {
                 )
                 TRUE
               }, error = function(e) {
-                create_log_entry(sprintf("  Metrics upload error: %s", e$message), "ERROR")
+                create_log_entry(sprintf("  Metrics upload error: %s", conditionMessage(e)), "ERROR")
                 create_log_entry(sprintf("  Metrics data: %s", paste(capture.output(str(metrics)), collapse="\n")), "ERROR")
-                stop(sprintf("registry_metrics upload failed: %s", e$message))
+                stop(sprintf("registry_metrics upload failed: %s", conditionMessage(e)))
               })
             },
             max_attempts = 3,
@@ -2169,8 +2169,8 @@ for (i in seq_len(n_athletes)) {
                 TRUE
               }, error = function(e) {
                 create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
-                create_log_entry(sprintf("  BigQuery error: %s", e$message), "ERROR")
-                stop(sprintf("registry_stages insert failed: %s", e$message))
+                create_log_entry(sprintf("  BigQuery error: %s", conditionMessage(e)), "ERROR")
+                stop(sprintf("registry_stages insert failed: %s", conditionMessage(e)))
               })
             },
             max_attempts = 3,
@@ -2186,13 +2186,13 @@ for (i in seq_len(n_athletes)) {
           
         }, error = function(e) {
           create_log_entry(
-            sprintf("  ERROR saving to BigQuery registry for %s: %s", model_name, e$message),
+            sprintf("  ERROR saving to BigQuery registry for %s: %s", model_name, conditionMessage(e)),
             "ERROR",
             reason = "bigquery_registry_failed"
           )
           # Print detailed error information
           create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
-          stop(sprintf("BigQuery registry save failed: %s", e$message))
+          stop(sprintf("BigQuery registry save failed: %s", conditionMessage(e)))
         })
         
         # Return success with model object for flattening
@@ -2339,7 +2339,7 @@ for (i in seq_len(n_athletes)) {
             rep(NA_real_, nrow(all_data))
           }
         }, error = function(e) {
-          create_log_entry(glue("  Prediction generation failed: {e$message}"), "WARN")
+          create_log_entry(glue("  Prediction generation failed: {conditionMessage(e)}"), "WARN")
           rep(NA_real_, nrow(all_data))
         })
         
@@ -2385,7 +2385,7 @@ for (i in seq_len(n_athletes)) {
       fail_count <- fail_count + 1
     }
   }, error = function(e) {
-    create_log_entry(glue("  ERROR: {e$message}"), "ERROR")
+    create_log_entry(glue("  ERROR: {conditionMessage(e)}"), "ERROR")
     fail_count <- fail_count + 1
   })
 }
@@ -2476,7 +2476,7 @@ tryCatch({
   bq_table_upload(health_tbl, health_metrics, write_disposition = "WRITE_APPEND")
   create_log_entry("Pipeline health metrics saved")
 }, error = function(e) {
-  create_log_entry(paste("Health metrics save failed (non-fatal):", e$message), "WARN")
+  create_log_entry(paste("Health metrics save failed (non-fatal):", conditionMessage(e)), "WARN")
 })
 
 ################################################################################

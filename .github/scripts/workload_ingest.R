@@ -10,7 +10,7 @@ tryCatch({
     library(httr); library(jsonlite); library(curl)
     library(gargle); library(glue); library(slider); library(janitor)
   })
-}, error = function(e) { cat("Error loading packages:", e$message, "\n"); quit(status=1) })
+}, error = function(e) { cat("Error loading packages:", conditionMessage(e), "\n"); quit(status=1) })
 
 # ===== Options =====
 options(bigrquery.use_bqstorage = FALSE)
@@ -57,7 +57,7 @@ upload_logs_to_bigquery <- function() {
     if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
-  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+  }, error=function(e){ cat("Log upload failed:", conditionMessage(e), "\n"); FALSE })
 }
 script_start <- Sys.time()
 create_log_entry("=== WORKLOAD INGEST START ===", "START")
@@ -77,7 +77,7 @@ tryCatch({
   ds <- bq_dataset(project, dataset)
   if (!bq_dataset_exists(ds)) { bq_dataset_create(ds, location = location); create_log_entry(glue("Created dataset {dataset}")) }
 }, error = function(e) {
-  create_log_entry(paste("BigQuery auth failed:", e$message), "ERROR")
+  create_log_entry(paste("BigQuery auth failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
@@ -94,7 +94,7 @@ refresh_token_if_needed <- function() {
       create_log_entry("Token refreshed", "INFO")
     }
   }, error = function(e) {
-    create_log_entry(paste("Token refresh warning:", e$message), "WARN")
+    create_log_entry(paste("Token refresh warning:", conditionMessage(e)), "WARN")
   })
 }
 
@@ -154,14 +154,14 @@ tryCatch({
   if (!file.exists(fpath)) stop(glue("LOCAL_FILE_PATH not found: {fpath}"))
   create_log_entry("Loading local file (repo)")
 }, error = function(e) {
-  create_log_entry(paste("File fetch failed:", e$message), "ERROR")
+  create_log_entry(paste("File fetch failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
 raw <- tryCatch({
   read_any_tabular(fpath)
 }, error = function(e) {
-  create_log_entry(paste("File parse error:", e$message), "ERROR")
+  create_log_entry(paste("File parse error:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
@@ -370,7 +370,7 @@ tryCatch({
   bq_upsert(out, table_out, mode = ifelse(write_mode %in% c("MERGE","TRUNCATE"), write_mode, "MERGE"))
   create_log_entry("Ingest complete.")
 }, error=function(e){
-  create_log_entry(paste("Upload failed:", e$message), "ERROR")
+  create_log_entry(paste("Upload failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
 
