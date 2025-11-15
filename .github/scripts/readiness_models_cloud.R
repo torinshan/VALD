@@ -475,10 +475,10 @@ safe_scale_fit <- function(df, cols) {
 }
 
 safe_scale_apply <- function(df, fit) {
-  stopifnot(all(fit$cols %in% names(df)))
-  X <- as.matrix(df[, fit$cols, drop = FALSE])
-  s <- fit$scale; s[is.na(s) | s == 0] <- 1
-  scale(X, center = fit$center, scale = s)
+  stopifnot(all(fit[["cols"]] %in% names(df)))
+  X <- as.matrix(df[, fit[["cols"]], drop = FALSE])
+  s <- fit[["scale"]]; s[is.na(s) | s == 0] <- 1
+  scale(X, center = fit[["center"]], scale = s)
 }
 
 safe_runner <- function(name, fun, ...) {
@@ -1158,11 +1158,11 @@ workload_daily_result <- retry_operation(
   operation_name = "workload data load"
 )
 
-if (!workload_daily_result$success) {
+if (!isTRUE(workload_daily_result[["success"]])) {
   create_log_entry("Workload data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-workload_daily <- workload_daily_result$result
+workload_daily <- workload_daily_result[["result"]]
 
 # FIX 2.7: Validate and parse dates
 workload_daily <- validate_dates(workload_daily, "date", "workload")
@@ -1189,11 +1189,11 @@ vald_fd_jumps_result <- retry_operation(
   operation_name = "VALD FD jumps data load"
 )
 
-if (!vald_fd_jumps_result$success) {
+if (!isTRUE(vald_fd_jumps_result[["success"]])) {
   create_log_entry("VALD FD jumps data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-vald_fd_jumps <- vald_fd_jumps_result$result
+vald_fd_jumps <- vald_fd_jumps_result[["result"]]
 
 # FIX 2.7: Validate and parse dates
 vald_fd_jumps <- validate_dates(vald_fd_jumps, "date", "VALD FD jumps")
@@ -1216,11 +1216,11 @@ roster_mapping_result <- retry_operation(
   operation_name = "roster mapping load"
 )
 
-if (!roster_mapping_result$success) {
+if (!isTRUE(roster_mapping_result[["success"]])) {
   create_log_entry("Roster mapping load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-roster_mapping <- roster_mapping_result$result
+roster_mapping <- roster_mapping_result[["result"]]
 create_log_entry(glue("Roster mapping loaded: {nrow(roster_mapping)} rows"))
 
 ################################################################################
@@ -1405,7 +1405,7 @@ run_glmnet_cvfit <- function(train_df, preds, alpha_glmnet, lambda_grid, fit_int
   tr_cc <- train_df[stats::complete.cases(train_df[, mm_cols, drop = FALSE]), , drop = FALSE]
   if (nrow(tr_cc) < 2) stop("Insufficient complete cases")
   if (normalization) {
-    fit_sc <- safe_scale_fit(tr_cc, preds); Xtr <- fit_sc$X; sc <- fit_sc
+    fit_sc <- safe_scale_fit(tr_cc, preds); Xtr <- fit_sc[["X"]]; sc <- fit_sc
   } else { Xtr <- as.matrix(tr_cc[, preds, drop = FALSE]); sc <- list(center=NULL, scale=NULL, cols=preds) }
   y <- as.numeric(tr_cc[[response_var]])
   nfolds_used <- choose_nfolds(nrow(tr_cc))
@@ -1477,14 +1477,14 @@ run_linear <- function(train_df, test_df, preds, val_method) {
         predictors=preds,
         preprocessing=list(
           normalization=sc, 
-          center=if (sc) fit_sc$center else NULL,
-          scale=if (sc) fit_sc$scale else NULL, 
-          cols=if (sc) fit_sc$cols else preds,
+          center=if (sc) fit_sc[["center"]] else NULL,
+          scale=if (sc) fit_sc[["scale"]] else NULL, 
+          cols=if (sc) fit_sc[["cols"]] else preds,
           fit_intercept=fi
         )
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1493,14 +1493,14 @@ run_ridge <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, 0, lambda_grid, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
-    cv_rmse_val <- sqrt(min(fit$cv$cvm))
+    train_rmse_val <- rmse(fit[["y"]], run_glmnet_predict(fit[["cv"]], fit[["Xtr"]], "lambda.min"))
+    cv_rmse_val <- sqrt(min(fit[["cv"]][["cvm"]]))
     if (val_method == "test_set" && nrow(test_df) > 0) {
       te_df <- to_numeric_df(test_df, preds)
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
-        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
+        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit[["scaler"]]) else as.matrix(te_cc[, preds, drop = FALSE])
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit[["cv"]], Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
@@ -1510,23 +1510,23 @@ run_ridge <- function(train_df, test_df, preds, val_method) {
       cv_rmse=cv_rmse_val, 
       test_rmse=test_rmse_val, 
       primary_rmse=primary,
-      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
+      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit[["cv"]][["lambda.min"]], fi, sc_norm),
       fitted=list(
         type="glmnet", 
-        model=fit$cv, 
+        model=fit[["cv"]], 
         predictors=preds,
         preprocessing=list(
           normalization=sc_norm, 
-          center=if (sc_norm) fit$scaler$center else NULL,
-          scale=if (sc_norm) fit$scaler$scale else NULL, 
-          cols=fit$scaler$cols,
+          center=if (sc_norm) fit[["scaler"]][["center"]] else NULL,
+          scale=if (sc_norm) fit[["scaler"]][["scale"]] else NULL, 
+          cols=fit[["scaler"]][["cols"]],
           fit_intercept=fi
         ),
-        lambda_min=fit$cv$lambda.min, 
+        lambda_min=fit[["cv"]][["lambda.min"]], 
         alpha=0
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1535,14 +1535,14 @@ run_lasso <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, 1, lambda_grid, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
-    cv_rmse_val <- sqrt(min(fit$cv$cvm))
+    train_rmse_val <- rmse(fit[["y"]], run_glmnet_predict(fit[["cv"]], fit[["Xtr"]], "lambda.min"))
+    cv_rmse_val <- sqrt(min(fit[["cv"]][["cvm"]]))
     if (val_method == "test_set" && nrow(test_df) > 0) {
       te_df <- to_numeric_df(test_df, preds)
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
-        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
+        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit[["scaler"]]) else as.matrix(te_cc[, preds, drop = FALSE])
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit[["cv"]], Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
@@ -1552,23 +1552,23 @@ run_lasso <- function(train_df, test_df, preds, val_method) {
       cv_rmse=cv_rmse_val, 
       test_rmse=test_rmse_val, 
       primary_rmse=primary,
-      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, fi, sc_norm),
+      hyper=sprintf("lambda=%.6f; fit_intercept=%s; normalization=%s", fit[["cv"]][["lambda.min"]], fi, sc_norm),
       fitted=list(
         type="glmnet", 
-        model=fit$cv, 
+        model=fit[["cv"]], 
         predictors=preds,
         preprocessing=list(
           normalization=sc_norm, 
-          center=if (sc_norm) fit$scaler$center else NULL,
-          scale=if (sc_norm) fit$scaler$scale else NULL, 
-          cols=fit$scaler$cols,
+          center=if (sc_norm) fit[["scaler"]][["center"]] else NULL,
+          scale=if (sc_norm) fit[["scaler"]][["scale"]] else NULL, 
+          cols=fit[["scaler"]][["cols"]],
           fit_intercept=fi
         ),
-        lambda_min=fit$cv$lambda.min, 
+        lambda_min=fit[["cv"]][["lambda.min"]], 
         alpha=1
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1577,14 +1577,14 @@ run_elastic <- function(train_df, test_df, preds, val_method) {
   best <- NULL
   for (ai in seq(0.1,0.9,by=0.2)) for (fi in c(TRUE,FALSE)) for (sc_norm in c(TRUE,FALSE)) {
     fit <- run_glmnet_cvfit(train_df, preds, ai, lambda_grid_en, fi, sc_norm)
-    train_rmse_val <- rmse(fit$y, run_glmnet_predict(fit$cv, fit$Xtr, "lambda.min"))
-    cv_rmse_val <- sqrt(min(fit$cv$cvm))
+    train_rmse_val <- rmse(fit[["y"]], run_glmnet_predict(fit[["cv"]], fit[["Xtr"]], "lambda.min"))
+    cv_rmse_val <- sqrt(min(fit[["cv"]][["cvm"]]))
     if (val_method == "test_set" && nrow(test_df) > 0) {
       te_df <- to_numeric_df(test_df, preds)
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
-        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit$scaler) else as.matrix(te_cc[, preds, drop = FALSE])
-        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit$cv, Xn, "lambda.min"))
+        Xn <- if (sc_norm) safe_scale_apply(te_cc, fit[["scaler"]]) else as.matrix(te_cc[, preds, drop = FALSE])
+        test_rmse_val <- rmse(te_cc[[response_var]], run_glmnet_predict(fit[["cv"]], Xn, "lambda.min"))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
@@ -1594,23 +1594,23 @@ run_elastic <- function(train_df, test_df, preds, val_method) {
       cv_rmse=cv_rmse_val, 
       test_rmse=test_rmse_val, 
       primary_rmse=primary,
-      hyper=sprintf("lambda=%.6f; l1_ratio=%.1f; fit_intercept=%s; normalization=%s", fit$cv$lambda.min, ai, fi, sc_norm),
+      hyper=sprintf("lambda=%.6f; l1_ratio=%.1f; fit_intercept=%s; normalization=%s", fit[["cv"]][["lambda.min"]], ai, fi, sc_norm),
       fitted=list(
         type="glmnet", 
-        model=fit$cv, 
+        model=fit[["cv"]], 
         predictors=preds,
         preprocessing=list(
           normalization=sc_norm, 
-          center=if (sc_norm) fit$scaler$center else NULL,
-          scale=if (sc_norm) fit$scaler$scale else NULL, 
-          cols=fit$scaler$cols,
+          center=if (sc_norm) fit[["scaler"]][["center"]] else NULL,
+          scale=if (sc_norm) fit[["scaler"]][["scale"]] else NULL, 
+          cols=fit[["scaler"]][["cols"]],
           fit_intercept=fi
         ),
-        lambda_min=fit$cv$lambda.min, 
+        lambda_min=fit[["cv"]][["lambda.min"]], 
         alpha=ai
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1628,7 +1628,7 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
     ))
   }
   sk <- reticulate::import("sklearn.linear_model", delay_load = TRUE)
-  BayesRidge <- sk$BayesianRidge
+  BayesRidge <- sk[["BayesianRidge"]]
   best <- NULL
   for (a1 in c(1e-6, 1e-4)) for (l1 in c(1e-6, 1e-4)) {
     tr_df <- to_numeric_df(train_df, preds)
@@ -1636,10 +1636,10 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
     tr_cc <- tr_df[stats::complete.cases(tr_df[, mm_cols, drop = FALSE]), , drop = FALSE]
     if (!enough_rows(nrow(tr_cc), 2L)) next
     fit_sc <- safe_scale_fit(tr_cc, preds)
-    Xtr <- fit_sc$X; y <- as.numeric(tr_cc[[response_var]])
+    Xtr <- fit_sc[["X"]]; y <- as.numeric(tr_cc[[response_var]])
     m <- BayesRidge(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1, fit_intercept=TRUE)
-    m$fit(Xtr, y)
-    train_rmse_val <- rmse(y, as.numeric(m$predict(Xtr)))
+    m[["fit"]](Xtr, y)
+    train_rmse_val <- rmse(y, as.numeric(m[["predict"]](Xtr)))
     k <- choose_nfolds(nrow(tr_cc))
     folds <- sample(rep(seq_len(k), length.out=nrow(tr_cc)))
     cv_vals <- numeric(k)
@@ -1648,9 +1648,9 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
       if (sum(tr_ix) < 2 || sum(te_ix) < 1) { cv_vals[f] <- NA_real_; next }
       sc_cv <- safe_scale_fit(tr_cc[tr_ix, , drop=FALSE], preds)
       m_cv <- BayesRidge(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1)
-      m_cv$fit(sc_cv$X, as.numeric(tr_cc[[response_var]][tr_ix]))
+      m_cv[["fit"]](sc_cv[["X"]], as.numeric(tr_cc[[response_var]][tr_ix]))
       Xte_cv <- safe_scale_apply(tr_cc[te_ix, , drop=FALSE], sc_cv)
-      cv_vals[f] <- rmse(tr_cc[[response_var]][te_ix], as.numeric(m_cv$predict(Xte_cv)))
+      cv_vals[f] <- rmse(tr_cc[[response_var]][te_ix], as.numeric(m_cv[["predict"]](Xte_cv)))
     }
     cv_rmse_val <- mean(cv_vals, na.rm=TRUE)
     if (val_method == "test_set" && nrow(test_df) > 0) {
@@ -1658,12 +1658,12 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
       te_cc <- te_df[stats::complete.cases(te_df[, preds, drop = FALSE]), , drop = FALSE]
       if (nrow(te_cc) > 0) {
         Xte <- safe_scale_apply(te_cc, fit_sc)
-        test_rmse_val <- rmse(te_cc[[response_var]], as.numeric(m$predict(Xte)))
+        test_rmse_val <- rmse(te_cc[[response_var]], as.numeric(m[["predict"]](Xte)))
       } else test_rmse_val <- NA_real_
       primary <- test_rmse_val
     } else { test_rmse_val <- NA_real_; primary <- cv_rmse_val }
-    coef_vec <- tryCatch(as.numeric(reticulate::py_to_r(m$coef_)), error=function(e) rep(NA_real_, length(preds)))
-    intercept_val <- tryCatch(as.numeric(reticulate::py_to_r(m$intercept_)), error=function(e) NA_real_)
+    coef_vec <- tryCatch(as.numeric(reticulate::py_to_r(m[["coef_"]])), error=function(e) rep(NA_real_, length(preds)))
+    intercept_val <- tryCatch(as.numeric(reticulate::py_to_r(m[["intercept_"]])), error=function(e) NA_real_)
     cand <- list(
       model_type="bayesian_regression", 
       train_rmse=train_rmse_val, 
@@ -1676,9 +1676,9 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
         predictors=preds,
         preprocessing=list(
           normalization=TRUE, 
-          center=fit_sc$center, 
-          scale=fit_sc$scale, 
-          cols=fit_sc$cols, 
+          center=fit_sc[["center"]], 
+          scale=fit_sc[["scale"]], 
+          cols=fit_sc[["cols"]], 
           fit_intercept=TRUE
         ),
         coefficients=coef_vec, 
@@ -1686,7 +1686,7 @@ run_bayes_reg <- function(train_df, test_df, preds, val_method) {
         priors=list(alpha_1=a1, alpha_2=a1, lambda_1=l1, lambda_2=l1)
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1757,7 +1757,7 @@ run_bayes_net <- function(train_df, test_df, preds, val_method) {
         param_method="mle"
       )
     )
-    if (is.null(best) || (is.finite(cand$primary_rmse) && cand$primary_rmse < best$primary_rmse)) best <- cand
+    if (is.null(best) || (is.finite(cand[["primary_rmse"]]) && cand[["primary_rmse"]] < best[["primary_rmse"]])) best <- cand
   }
   best
 }
@@ -1840,8 +1840,8 @@ for (i in seq_len(n_athletes)) {
     if (nrow(ath_test_df) > 0) ath_test_df <- to_numeric_df(ath_test_df, preds)
     
     imp <- impute_train_test(ath_train_df, ath_test_df, preds)
-    ath_train_df <- imp$train
-    ath_test_df <- imp$test
+    ath_train_df <- imp[["train"]]
+    ath_test_df <- imp[["test"]]
     
     sds <- sapply(ath_train_df[, preds, drop=FALSE], stats::sd, na.rm=TRUE)
     keep <- names(sds)[is.finite(sds) & sds > MIN_PREDICTOR_VARIANCE]
@@ -1871,7 +1871,7 @@ for (i in seq_len(n_athletes)) {
       safe_runner("bayesian_network",    run_bayes_net, ath_train_df, ath_test_df, preds, val_method)
     )
     
-    prim_rmse <- sapply(cands, function(c) c$primary_rmse)
+    prim_rmse <- sapply(cands, function(c) c[["primary_rmse"]])
     finite_idx <- which(is.finite(prim_rmse))
     if (length(finite_idx) == 0) {
       create_log_entry("  ERROR: all models failed", "ERROR")
@@ -1883,10 +1883,11 @@ for (i in seq_len(n_athletes)) {
     best_cand <- cands[[best_idx]]
     
     # Helper function to safely convert numeric values for BigQuery
+    # Returns NA_real_ for invalid values so BigQuery can properly handle NULLs
     safe_numeric_for_bq <- function(x) {
-      if (is.null(x) || !is.numeric(x)) return("NULL")
-      if (is.na(x) || is.nan(x) || is.infinite(x)) return("NULL")
-      return(as.character(x))
+      if (is.null(x) || !is.numeric(x)) return(NA_real_)
+      if (is.na(x) || is.nan(x) || is.infinite(x)) return(NA_real_)
+      return(as.numeric(x))
     }
     
     # Helper function to escape strings for BigQuery
@@ -1900,7 +1901,25 @@ for (i in seq_len(n_athletes)) {
     
     # Save best model to registry (coefficients saved to BigQuery)
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
-      if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
+      # Defensive check: ensure candidate is a list
+      if (!is.list(candidate)) {
+        create_log_entry(
+          sprintf("Cannot save model for %s: candidate is not a list structure", model_name),
+          "ERROR",
+          reason = "invalid_candidate_structure"
+        )
+        return(list(
+          success = FALSE, 
+          model_id = paste(team_name, model_name, sep=":"), 
+          version_id = version_id, 
+          artifact_uri = "bigquery:model_coefficients",
+          model_object = NULL,
+          error = "invalid_candidate_structure"
+        ))
+      }
+      
+      fitted <- candidate[["fitted"]]
+      if (is.null(fitted) || !is.list(fitted) || identical(fitted[["type"]], "error")) {
         create_log_entry(
           sprintf("Cannot save model for %s: model fitting failed or returned error", model_name),
           "ERROR",
@@ -1933,7 +1952,7 @@ for (i in seq_len(n_athletes)) {
             model_id = model_id,
             version_id = version_id,
             artifact_uri = "skipped",
-            model_object = candidate$fitted$model,
+            model_object = candidate[["fitted"]][["model"]],
             skipped = TRUE
           ))
         }
@@ -1942,16 +1961,16 @@ for (i in seq_len(n_athletes)) {
         artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
                                project, dataset, model_id)
         
-        # Validate numeric values before saving
-        train_rmse_val <- safe_numeric_for_bq(candidate$train_rmse)
-        cv_rmse_val <- safe_numeric_for_bq(candidate$cv_rmse)
-        test_rmse_val <- safe_numeric_for_bq(candidate$test_rmse)
+        # Validate numeric values before saving (using [[ ]] for safer access)
+        train_rmse_val <- safe_numeric_for_bq(candidate[["train_rmse"]])
+        cv_rmse_val <- safe_numeric_for_bq(candidate[["cv_rmse"]])
+        test_rmse_val <- safe_numeric_for_bq(candidate[["test_rmse"]])
         
         # Prepare values and escape strings
         run_id_val <- escape_bq_string(Sys.getenv("GITHUB_RUN_ID", "manual"))
         git_sha_val <- escape_bq_string(Sys.getenv("GITHUB_SHA", "unknown"))
         preds_json <- escape_bq_string(jsonlite::toJSON(preds, auto_unbox=TRUE))
-        hyper_json <- escape_bq_string(jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE))
+        hyper_json <- escape_bq_string(jsonlite::toJSON(candidate[["hyper"]], auto_unbox=TRUE))
         escaped_model_id <- escape_bq_string(model_id)
         escaped_model_name <- escape_bq_string(model_name)
         escaped_version_id <- escape_bq_string(version_id)
@@ -2047,8 +2066,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_models after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_models after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
           
@@ -2141,21 +2160,21 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_versions after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_versions after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_versions: %s", version_id))
           
-          # Step 3: Save metrics
+          # Step 3: Save metrics (using [[ ]] for safer access)
           metrics <- tibble(
             model_id = model_id, 
             version_id = version_id,
             metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
             metric_value = c(
-              if (!is.finite(candidate$train_rmse)) NA_real_ else candidate$train_rmse,
-              if (!is.finite(candidate$cv_rmse)) NA_real_ else candidate$cv_rmse,
-              if (!is.finite(candidate$test_rmse)) NA_real_ else candidate$test_rmse,
-              if (!is.finite(candidate$primary_rmse)) NA_real_ else candidate$primary_rmse
+              if (!is.finite(candidate[["train_rmse"]])) NA_real_ else candidate[["train_rmse"]],
+              if (!is.finite(candidate[["cv_rmse"]])) NA_real_ else candidate[["cv_rmse"]],
+              if (!is.finite(candidate[["test_rmse"]])) NA_real_ else candidate[["test_rmse"]],
+              if (!is.finite(candidate[["primary_rmse"]])) NA_real_ else candidate[["primary_rmse"]]
             ),
             split = c("train","cv","test","primary"), 
             logged_at = Sys.time()
@@ -2183,8 +2202,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to upload metrics after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to upload metrics after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved metrics to registry_metrics"))
           
@@ -2214,8 +2233,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_stages after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_stages after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_stages: Staging"))
           
@@ -2236,7 +2255,7 @@ for (i in seq_len(n_athletes)) {
           model_id=model_id, 
           version_id=version_id, 
           artifact_uri=artifact_uri,
-          model_object=candidate$fitted$model  # Model object for coefficient flattening
+          model_object=candidate[["fitted"]][["model"]]  # Model object for coefficient flattening
         )
       }, error = function(e) {
         # Top-level error handler with full details
@@ -2267,7 +2286,7 @@ for (i in seq_len(n_athletes)) {
         
         # Diagnostic information
         cat("Diagnostic info:\n")
-        cat("  Model type:", candidate$model_type, "\n")
+        cat("  Model type:", candidate[["model_type"]], "\n")
         cat("  Athlete ID:", athlete_id, "\n")
         cat("  Version ID:", version_id, "\n")
         cat("\n")
@@ -2285,22 +2304,22 @@ for (i in seq_len(n_athletes)) {
       })
     }
     
-    model_name <- paste(athlete_id, best_cand$model_type, sep = "_")
+    model_name <- paste(athlete_id, best_cand[["model_type"]], sep = "_")
     save_result <- save_model_to_registry(athlete_id, model_name, best_cand, version_id)
     
     # ============================================
     # FLATTEN AND UPLOAD COEFFICIENTS TO BIGQUERY
     # ============================================
-    if (isTRUE(save_result$success) && !is.null(save_result$model_object)) {
+    if (isTRUE(save_result[["success"]]) && !is.null(save_result[["model_object"]])) {
       
-      create_log_entry(sprintf("  Flattening %s model for athlete %s...", best_cand$model_type, athlete_id))
+      create_log_entry(sprintf("  Flattening %s model for athlete %s...", best_cand[["model_type"]], athlete_id))
       
       # Flatten the model
       coef_df <- flatten_model(
-        model_obj = save_result$model_object,
-        model_id = save_result$model_id,
+        model_obj = save_result[["model_object"]],
+        model_id = save_result[["model_id"]],
         athlete_id = athlete_id,
-        model_type = best_cand$model_type
+        model_type = best_cand[["model_type"]]
       )
       
       # Upload to BigQuery
@@ -2320,56 +2339,57 @@ for (i in seq_len(n_athletes)) {
                     n_total, n_coefs)
           )
           
-          # Store flattening metadata
-          save_result$n_coefficients <- n_total
-          save_result$n_nonzero_coefficients <- n_coefs
-          save_result$flattened <- TRUE
+          # Store flattening metadata (using [[ ]] for safer access)
+          save_result[["n_coefficients"]] <- n_total
+          save_result[["n_nonzero_coefficients"]] <- n_coefs
+          save_result[["flattened"]] <- TRUE
         } else {
           create_log_entry(
-            sprintf("  ⚠ Failed to upload coefficients for model %s", save_result$model_id),
+            sprintf("  ⚠ Failed to upload coefficients for model %s", save_result[["model_id"]]),
             "WARN"
           )
-          save_result$n_coefficients <- NA_integer_
-          save_result$n_nonzero_coefficients <- NA_integer_
-          save_result$flattened <- FALSE
+          save_result[["n_coefficients"]] <- NA_integer_
+          save_result[["n_nonzero_coefficients"]] <- NA_integer_
+          save_result[["flattened"]] <- FALSE
         }
       } else {
         create_log_entry(
-          sprintf("  ⚠ No coefficients extracted for model %s", save_result$model_id),
+          sprintf("  ⚠ No coefficients extracted for model %s", save_result[["model_id"]]),
           "WARN"
         )
-        save_result$n_coefficients <- NA_integer_
-        save_result$n_nonzero_coefficients <- NA_integer_
-        save_result$flattened <- FALSE
+        save_result[["n_coefficients"]] <- NA_integer_
+        save_result[["n_nonzero_coefficients"]] <- NA_integer_
+        save_result[["flattened"]] <- FALSE
       }
     } else {
       # Model save failed or no model object
-      save_result$n_coefficients <- NA_integer_
-      save_result$n_nonzero_coefficients <- NA_integer_
-      save_result$flattened <- FALSE
+      save_result[["n_coefficients"]] <- NA_integer_
+      save_result[["n_nonzero_coefficients"]] <- NA_integer_
+      save_result[["flattened"]] <- FALSE
     }
     # ============================================
     
-    if (isTRUE(save_result$success) || is.na(save_result$success)) {
-      create_log_entry(glue("  SUCCESS: {best_cand$model_type} (RMSE={round(best_cand$primary_rmse, 3)})"))
+    if (isTRUE(save_result[["success"]]) || is.na(save_result[["success"]])) {
+      create_log_entry(glue("  SUCCESS: {best_cand[['model_type']]} (RMSE={round(best_cand[['primary_rmse']], 3)})"))
       success_count <- success_count + 1
       
       # Generate predictions
       all_data <- rbind(ath_train_df, ath_test_df)
       if (nrow(all_data) > 0) {
         preds_model <- tryCatch({
-          if (best_cand$fitted$type == "lm") {
-            predict(best_cand$fitted$model, all_data)
-          } else if (best_cand$fitted$type == "glmnet") {
-            if (isTRUE(best_cand$fitted$preprocessing$normalization)) {
-              X_scaled <- safe_scale_apply(all_data, best_cand$fitted$preprocessing)
-              as.numeric(predict(best_cand$fitted$model, X_scaled, s="lambda.min"))
+          fitted_type <- best_cand[["fitted"]][["type"]]
+          if (identical(fitted_type, "lm")) {
+            predict(best_cand[["fitted"]][["model"]], all_data)
+          } else if (identical(fitted_type, "glmnet")) {
+            if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
+              X_scaled <- safe_scale_apply(all_data, best_cand[["fitted"]][["preprocessing"]])
+              as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
             } else {
               X <- as.matrix(all_data[, preds, drop=FALSE])
-              as.numeric(predict(best_cand$fitted$model, X, s="lambda.min"))
+              as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
             }
-          } else if (best_cand$fitted$type == "bnlearn") {
-            as.numeric(predict(best_cand$fitted$model, node = response_var, data = all_data[, preds, drop=FALSE]))
+          } else if (identical(fitted_type, "bnlearn")) {
+            as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = all_data[, preds, drop=FALSE]))
           } else {
             rep(NA_real_, nrow(all_data))
           }
@@ -2386,8 +2406,8 @@ for (i in seq_len(n_athletes)) {
         pred_df <- pred_meta %>%
           mutate(
             predicted_readiness = preds_model,
-            model_id = save_result$model_id %||% NA_character_,
-            version_id = save_result$version_id %||% NA_character_,
+            model_id = save_result[["model_id"]] %||% NA_character_,
+            version_id = save_result[["version_id"]] %||% NA_character_,
             prediction_date = Sys.time()
           )
         all_predictions[[length(all_predictions) + 1]] <- pred_df
@@ -2397,22 +2417,22 @@ for (i in seq_len(n_athletes)) {
       all_results[[length(all_results) + 1]] <- tibble(
         athlete_id = athlete_id,
         roster_name = NA_character_,
-        model_type = best_cand$model_type,
-        model_id = save_result$model_id %||% NA_character_,
-        version_id = save_result$version_id %||% NA_character_,
-        artifact_uri = save_result$artifact_uri %||% NA_character_,
-        train_rmse = best_cand$train_rmse,
-        cv_rmse = best_cand$cv_rmse,
-        test_rmse = best_cand$test_rmse,
-        primary_rmse = best_cand$primary_rmse,
+        model_type = best_cand[["model_type"]],
+        model_id = save_result[["model_id"]] %||% NA_character_,
+        version_id = save_result[["version_id"]] %||% NA_character_,
+        artifact_uri = save_result[["artifact_uri"]] %||% NA_character_,
+        train_rmse = best_cand[["train_rmse"]],
+        cv_rmse = best_cand[["cv_rmse"]],
+        test_rmse = best_cand[["test_rmse"]],
+        primary_rmse = best_cand[["primary_rmse"]],
         n_train = n_tr,
         n_test = n_te,
         n_predictors = length(preds),
         validation_method = val_method,
-        hyperparameters = best_cand$hyper,
-        flattened = save_result$flattened %||% FALSE,
-        n_coefficients = save_result$n_coefficients %||% NA_integer_,
-        n_nonzero_coefficients = save_result$n_nonzero_coefficients %||% NA_integer_,
+        hyperparameters = best_cand[["hyper"]],
+        flattened = save_result[["flattened"]] %||% FALSE,
+        n_coefficients = save_result[["n_coefficients"]] %||% NA_integer_,
+        n_nonzero_coefficients = save_result[["n_nonzero_coefficients"]] %||% NA_integer_,
         trained_at = Sys.time()
       )
     } else {
