@@ -1996,60 +1996,60 @@ for (i in seq_len(n_athletes)) {
                 if (check_df$count[1] > 0) {
                   # Model already exists - skip (or could update via delete+insert if needed)
                   create_log_entry(sprintf("  Model already exists in registry, skipping insert"))
-                  return(TRUE)
-                }
-                
-                # Model doesn't exist - insert using streaming API (NOT DML - works on free tier!)
-                new_row <- tibble(
-                  model_id = escaped_model_id,
-                  model_name = escaped_model_name,
-                  team = team_name,
-                  owner = "auto",
-                  description = "Athlete readiness model",
-                  created_at = Sys.time()
-                )
-                
-                tbl <- bq_table(project, dataset, "registry_models")
-                
-                # Log the data being uploaded for debugging
-                create_log_entry(sprintf("    Uploading model row: model_id=%s", escaped_model_id))
-                
-                # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
-                upload_job <- bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
-                
-                # If the upload returns a job object, wait for it and check status
-                if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
-                  # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
-                  job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
-                  job_location <- safe_get_field(upload_job, c("jobReference", "location"))
+                  TRUE  # Return TRUE to indicate success, not return() which would exit the retry_operation early
+                } else {
+                  # Model doesn't exist - insert using streaming API (NOT DML - works on free tier!)
+                  new_row <- tibble(
+                    model_id = escaped_model_id,
+                    model_name = escaped_model_name,
+                    team = team_name,
+                    owner = "auto",
+                    description = "Athlete readiness model",
+                    created_at = Sys.time()
+                  )
                   
-                  if (!is.null(job_id)) {
-                    job_location <- job_location %||% location
-                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
+                  tbl <- bq_table(project, dataset, "registry_models")
+                  
+                  # Log the data being uploaded for debugging
+                  create_log_entry(sprintf("    Uploading model row: model_id=%s", escaped_model_id))
+                  
+                  # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
+                  upload_job <- bq_table_upload(tbl, new_row, write_disposition = "WRITE_APPEND")
+                  
+                  # If the upload returns a job object, wait for it and check status
+                  if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
+                    # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
+                    job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
+                    job_location <- safe_get_field(upload_job, c("jobReference", "location"))
                     
-                    # Wait for job completion and check status
-                    tryCatch({
-                      completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                    if (!is.null(job_id)) {
+                      job_location <- job_location %||% location
+                      create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
                       
-                      # Check if job failed using safe accessor
-                      error_result <- safe_get_field(completed_job, c("status", "errorResult"))
-                      if (!is.null(error_result)) {
-                        create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
-                        log_bq_job_error(completed_job, "registry_models upload")
-                        stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
-                      }
-                      
-                      create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
-                    }, error = function(wait_err) {
-                      create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
-                      # Try to fetch job details even if wait failed
-                      log_bq_job_error(upload_job, "registry_models upload")
-                      stop(wait_err)
-                    })
+                      # Wait for job completion and check status
+                      tryCatch({
+                        completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                        
+                        # Check if job failed using safe accessor
+                        error_result <- safe_get_field(completed_job, c("status", "errorResult"))
+                        if (!is.null(error_result)) {
+                          create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
+                          log_bq_job_error(completed_job, "registry_models upload")
+                          stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
+                        }
+                        
+                        create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
+                      }, error = function(wait_err) {
+                        create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
+                        # Try to fetch job details even if wait failed
+                        log_bq_job_error(upload_job, "registry_models upload")
+                        stop(wait_err)
+                      })
+                    }
                   }
+                  
+                  TRUE
                 }
-                
-                TRUE
               }, error = function(e) {
                 create_log_entry(sprintf("  Registry save error: %s", conditionMessage(e)), "ERROR")
                 create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
@@ -2089,77 +2089,77 @@ for (i in seq_len(n_athletes)) {
                 if (check_df$count[1] > 0) {
                   # Version already exists - skip (or could update via delete+insert if needed)
                   create_log_entry(sprintf("  Version already exists in registry, skipping insert"))
-                  return(TRUE)
-                }
-                
-                # Prepare version row for streaming insert
-                version_row <- tibble(
-                  model_id = escaped_model_id,
-                  version_id = escaped_version_id,
-                  created_at = Sys.time(),
-                  created_by = "github_actions",
-                  artifact_uri = artifact_uri,
-                  artifact_sha256 = "bigquery",
-                  framework = "R/glmnet",
-                  r_version = R.version$version.string,
-                  package_info = "",
-                  notes = "",
-                  training_data_start_date = cfg_start_date,
-                  training_data_end_date = cfg_end_date,
-                  n_training_samples = as.integer(n_tr),
-                  n_test_samples = as.integer(n_te),
-                  validation_method = val_method,
-                  predictor_list = preds_json,
-                  hyperparameters = hyper_json,
-                  train_rmse = train_rmse_val,
-                  cv_rmse = cv_rmse_val,
-                  test_rmse = test_rmse_val,
-                  pipeline_run_id = run_id_val,
-                  git_commit_sha = git_sha_val
-                )
-                
-                tbl <- bq_table(project, dataset, "registry_versions")
-                
-                # Log the data being uploaded for debugging
-                create_log_entry(sprintf("    Uploading version row: model_id=%s, version_id=%s", 
-                                        escaped_model_id, escaped_version_id))
-                
-                # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
-                upload_job <- bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
-                
-                # If the upload returns a job object, wait for it and check status
-                if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
-                  # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
-                  job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
-                  job_location <- safe_get_field(upload_job, c("jobReference", "location"))
+                  TRUE  # Return TRUE to indicate success, not return() which would exit the retry_operation early
+                } else {
+                  # Prepare version row for streaming insert
+                  version_row <- tibble(
+                    model_id = escaped_model_id,
+                    version_id = escaped_version_id,
+                    created_at = Sys.time(),
+                    created_by = "github_actions",
+                    artifact_uri = artifact_uri,
+                    artifact_sha256 = "bigquery",
+                    framework = "R/glmnet",
+                    r_version = R.version$version.string,
+                    package_info = "",
+                    notes = "",
+                    training_data_start_date = cfg_start_date,
+                    training_data_end_date = cfg_end_date,
+                    n_training_samples = as.integer(n_tr),
+                    n_test_samples = as.integer(n_te),
+                    validation_method = val_method,
+                    predictor_list = preds_json,
+                    hyperparameters = hyper_json,
+                    train_rmse = train_rmse_val,
+                    cv_rmse = cv_rmse_val,
+                    test_rmse = test_rmse_val,
+                    pipeline_run_id = run_id_val,
+                    git_commit_sha = git_sha_val
+                  )
                   
-                  if (!is.null(job_id)) {
-                    job_location <- job_location %||% location
-                    create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
+                  tbl <- bq_table(project, dataset, "registry_versions")
+                  
+                  # Log the data being uploaded for debugging
+                  create_log_entry(sprintf("    Uploading version row: model_id=%s, version_id=%s", 
+                                          escaped_model_id, escaped_version_id))
+                  
+                  # bq_table_upload uses streaming insert API (not DML) - free tier compatible!
+                  upload_job <- bq_table_upload(tbl, version_row, write_disposition = "WRITE_APPEND")
+                  
+                  # If the upload returns a job object, wait for it and check status
+                  if (!is.null(upload_job) && is.list(upload_job) && inherits(upload_job, "bq_job")) {
+                    # Use safe_get_field to avoid "$ operator is invalid for atomic vectors" error
+                    job_id <- safe_get_field(upload_job, c("jobReference", "jobId"))
+                    job_location <- safe_get_field(upload_job, c("jobReference", "location"))
                     
-                    # Wait for job completion and check status
-                    tryCatch({
-                      completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                    if (!is.null(job_id)) {
+                      job_location <- job_location %||% location
+                      create_log_entry(sprintf("    ✅ Upload job created: %s.%s", job_id, job_location))
                       
-                      # Check if job failed using safe accessor
-                      error_result <- safe_get_field(completed_job, c("status", "errorResult"))
-                      if (!is.null(error_result)) {
-                        create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
-                        log_bq_job_error(completed_job, "registry_versions upload")
-                        stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
-                      }
-                      
-                      create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
-                    }, error = function(wait_err) {
-                      create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
-                      # Try to fetch job details even if wait failed
-                      log_bq_job_error(upload_job, "registry_versions upload")
-                      stop(wait_err)
-                    })
+                      # Wait for job completion and check status
+                      tryCatch({
+                        completed_job <- bq_job_wait(upload_job, quiet = TRUE)
+                        
+                        # Check if job failed using safe accessor
+                        error_result <- safe_get_field(completed_job, c("status", "errorResult"))
+                        if (!is.null(error_result)) {
+                          create_log_entry(sprintf("    ❌ Job %s.%s FAILED", job_id, job_location), "ERROR")
+                          log_bq_job_error(completed_job, "registry_versions upload")
+                          stop(sprintf("BigQuery job %s.%s failed", job_id, job_location))
+                        }
+                        
+                        create_log_entry(sprintf("    ✅ Job %s.%s completed successfully", job_id, job_location))
+                      }, error = function(wait_err) {
+                        create_log_entry(sprintf("    ⚠️  Error waiting for job: %s", wait_err$message), "WARN")
+                        # Try to fetch job details even if wait failed
+                        log_bq_job_error(upload_job, "registry_versions upload")
+                        stop(wait_err)
+                      })
+                    }
                   }
+                  
+                  TRUE
                 }
-                
-                TRUE
               }, error = function(e) {
                 create_log_entry(sprintf("  Registry versions save error: %s", conditionMessage(e)), "ERROR")
                 create_log_entry(sprintf("  Error class: %s", paste(class(e), collapse=", ")), "ERROR")
