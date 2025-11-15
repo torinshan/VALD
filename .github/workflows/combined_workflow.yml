@@ -89,7 +89,6 @@ jobs:
           ls -lh ".github/Clean_Activities_GPS.xlsx"
 
       - name: Ingest workload (local xlsx)
-        if: ${{ secrets.GCP_SA_KEY != '' && secrets.GCP_PROJECT != '' }}
         env:
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
@@ -154,7 +153,6 @@ jobs:
           ls -lh ".github/Sac State Roster - Summer 2025.xlsx"
 
       - name: Ingest roster (local xlsx → BigQuery)
-        if: ${{ secrets.GCP_SA_KEY != '' && secrets.GCP_PROJECT != '' }}
         env:
           GCP_PROJECT:        ${{ env.GCP_PROJECT }}
           BQ_DATASET:         ${{ env.BQ_DATASET }}
