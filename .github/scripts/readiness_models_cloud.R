@@ -2076,6 +2076,22 @@ for (i in seq_len(n_athletes)) {
           result <- retry_operation(
             {
               tryCatch({
+                # FREE TIER FIX: Check if version exists (SELECT allowed on free tier)
+                check_sql <- glue("
+                  SELECT COUNT(*) as count 
+                  FROM `{project}.{dataset}.registry_versions` 
+                  WHERE model_id = '{escaped_model_id}' AND version_id = '{escaped_version_id}'
+                ")
+                
+                check_result <- bq_project_query(project, check_sql, use_legacy_sql = FALSE)
+                check_df <- bq_table_download(check_result)
+                
+                if (check_df$count[1] > 0) {
+                  # Version already exists - skip (or could update via delete+insert if needed)
+                  create_log_entry(sprintf("  Version already exists in registry, skipping insert"))
+                  return(TRUE)
+                }
+                
                 # Prepare version row for streaming insert
                 version_row <- tibble(
                   model_id = escaped_model_id,
@@ -2398,10 +2414,23 @@ for (i in seq_len(n_athletes)) {
           rep(NA_real_, nrow(all_data))
         })
         
-        pred_meta <- rbind(
-          ath_train[, .(official_id, date, readiness, is_test)],
-          ath_test[,  .(official_id, date, readiness, is_test)]
-        )
+        # Defensive extraction of metadata columns - handle empty data.tables safely
+        meta_cols <- c("official_id", "date", "readiness", "is_test")
+        train_meta <- if (nrow(ath_train) > 0 && all(meta_cols %in% names(ath_train))) {
+          ath_train[, ..meta_cols]
+        } else {
+          data.table(official_id = character(), date = as.Date(character()), 
+                    readiness = numeric(), is_test = integer())
+        }
+        
+        test_meta <- if (nrow(ath_test) > 0 && all(meta_cols %in% names(ath_test))) {
+          ath_test[, ..meta_cols]
+        } else {
+          data.table(official_id = character(), date = as.Date(character()), 
+                    readiness = numeric(), is_test = integer())
+        }
+        
+        pred_meta <- rbind(train_meta, test_meta)
         
         pred_df <- pred_meta %>%
           mutate(
