@@ -57,6 +57,7 @@ RETRY_WAIT_SECONDS <- as.integer(Sys.getenv("RETRY_WAIT_SECONDS", "5"))
 # Workflow fork controls
 skip_training          <- tolower(Sys.getenv("SKIP_TRAINING", "false")) %in% c("1","true","yes")
 skip_registry_versions <- tolower(Sys.getenv("SKIP_REGISTRY_VERSIONS", "false")) %in% c("1","true","yes")
+skip_registry_stages   <- tolower(Sys.getenv("SKIP_REGISTRY_STAGES", "true")) %in% c("1","true","yes")  # Default TRUE for free tier
 has_matches_hint       <- Sys.getenv("HAS_MATCHES", "")
 match_lookback_days    <- as.integer(Sys.getenv("MATCH_LOOKBACK_DAYS", "7"))
 
@@ -73,6 +74,7 @@ cat("Train fraction:", cfg_frac_train, "\n")
 cat("Min train obs:", MIN_TRAIN_OBS, "\n")
 cat("Skip training:", skip_training, "\n")
 cat("Skip registry versions:", skip_registry_versions, "\n")
+cat("Skip registry stages:", skip_registry_stages, "\n")
 cat("HAS_MATCHES hint:", ifelse(nzchar(has_matches_hint), has_matches_hint, "not provided"), "\n")
 cat("Match lookback days:", match_lookback_days, "\n")
 cat("Storage: BigQuery tables only\n\n")
@@ -2224,35 +2226,39 @@ for (i in seq_len(n_athletes)) {
           create_log_entry(sprintf("  Saved metrics to registry_metrics"))
           
           # Step 4: Save to registry_stages
-          sql_stages <- glue("
-            INSERT INTO `{project}.{dataset}.registry_stages`
-              (model_id, version_id, stage, set_at, set_by, reason)
-            VALUES
-              ('{escaped_model_id}','{escaped_version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
-          ")
-          
-          create_log_entry(sprintf("  Executing SQL for registry_stages..."))
-          result <- retry_operation(
-            {
-              tryCatch({
-                bq_project_query(project, sql_stages, use_legacy_sql = FALSE)
-                TRUE
-              }, error = function(e) {
-                create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
-                create_log_entry(sprintf("  BigQuery error: %s", conditionMessage(e)), "ERROR")
-                stop(sprintf("registry_stages insert failed: %s", conditionMessage(e)))
-              })
-            },
-            max_attempts = 3,
-            wait_seconds = 2,
-            operation_name = "registry_stages save",
-            exponential_backoff = TRUE
-          )
-          
-          if (!isTRUE(result[["success"]])) {
-            stop(sprintf("Failed to save to registry_stages after retries: %s", result[["error"]]))
+          if (!skip_registry_stages) {
+            sql_stages <- glue("
+              INSERT INTO `{project}.{dataset}.registry_stages`
+                (model_id, version_id, stage, set_at, set_by, reason)
+              VALUES
+                ('{escaped_model_id}','{escaped_version_id}','Staging',CURRENT_TIMESTAMP(),'auto','Initial training')
+            ")
+            
+            create_log_entry(sprintf("  Executing SQL for registry_stages..."))
+            result <- retry_operation(
+              {
+                tryCatch({
+                  bq_project_query(project, sql_stages, use_legacy_sql = FALSE)
+                  TRUE
+                }, error = function(e) {
+                  create_log_entry(sprintf("  SQL that failed:\n%s", sql_stages), "ERROR")
+                  create_log_entry(sprintf("  BigQuery error: %s", conditionMessage(e)), "ERROR")
+                  stop(sprintf("registry_stages insert failed: %s", conditionMessage(e)))
+                })
+              },
+              max_attempts = 3,
+              wait_seconds = 2,
+              operation_name = "registry_stages save",
+              exponential_backoff = TRUE
+            )
+            
+            if (!isTRUE(result[["success"]])) {
+              stop(sprintf("Failed to save to registry_stages after retries: %s", result[["error"]]))
+            }
+            create_log_entry(sprintf("  Saved to registry_stages: Staging"))
+          } else {
+            create_log_entry(sprintf("  Skipped registry_stages save (SKIP_REGISTRY_STAGES=true) - DML not allowed in free tier"), "INFO")
           }
-          create_log_entry(sprintf("  Saved to registry_stages: Staging"))
           
         }, error = function(e) {
           create_log_entry(

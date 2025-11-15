@@ -587,6 +587,7 @@ jobs:
           HAS_MATCHES:       ${{ needs.check-readiness.outputs.has_matches }}
           MATCH_LOOKBACK_DAYS: '7'
           SKIP_TRAINING:     ${{ github.event.inputs.skip_training || 'false' }}
+          SKIP_REGISTRY_STAGES: 'true'  # BigQuery free tier doesn't support DML (INSERT) queries
         run: Rscript ".github/scripts/readiness_models_cloud.R"
 
       - name: Show today's training summary (best-effort)
