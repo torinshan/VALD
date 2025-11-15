@@ -601,42 +601,54 @@ jobs:
             sudo apt-get update && sudo apt-get install -y gettext-base
           fi
 
+          # Check if model_training_summary table exists before querying
+          TABLE_EXISTS=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+            ls -n 1000 "${BQ_DATASET}" 2>/dev/null | grep -c "model_training_summary" || echo "0")
+
           echo ""
           echo "📈 Latest Models:"
 
-          # Use cat with heredoc instead of read to avoid exit code issues
-          Q1=$(cat <<'SQL'
-          SELECT
-            athlete_id,
-            roster_name,
-            model_type,
-            ROUND(primary_rmse, 3) AS rmse,
-            n_train,
-            FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
-          FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
-          WHERE DATE(trained_at) = CURRENT_DATE()
-          ORDER BY trained_at DESC
-          LIMIT 10
-          SQL
-          )
-          Q1="$(envsubst <<<"$Q1")"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 "$Q1" || echo "No training results yet"
+          if [ "$TABLE_EXISTS" -eq "0" ]; then
+            echo "No training results yet (table not created)"
+          else
+            # Use cat with heredoc instead of read to avoid exit code issues
+            Q1=$(cat <<'SQL'
+            SELECT
+              athlete_id,
+              roster_name,
+              model_type,
+              ROUND(primary_rmse, 3) AS rmse,
+              n_train,
+              FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+            WHERE DATE(trained_at) = CURRENT_DATE()
+            ORDER BY trained_at DESC
+            LIMIT 10
+            SQL
+            )
+            Q1="$(envsubst <<<"$Q1")"
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 "$Q1" 2>&1 || echo "No training results yet"
+          fi
 
           echo ""
           echo "📊 Today's Training Stats:"
 
-          Q2=$(cat <<'SQL'
-          SELECT
-            COUNT(DISTINCT athlete_id) AS athletes_trained,
-            COUNT(*) AS total_models,
-            ROUND(AVG(primary_rmse), 3) AS avg_rmse,
-            FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
-          FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
-          WHERE DATE(trained_at) = CURRENT_DATE()
-          SQL
-          )
-          Q2="$(envsubst <<<"$Q2")"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "$Q2" || echo "No stats available"
+          if [ "$TABLE_EXISTS" -eq "0" ]; then
+            echo "No stats available (table not created)"
+          else
+            Q2=$(cat <<'SQL'
+            SELECT
+              COUNT(DISTINCT athlete_id) AS athletes_trained,
+              COUNT(*) AS total_models,
+              ROUND(AVG(primary_rmse), 3) AS avg_rmse,
+              FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
+            FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+            WHERE DATE(trained_at) = CURRENT_DATE()
+            SQL
+            )
+            Q2="$(envsubst <<<"$Q2")"
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
+          fi
 
   summary:
     runs-on: ubuntu-latest
