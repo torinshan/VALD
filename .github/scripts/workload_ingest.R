@@ -50,6 +50,13 @@ create_log_entry <- function(message, level="INFO") {
 }
 upload_logs_to_bigquery <- function() {
   if (nrow(log_entries)==0) return(invisible(TRUE))
+  
+  # Check if upload should be skipped
+  if (identical(Sys.getenv("SKIP_BQ_UPLOAD"), "true")) {
+    cat("SKIP_BQ_UPLOAD=true -> skipping log upload to BigQuery\n")
+    return(invisible(TRUE))
+  }
+  
   tryCatch({
     ds <- bq_dataset(project, dataset)
     if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
@@ -57,7 +64,16 @@ upload_logs_to_bigquery <- function() {
     if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
-  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+  }, error=function(e){
+    err_msg <- conditionMessage(e)
+    if (grepl("Quota exceeded", err_msg, ignore.case = TRUE)) {
+      cat("BigQuery quota exceeded for log upload. Skipping and continuing.\n")
+      return(invisible(TRUE))
+    } else {
+      cat("Log upload failed:", err_msg, "\n")
+      return(invisible(FALSE))
+    }
+  })
 }
 script_start <- Sys.time()
 create_log_entry("=== WORKLOAD INGEST START ===", "START")
@@ -320,48 +336,68 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
   if (nrow(df)==0) { create_log_entry(glue("No rows to upload for {table_name}")); return(TRUE) }
 
+  # Check if upload should be skipped
+  if (identical(Sys.getenv("SKIP_BQ_UPLOAD"), "true")) {
+    create_log_entry(glue("SKIP_BQ_UPLOAD=true -> skipping BigQuery upload for {table_name}"))
+    create_log_entry(glue("Would have uploaded {nrow(df)} rows to {table_name}"))
+    return(TRUE)
+  }
+
   ensure_table(tbl, df, partition_field="date", cluster_fields=c("roster_name"))
   df <- validate_against_schema(df, tbl)
 
-  if (mode == "TRUNCATE" || !bq_table_exists(tbl) || isTRUE(bq_table_meta(tbl)$numRows == "0")) {
+  tryCatch({
+    if (mode == "TRUNCATE" || !bq_table_exists(tbl) || isTRUE(bq_table_meta(tbl)$numRows == "0")) {
+      refresh_token_if_needed()
+      bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
+      nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
+      create_log_entry(glue("TRUNCATE upload complete; {table_name} rows: {nr}"))
+      return(TRUE)
+    }
+
+    existing <- read_bq_table_rest(tbl)
+    if (nrow(existing)==0) {
+      refresh_token_if_needed()
+      bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
+      create_log_entry(glue("Initial upload to {table_name}"))
+      return(TRUE)
+    }
+
+    # Use df (schema-validated) for MERGE logic
+    df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
+    existing <- existing %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
+    df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
+    allc <- union(names(existing), names(df))
+    for (c in setdiff(allc, names(existing))) existing[[c]] <- NA
+    for (c in setdiff(allc, names(df)))       df[[c]]       <- NA
+    existing <- existing[, allc, drop=FALSE]
+    df       <- df[, allc, drop=FALSE]
+
+    combined <- bind_rows(existing, df) %>%
+      mutate(.row_id = row_number()) %>%
+      arrange(.row_id) %>%
+      group_by(pk) %>%
+      slice_tail(n=1) %>%
+      ungroup() %>%
+      select(-.row_id, -pk)
+
     refresh_token_if_needed()
-    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
+    bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
     nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
-    create_log_entry(glue("TRUNCATE upload complete; {table_name} rows: {nr}"))
+    create_log_entry(glue("MERGE complete; {table_name} rows: {nr}"))
     return(TRUE)
-  }
-
-  existing <- read_bq_table_rest(tbl)
-  if (nrow(existing)==0) {
-    refresh_token_if_needed()
-    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
-    create_log_entry(glue("Initial upload to {table_name}"))
-    return(TRUE)
-  }
-
-  # Use df (schema-validated) for MERGE logic
-  df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
-  existing <- existing %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
-  df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
-  allc <- union(names(existing), names(df))
-  for (c in setdiff(allc, names(existing))) existing[[c]] <- NA
-  for (c in setdiff(allc, names(df)))       df[[c]]       <- NA
-  existing <- existing[, allc, drop=FALSE]
-  df       <- df[, allc, drop=FALSE]
-
-  combined <- bind_rows(existing, df) %>%
-    mutate(.row_id = row_number()) %>%
-    arrange(.row_id) %>%
-    group_by(pk) %>%
-    slice_tail(n=1) %>%
-    ungroup() %>%
-    select(-.row_id, -pk)
-
-  refresh_token_if_needed()
-  bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
-  nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
-  create_log_entry(glue("MERGE complete; {table_name} rows: {nr}"))
-  TRUE
+  }, error = function(e) {
+    err_msg <- conditionMessage(e)
+    if (grepl("Quota exceeded", err_msg, ignore.case = TRUE)) {
+      create_log_entry(glue("BigQuery quota exceeded for {table_name}. Skipping upload in CI and continuing."), "WARN")
+      create_log_entry(glue("Error details: {err_msg}"), "WARN")
+      # Return TRUE to indicate we handled the error gracefully
+      return(TRUE)
+    } else {
+      # Re-throw other errors that we must fix
+      stop(e)
+    }
+  })
 }
 
 # ===== Upload =====
