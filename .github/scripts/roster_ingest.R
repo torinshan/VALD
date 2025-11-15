@@ -80,17 +80,35 @@ on.exit(try(dbDisconnect(con), silent = TRUE))
 
 message("Writing to BigQuery: ", project, ".", dataset, ".", table_name)
 
-# Write the table. Ensure the dataframe column names match the BigQuery schema:
-# official_id, vald_name
-# Use DBI::dbWriteTable which wraps bigrquery::bq_table_upload
-dbWriteTable(
-  con,
-  name = table_name,
-  value = df,
-  overwrite = TRUE
-)
-
-# Confirm upload
-query <- sprintf("SELECT COUNT(*) AS c FROM `%s.%s.%s`", project, dataset, table_name)
-res <- dbGetQuery(con, query)
-message("Upload complete. Row count in ", table_name, ": ", res$c[1])
+# Check if upload should be skipped
+if (identical(Sys.getenv("SKIP_BQ_UPLOAD"), "true")) {
+  message("SKIP_BQ_UPLOAD=true -> skipping BigQuery upload in CI")
+  message("Would have uploaded ", nrow(df), " rows to ", table_name)
+} else {
+  # Write the table with error handling for quota issues
+  tryCatch({
+    # Use DBI::dbWriteTable which wraps bigrquery::bq_table_upload
+    dbWriteTable(
+      con,
+      name = table_name,
+      value = df,
+      overwrite = TRUE
+    )
+    
+    # Confirm upload
+    query <- sprintf("SELECT COUNT(*) AS c FROM `%s.%s.%s`", project, dataset, table_name)
+    res <- dbGetQuery(con, query)
+    message("Upload complete. Row count in ", table_name, ": ", res$c[1])
+  }, error = function(e) {
+    err_msg <- conditionMessage(e)
+    if (grepl("Quota exceeded", err_msg, ignore.case = TRUE)) {
+      message("BigQuery quota exceeded. Skipping upload in CI and continuing.")
+      message("Error details: ", err_msg)
+      # Return invisible NULL instead of stopping
+      return(invisible(NULL))
+    } else {
+      # Re-throw other errors that we must fix
+      stop(e)
+    }
+  })
+}
