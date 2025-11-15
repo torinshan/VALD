@@ -2421,6 +2421,7 @@ for (i in seq_len(n_athletes)) {
         })
         
         # Defensive extraction of metadata columns - handle empty data.tables safely
+        # Only include metadata for rows that actually have predictions (i.e., in all_data)
         meta_cols <- c("official_id", "date", "readiness", "is_test")
         train_meta <- if (nrow(ath_train) > 0 && all(meta_cols %in% names(ath_train))) {
           ath_train[, ..meta_cols]
@@ -2429,7 +2430,8 @@ for (i in seq_len(n_athletes)) {
                     readiness = numeric(), is_test = integer())
         }
         
-        test_meta <- if (nrow(ath_test) > 0 && all(meta_cols %in% names(ath_test))) {
+        # Only include test_meta if ath_test_df has rows (i.e., not cleared for CV mode)
+        test_meta <- if (nrow(ath_test_df) > 0 && nrow(ath_test) > 0 && all(meta_cols %in% names(ath_test))) {
           ath_test[, ..meta_cols]
         } else {
           data.table(official_id = character(), date = as.Date(character()), 
@@ -2437,6 +2439,21 @@ for (i in seq_len(n_athletes)) {
         }
         
         pred_meta <- rbind(train_meta, test_meta)
+        
+        # Validate that prediction vector matches metadata rows
+        if (length(preds_model) != nrow(pred_meta)) {
+          create_log_entry(
+            glue("  WARNING: Prediction vector size mismatch: expected {nrow(pred_meta)}, got {length(preds_model)}. ",
+                 "Padding with NAs to match."),
+            "WARN"
+          )
+          # Pad or truncate to match
+          if (length(preds_model) < nrow(pred_meta)) {
+            preds_model <- c(preds_model, rep(NA_real_, nrow(pred_meta) - length(preds_model)))
+          } else {
+            preds_model <- preds_model[1:nrow(pred_meta)]
+          }
+        }
         
         pred_df <- pred_meta %>%
           mutate(
