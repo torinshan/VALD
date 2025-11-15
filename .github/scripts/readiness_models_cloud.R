@@ -2414,10 +2414,23 @@ for (i in seq_len(n_athletes)) {
           rep(NA_real_, nrow(all_data))
         })
         
-        pred_meta <- rbind(
-          ath_train[, .(official_id, date, readiness, is_test)],
-          ath_test[,  .(official_id, date, readiness, is_test)]
-        )
+        # Defensive extraction of metadata columns - handle empty data.tables safely
+        meta_cols <- c("official_id", "date", "readiness", "is_test")
+        train_meta <- if (nrow(ath_train) > 0 && all(meta_cols %in% names(ath_train))) {
+          ath_train[, ..meta_cols]
+        } else {
+          data.table(official_id = character(), date = as.Date(character()), 
+                    readiness = numeric(), is_test = integer())
+        }
+        
+        test_meta <- if (nrow(ath_test) > 0 && all(meta_cols %in% names(ath_test))) {
+          ath_test[, ..meta_cols]
+        } else {
+          data.table(official_id = character(), date = as.Date(character()), 
+                    readiness = numeric(), is_test = integer())
+        }
+        
+        pred_meta <- rbind(train_meta, test_meta)
         
         pred_df <- pred_meta %>%
           mutate(
