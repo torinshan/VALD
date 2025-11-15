@@ -596,7 +596,7 @@ jobs:
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           if ! command -v envsubst >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y gettext-base
           fi
@@ -604,7 +604,8 @@ jobs:
           echo ""
           echo "📈 Latest Models:"
 
-          read -r -d '' Q1 <<'SQL'
+          # Use cat with heredoc instead of read to avoid exit code issues
+          Q1=$(cat <<'SQL'
           SELECT
             athlete_id,
             roster_name,
@@ -617,13 +618,14 @@ jobs:
           ORDER BY trained_at DESC
           LIMIT 10
           SQL
+          )
           Q1="$(envsubst <<<"$Q1")"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 "$Q1" || echo "No training results yet"
 
           echo ""
           echo "📊 Today's Training Stats:"
 
-          read -r -d '' Q2 <<'SQL'
+          Q2=$(cat <<'SQL'
           SELECT
             COUNT(DISTINCT athlete_id) AS athletes_trained,
             COUNT(*) AS total_models,
@@ -632,6 +634,7 @@ jobs:
           FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
           WHERE DATE(trained_at) = CURRENT_DATE()
           SQL
+          )
           Q2="$(envsubst <<<"$Q2")"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "$Q2" || echo "No stats available"
 

@@ -1883,10 +1883,11 @@ for (i in seq_len(n_athletes)) {
     best_cand <- cands[[best_idx]]
     
     # Helper function to safely convert numeric values for BigQuery
+    # Returns NA_real_ for invalid values so BigQuery can properly handle NULLs
     safe_numeric_for_bq <- function(x) {
-      if (is.null(x) || !is.numeric(x)) return("NULL")
-      if (is.na(x) || is.nan(x) || is.infinite(x)) return("NULL")
-      return(as.character(x))
+      if (is.null(x) || !is.numeric(x)) return(NA_real_)
+      if (is.na(x) || is.nan(x) || is.infinite(x)) return(NA_real_)
+      return(as.numeric(x))
     }
     
     # Helper function to escape strings for BigQuery
