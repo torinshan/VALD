@@ -320,15 +320,12 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   ds <- bq_dataset(project, dataset); tbl <- bq_table(ds, table_name)
   if (nrow(df)==0) { create_log_entry(glue("No rows to upload for {table_name}")); return(TRUE) }
 
-  df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
-  df_no_pk <- df %>% select(-pk)
-
-  ensure_table(tbl, df_no_pk, partition_field="date", cluster_fields=c("roster_name"))
-  df_no_pk <- validate_against_schema(df_no_pk, tbl)
+  ensure_table(tbl, df, partition_field="date", cluster_fields=c("roster_name"))
+  df <- validate_against_schema(df, tbl)
 
   if (mode == "TRUNCATE" || !bq_table_exists(tbl) || isTRUE(bq_table_meta(tbl)$numRows == "0")) {
     refresh_token_if_needed()
-    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
+    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
     nr <- tryCatch(bq_table_meta(tbl)$numRows, error=function(e) NA)
     create_log_entry(glue("TRUNCATE upload complete; {table_name} rows: {nr}"))
     return(TRUE)
@@ -337,11 +334,13 @@ bq_upsert <- function(df, table_name, mode=c("MERGE","TRUNCATE")) {
   existing <- read_bq_table_rest(tbl)
   if (nrow(existing)==0) {
     refresh_token_if_needed()
-    bq_table_upload(tbl, df_no_pk, write_disposition = "WRITE_TRUNCATE")
+    bq_table_upload(tbl, df, write_disposition = "WRITE_TRUNCATE")
     create_log_entry(glue("Initial upload to {table_name}"))
     return(TRUE)
   }
 
+  # Use df (schema-validated) for MERGE logic
+  df <- df %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
   existing <- existing %>% mutate(pk = paste0(roster_name, "|", as.character(date)))
   df$pk <- as.character(df$pk); existing$pk <- as.character(existing$pk)
   allc <- union(names(existing), names(df))
