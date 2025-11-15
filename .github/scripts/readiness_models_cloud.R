@@ -1158,11 +1158,11 @@ workload_daily_result <- retry_operation(
   operation_name = "workload data load"
 )
 
-if (!workload_daily_result$success) {
+if (!isTRUE(workload_daily_result[["success"]])) {
   create_log_entry("Workload data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-workload_daily <- workload_daily_result$result
+workload_daily <- workload_daily_result[["result"]]
 
 # FIX 2.7: Validate and parse dates
 workload_daily <- validate_dates(workload_daily, "date", "workload")
@@ -1189,11 +1189,11 @@ vald_fd_jumps_result <- retry_operation(
   operation_name = "VALD FD jumps data load"
 )
 
-if (!vald_fd_jumps_result$success) {
+if (!isTRUE(vald_fd_jumps_result[["success"]])) {
   create_log_entry("VALD FD jumps data load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-vald_fd_jumps <- vald_fd_jumps_result$result
+vald_fd_jumps <- vald_fd_jumps_result[["result"]]
 
 # FIX 2.7: Validate and parse dates
 vald_fd_jumps <- validate_dates(vald_fd_jumps, "date", "VALD FD jumps")
@@ -1216,11 +1216,11 @@ roster_mapping_result <- retry_operation(
   operation_name = "roster mapping load"
 )
 
-if (!roster_mapping_result$success) {
+if (!isTRUE(roster_mapping_result[["success"]])) {
   create_log_entry("Roster mapping load failed after retries", "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 }
-roster_mapping <- roster_mapping_result$result
+roster_mapping <- roster_mapping_result[["result"]]
 create_log_entry(glue("Roster mapping loaded: {nrow(roster_mapping)} rows"))
 
 ################################################################################
@@ -1901,7 +1901,25 @@ for (i in seq_len(n_athletes)) {
     
     # Save best model to registry (coefficients saved to BigQuery)
     save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
-      if (is.null(candidate$fitted) || candidate$fitted$type == "error") {
+      # Defensive check: ensure candidate is a list
+      if (!is.list(candidate)) {
+        create_log_entry(
+          sprintf("Cannot save model for %s: candidate is not a list structure", model_name),
+          "ERROR",
+          reason = "invalid_candidate_structure"
+        )
+        return(list(
+          success = FALSE, 
+          model_id = paste(team_name, model_name, sep=":"), 
+          version_id = version_id, 
+          artifact_uri = "bigquery:model_coefficients",
+          model_object = NULL,
+          error = "invalid_candidate_structure"
+        ))
+      }
+      
+      fitted <- candidate[["fitted"]]
+      if (is.null(fitted) || !is.list(fitted) || identical(fitted[["type"]], "error")) {
         create_log_entry(
           sprintf("Cannot save model for %s: model fitting failed or returned error", model_name),
           "ERROR",
@@ -1934,7 +1952,7 @@ for (i in seq_len(n_athletes)) {
             model_id = model_id,
             version_id = version_id,
             artifact_uri = "skipped",
-            model_object = candidate$fitted$model,
+            model_object = candidate[["fitted"]][["model"]],
             skipped = TRUE
           ))
         }
@@ -1943,16 +1961,16 @@ for (i in seq_len(n_athletes)) {
         artifact_uri <- sprintf("bigquery:%s.%s.model_coefficients?model_id=%s", 
                                project, dataset, model_id)
         
-        # Validate numeric values before saving
-        train_rmse_val <- safe_numeric_for_bq(candidate$train_rmse)
-        cv_rmse_val <- safe_numeric_for_bq(candidate$cv_rmse)
-        test_rmse_val <- safe_numeric_for_bq(candidate$test_rmse)
+        # Validate numeric values before saving (using [[ ]] for safer access)
+        train_rmse_val <- safe_numeric_for_bq(candidate[["train_rmse"]])
+        cv_rmse_val <- safe_numeric_for_bq(candidate[["cv_rmse"]])
+        test_rmse_val <- safe_numeric_for_bq(candidate[["test_rmse"]])
         
         # Prepare values and escape strings
         run_id_val <- escape_bq_string(Sys.getenv("GITHUB_RUN_ID", "manual"))
         git_sha_val <- escape_bq_string(Sys.getenv("GITHUB_SHA", "unknown"))
         preds_json <- escape_bq_string(jsonlite::toJSON(preds, auto_unbox=TRUE))
-        hyper_json <- escape_bq_string(jsonlite::toJSON(candidate$hyper, auto_unbox=TRUE))
+        hyper_json <- escape_bq_string(jsonlite::toJSON(candidate[["hyper"]], auto_unbox=TRUE))
         escaped_model_id <- escape_bq_string(model_id)
         escaped_model_name <- escape_bq_string(model_name)
         escaped_version_id <- escape_bq_string(version_id)
@@ -2048,8 +2066,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_models after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_models after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_models: %s", model_id))
           
@@ -2142,21 +2160,21 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_versions after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_versions after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_versions: %s", version_id))
           
-          # Step 3: Save metrics
+          # Step 3: Save metrics (using [[ ]] for safer access)
           metrics <- tibble(
             model_id = model_id, 
             version_id = version_id,
             metric_name = c("train_rmse","cv_rmse","test_rmse","primary_rmse"),
             metric_value = c(
-              if (!is.finite(candidate$train_rmse)) NA_real_ else candidate$train_rmse,
-              if (!is.finite(candidate$cv_rmse)) NA_real_ else candidate$cv_rmse,
-              if (!is.finite(candidate$test_rmse)) NA_real_ else candidate$test_rmse,
-              if (!is.finite(candidate$primary_rmse)) NA_real_ else candidate$primary_rmse
+              if (!is.finite(candidate[["train_rmse"]])) NA_real_ else candidate[["train_rmse"]],
+              if (!is.finite(candidate[["cv_rmse"]])) NA_real_ else candidate[["cv_rmse"]],
+              if (!is.finite(candidate[["test_rmse"]])) NA_real_ else candidate[["test_rmse"]],
+              if (!is.finite(candidate[["primary_rmse"]])) NA_real_ else candidate[["primary_rmse"]]
             ),
             split = c("train","cv","test","primary"), 
             logged_at = Sys.time()
@@ -2184,8 +2202,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to upload metrics after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to upload metrics after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved metrics to registry_metrics"))
           
@@ -2215,8 +2233,8 @@ for (i in seq_len(n_athletes)) {
             exponential_backoff = TRUE
           )
           
-          if (!result$success) {
-            stop(sprintf("Failed to save to registry_stages after retries: %s", result$error))
+          if (!isTRUE(result[["success"]])) {
+            stop(sprintf("Failed to save to registry_stages after retries: %s", result[["error"]]))
           }
           create_log_entry(sprintf("  Saved to registry_stages: Staging"))
           
@@ -2237,7 +2255,7 @@ for (i in seq_len(n_athletes)) {
           model_id=model_id, 
           version_id=version_id, 
           artifact_uri=artifact_uri,
-          model_object=candidate$fitted$model  # Model object for coefficient flattening
+          model_object=candidate[["fitted"]][["model"]]  # Model object for coefficient flattening
         )
       }, error = function(e) {
         # Top-level error handler with full details
@@ -2268,7 +2286,7 @@ for (i in seq_len(n_athletes)) {
         
         # Diagnostic information
         cat("Diagnostic info:\n")
-        cat("  Model type:", candidate$model_type, "\n")
+        cat("  Model type:", candidate[["model_type"]], "\n")
         cat("  Athlete ID:", athlete_id, "\n")
         cat("  Version ID:", version_id, "\n")
         cat("\n")
@@ -2286,22 +2304,22 @@ for (i in seq_len(n_athletes)) {
       })
     }
     
-    model_name <- paste(athlete_id, best_cand$model_type, sep = "_")
+    model_name <- paste(athlete_id, best_cand[["model_type"]], sep = "_")
     save_result <- save_model_to_registry(athlete_id, model_name, best_cand, version_id)
     
     # ============================================
     # FLATTEN AND UPLOAD COEFFICIENTS TO BIGQUERY
     # ============================================
-    if (isTRUE(save_result$success) && !is.null(save_result$model_object)) {
+    if (isTRUE(save_result[["success"]]) && !is.null(save_result[["model_object"]])) {
       
-      create_log_entry(sprintf("  Flattening %s model for athlete %s...", best_cand$model_type, athlete_id))
+      create_log_entry(sprintf("  Flattening %s model for athlete %s...", best_cand[["model_type"]], athlete_id))
       
       # Flatten the model
       coef_df <- flatten_model(
-        model_obj = save_result$model_object,
-        model_id = save_result$model_id,
+        model_obj = save_result[["model_object"]],
+        model_id = save_result[["model_id"]],
         athlete_id = athlete_id,
-        model_type = best_cand$model_type
+        model_type = best_cand[["model_type"]]
       )
       
       # Upload to BigQuery
@@ -2321,56 +2339,57 @@ for (i in seq_len(n_athletes)) {
                     n_total, n_coefs)
           )
           
-          # Store flattening metadata
-          save_result$n_coefficients <- n_total
-          save_result$n_nonzero_coefficients <- n_coefs
-          save_result$flattened <- TRUE
+          # Store flattening metadata (using [[ ]] for safer access)
+          save_result[["n_coefficients"]] <- n_total
+          save_result[["n_nonzero_coefficients"]] <- n_coefs
+          save_result[["flattened"]] <- TRUE
         } else {
           create_log_entry(
-            sprintf("  ⚠ Failed to upload coefficients for model %s", save_result$model_id),
+            sprintf("  ⚠ Failed to upload coefficients for model %s", save_result[["model_id"]]),
             "WARN"
           )
-          save_result$n_coefficients <- NA_integer_
-          save_result$n_nonzero_coefficients <- NA_integer_
-          save_result$flattened <- FALSE
+          save_result[["n_coefficients"]] <- NA_integer_
+          save_result[["n_nonzero_coefficients"]] <- NA_integer_
+          save_result[["flattened"]] <- FALSE
         }
       } else {
         create_log_entry(
-          sprintf("  ⚠ No coefficients extracted for model %s", save_result$model_id),
+          sprintf("  ⚠ No coefficients extracted for model %s", save_result[["model_id"]]),
           "WARN"
         )
-        save_result$n_coefficients <- NA_integer_
-        save_result$n_nonzero_coefficients <- NA_integer_
-        save_result$flattened <- FALSE
+        save_result[["n_coefficients"]] <- NA_integer_
+        save_result[["n_nonzero_coefficients"]] <- NA_integer_
+        save_result[["flattened"]] <- FALSE
       }
     } else {
       # Model save failed or no model object
-      save_result$n_coefficients <- NA_integer_
-      save_result$n_nonzero_coefficients <- NA_integer_
-      save_result$flattened <- FALSE
+      save_result[["n_coefficients"]] <- NA_integer_
+      save_result[["n_nonzero_coefficients"]] <- NA_integer_
+      save_result[["flattened"]] <- FALSE
     }
     # ============================================
     
-    if (isTRUE(save_result$success) || is.na(save_result$success)) {
-      create_log_entry(glue("  SUCCESS: {best_cand$model_type} (RMSE={round(best_cand$primary_rmse, 3)})"))
+    if (isTRUE(save_result[["success"]]) || is.na(save_result[["success"]])) {
+      create_log_entry(glue("  SUCCESS: {best_cand[['model_type']]} (RMSE={round(best_cand[['primary_rmse']], 3)})"))
       success_count <- success_count + 1
       
       # Generate predictions
       all_data <- rbind(ath_train_df, ath_test_df)
       if (nrow(all_data) > 0) {
         preds_model <- tryCatch({
-          if (best_cand$fitted$type == "lm") {
-            predict(best_cand$fitted$model, all_data)
-          } else if (best_cand$fitted$type == "glmnet") {
-            if (isTRUE(best_cand$fitted$preprocessing$normalization)) {
-              X_scaled <- safe_scale_apply(all_data, best_cand$fitted$preprocessing)
-              as.numeric(predict(best_cand$fitted$model, X_scaled, s="lambda.min"))
+          fitted_type <- best_cand[["fitted"]][["type"]]
+          if (identical(fitted_type, "lm")) {
+            predict(best_cand[["fitted"]][["model"]], all_data)
+          } else if (identical(fitted_type, "glmnet")) {
+            if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
+              X_scaled <- safe_scale_apply(all_data, best_cand[["fitted"]][["preprocessing"]])
+              as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
             } else {
               X <- as.matrix(all_data[, preds, drop=FALSE])
-              as.numeric(predict(best_cand$fitted$model, X, s="lambda.min"))
+              as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
             }
-          } else if (best_cand$fitted$type == "bnlearn") {
-            as.numeric(predict(best_cand$fitted$model, node = response_var, data = all_data[, preds, drop=FALSE]))
+          } else if (identical(fitted_type, "bnlearn")) {
+            as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = all_data[, preds, drop=FALSE]))
           } else {
             rep(NA_real_, nrow(all_data))
           }
@@ -2387,8 +2406,8 @@ for (i in seq_len(n_athletes)) {
         pred_df <- pred_meta %>%
           mutate(
             predicted_readiness = preds_model,
-            model_id = save_result$model_id %||% NA_character_,
-            version_id = save_result$version_id %||% NA_character_,
+            model_id = save_result[["model_id"]] %||% NA_character_,
+            version_id = save_result[["version_id"]] %||% NA_character_,
             prediction_date = Sys.time()
           )
         all_predictions[[length(all_predictions) + 1]] <- pred_df
@@ -2398,22 +2417,22 @@ for (i in seq_len(n_athletes)) {
       all_results[[length(all_results) + 1]] <- tibble(
         athlete_id = athlete_id,
         roster_name = NA_character_,
-        model_type = best_cand$model_type,
-        model_id = save_result$model_id %||% NA_character_,
-        version_id = save_result$version_id %||% NA_character_,
-        artifact_uri = save_result$artifact_uri %||% NA_character_,
-        train_rmse = best_cand$train_rmse,
-        cv_rmse = best_cand$cv_rmse,
-        test_rmse = best_cand$test_rmse,
-        primary_rmse = best_cand$primary_rmse,
+        model_type = best_cand[["model_type"]],
+        model_id = save_result[["model_id"]] %||% NA_character_,
+        version_id = save_result[["version_id"]] %||% NA_character_,
+        artifact_uri = save_result[["artifact_uri"]] %||% NA_character_,
+        train_rmse = best_cand[["train_rmse"]],
+        cv_rmse = best_cand[["cv_rmse"]],
+        test_rmse = best_cand[["test_rmse"]],
+        primary_rmse = best_cand[["primary_rmse"]],
         n_train = n_tr,
         n_test = n_te,
         n_predictors = length(preds),
         validation_method = val_method,
-        hyperparameters = best_cand$hyper,
-        flattened = save_result$flattened %||% FALSE,
-        n_coefficients = save_result$n_coefficients %||% NA_integer_,
-        n_nonzero_coefficients = save_result$n_nonzero_coefficients %||% NA_integer_,
+        hyperparameters = best_cand[["hyper"]],
+        flattened = save_result[["flattened"]] %||% FALSE,
+        n_coefficients = save_result[["n_coefficients"]] %||% NA_integer_,
+        n_nonzero_coefficients = save_result[["n_nonzero_coefficients"]] %||% NA_integer_,
         trained_at = Sys.time()
       )
     } else {
