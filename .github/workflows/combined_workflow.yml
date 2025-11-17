@@ -252,7 +252,10 @@ jobs:
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
           echo "Checking readiness table exists (in readiness project)…"
+          # Temporarily use readiness project credentials
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          unset GOOGLE_APPLICATION_CREDENTIALS
 
           echo "Checking roster table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
