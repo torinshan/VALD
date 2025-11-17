@@ -236,9 +236,13 @@ jobs:
 
           if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
                show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
-            echo "❌ Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
-            echo "   Please ensure the table exists in the source project."
-            exit 1
+            echo "⚠️  Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
+            echo "   This table is populated by the saturday_makeup workflow."
+            echo "   Sync will be skipped - using existing local copy if available."
+            echo ""
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            echo "sync_action=skipped_no_source" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # Get source table metadata
@@ -388,12 +392,19 @@ jobs:
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
           echo "Checking readiness table exists (local copy in ML project)…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+            echo "❌ Readiness table not found in ML project"
+            echo "   The source table in ${GCP_PROJECT_READINESS} doesn't exist, so sync was skipped."
+            echo "   Please run the saturday_makeup workflow first to populate readiness data."
+            echo ""
+            echo "   Alternatively, manually create the table or restore from backup."
+            exit 1
+          fi
 
           echo "Checking roster table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
 
-          echo "Preflight OK"
+          echo "✅ Preflight OK - all required tables present"
 
       - name: Validate roster mapping table
         shell: bash
