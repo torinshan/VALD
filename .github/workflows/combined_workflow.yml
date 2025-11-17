@@ -182,95 +182,10 @@ jobs:
     outputs:
       status: ${{ steps.roster_check.outputs.status }}
 
-  ingest-readiness:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Auth to Google Cloud (ML Project - for writes)
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY_ML }}
-          create_credentials_file: true
-          export_environment_variables: true
-
-      - uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT_ML }}
-
-      - uses: r-lib/actions/setup-r@v2
-        with:
-          use-public-rspm: true
-
-      - name: Install R dependencies (VALD ingest)
-        uses: r-lib/actions/setup-r-dependencies@v2
-        with:
-          cache-version: 1
-          extra-packages: |
-            any::bigrquery
-            any::DBI
-            any::dplyr
-            any::tidyr
-            any::readr
-            any::stringr
-            any::purrr
-            any::tibble
-            any::data.table
-            any::hms
-            any::lubridate
-            any::httr
-            any::jsonlite
-            any::xml2
-            any::curl
-            any::valdr
-            any::gargle
-            any::rlang
-            any::lifecycle
-            any::glue
-            any::slider
-            any::R.utils
-
-      - name: System libs
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libcurl4-openssl-dev libssl-dev libxml2-dev \
-            libfontconfig1-dev libfreetype6-dev libpng-dev \
-            libtiff5-dev libjpeg-dev zlib1g-dev \
-            libharfbuzz-dev libfribidi-dev \
-            libsecret-1-dev libsecret-1-0
-
-      - name: Verify run.R script exists
-        run: test -f .github/scripts/run.R
-
-      - name: Ingest VALD readiness data (vald_fd_jumps)
-        env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT_ML }}
-          BQ_DATASET: ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
-          BIGRQUERY_USE_BQ_STORAGE: 'false'
-          VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
-          VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
-          VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-          VALD_REGION: use
-        run: |
-          set -e
-          Rscript .github/scripts/run.R
-
-      - name: Check readiness ingest success
-        id: readiness_check
-        run: |
-          echo "✅ Readiness ingest completed successfully"
-          echo "status=success" >> "$GITHUB_OUTPUT"
-
-    outputs:
-      status: ${{ steps.readiness_check.outputs.status }}
-
   check-readiness:
     runs-on: ubuntu-latest
-    needs: [ingest, ingest-roster, ingest-readiness]
-    if: needs.ingest.outputs.status == 'success' && needs['ingest-roster'].outputs.status == 'success' && needs['ingest-readiness'].outputs.status == 'success'
+    needs: [ingest, ingest-roster]
+    if: needs.ingest.outputs.status == 'success' && needs['ingest-roster'].outputs.status == 'success'
 
     steps:
       - uses: actions/checkout@v4
@@ -286,6 +201,12 @@ jobs:
         with:
           project_id: ${{ env.GCP_PROJECT_ML }}
 
+      - name: Auth to Readiness Project (for reading VALD data)
+        run: |
+          echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
+
       - name: Ensure jq + envsubst present
         run: |
           if ! command -v jq >/dev/null 2>&1; then
@@ -293,6 +214,146 @@ jobs:
           fi
           if ! command -v envsubst >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y gettext-base
+          fi
+
+      - name: Sync readiness table from sac-vald-hub to sac-ml-models
+        id: sync_readiness
+        shell: bash
+        env:
+          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+        run: |
+          set -euo pipefail
+
+          echo "🔄 Syncing readiness table from source to ML project..."
+          echo "  Source:      ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
+          echo "  Destination: ${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}"
+          echo ""
+
+          # Check if source table exists in sac-vald-hub
+          echo "📋 Checking source table in ${GCP_PROJECT_READINESS}..."
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+
+          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+               show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+            echo "⚠️  Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
+            echo "   This table is populated by the saturday_makeup workflow."
+            echo "   Sync will be skipped - using existing local copy if available."
+            echo ""
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            echo "sync_action=skipped_no_source" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get source table metadata
+          SOURCE_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+                          show --format=json "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}")
+          SOURCE_NUM_ROWS=$(echo "$SOURCE_INFO" | jq -r '.numRows // "0"')
+          SOURCE_SCHEMA_FIELDS=$(echo "$SOURCE_INFO" | jq -r '.schema.fields | length')
+
+          # Get most recent date from source table
+          SOURCE_MAX_DATE=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+                              query --use_legacy_sql=false --format=csv \
+                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}\`" \
+                              2>/dev/null | tail -n1)
+
+          echo "  Source stats:"
+          echo "    Rows: $SOURCE_NUM_ROWS"
+          echo "    Columns: $SOURCE_SCHEMA_FIELDS"
+          echo "    Latest date: ${SOURCE_MAX_DATE:-none}"
+          echo ""
+
+          # Switch back to ML project credentials
+          unset GOOGLE_APPLICATION_CREDENTIALS
+
+          # Check if destination table exists in sac-ml-models
+          echo "📋 Checking destination table in ${GCP_PROJECT_ML}..."
+
+          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+               show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+
+            # Destination table exists - check if sync is needed
+            DEST_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                          show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
+            DEST_NUM_ROWS=$(echo "$DEST_INFO" | jq -r '.numRows // "0"')
+            DEST_SCHEMA_FIELDS=$(echo "$DEST_INFO" | jq -r '.schema.fields | length')
+
+            # Get most recent date from destination table
+            DEST_MAX_DATE=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                              query --use_legacy_sql=false --format=csv \
+                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}\`" \
+                              2>/dev/null | tail -n1)
+
+            echo "  Destination stats:"
+            echo "    Rows: $DEST_NUM_ROWS"
+            echo "    Columns: $DEST_SCHEMA_FIELDS"
+            echo "    Latest date: ${DEST_MAX_DATE:-none}"
+            echo ""
+
+            # Compare metadata
+            if [ "$SOURCE_MAX_DATE" = "$DEST_MAX_DATE" ] && [ "$SOURCE_SCHEMA_FIELDS" = "$DEST_SCHEMA_FIELDS" ]; then
+              echo "✅ Tables are in sync (same latest date and column count)"
+              echo "   Keeping existing copy in ${GCP_PROJECT_ML}"
+              echo "sync_action=skipped" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "⚠️  Tables are out of sync:"
+              if [ "$SOURCE_MAX_DATE" != "$DEST_MAX_DATE" ]; then
+                echo "   Latest dates differ: source=$SOURCE_MAX_DATE vs dest=$DEST_MAX_DATE"
+              fi
+              if [ "$SOURCE_SCHEMA_FIELDS" != "$DEST_SCHEMA_FIELDS" ]; then
+                echo "   Column counts differ: source=$SOURCE_SCHEMA_FIELDS vs dest=$DEST_SCHEMA_FIELDS"
+              fi
+              echo "   → Will update destination table"
+              echo ""
+
+              # Delete old table
+              echo "🗑️  Deleting outdated table in ${GCP_PROJECT_ML}..."
+              bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                rm -f -t "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}"
+            fi
+          else
+            echo "ℹ️  Destination table does not exist"
+            echo "   → Will create new copy"
+            echo ""
+          fi
+
+          # Copy table from source to destination
+          echo "📦 Copying table from ${GCP_PROJECT_READINESS} to ${GCP_PROJECT_ML}..."
+
+          # Use a query-based copy to ensure cross-project compatibility
+          COPY_QUERY="CREATE OR REPLACE TABLE \`${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}\` AS
+          SELECT * FROM \`${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}\`"
+
+          # Execute with readiness credentials to read source
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+
+          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+               query --use_legacy_sql=false "$COPY_QUERY" 2>&1; then
+
+            unset GOOGLE_APPLICATION_CREDENTIALS
+
+            # Verify the copy
+            COPIED_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                            show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
+            COPIED_ROWS=$(echo "$COPIED_INFO" | jq -r '.numRows // "0"')
+
+            echo ""
+            echo "✅ Table copied successfully!"
+            echo "   Rows copied: $COPIED_ROWS"
+            echo "sync_action=updated" >> "$GITHUB_OUTPUT"
+          else
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            echo ""
+            echo "❌ Failed to copy table"
+            echo "   Check that:"
+            echo "   1. GCP_SA_KEY_READINESS has read access to ${GCP_PROJECT_READINESS}"
+            echo "   2. GCP_SA_KEY_ML has write access to ${GCP_PROJECT_ML}"
+            echo "   3. Cross-project queries are allowed"
+            exit 1
           fi
 
       - name: Preflight validation
@@ -310,15 +371,17 @@ jobs:
           set -euo pipefail
 
           echo "=== Environment Configuration ==="
-          echo "  GCP_PROJECT_ML=$GCP_PROJECT_ML (workload, readiness & models)"
+          echo "  GCP_PROJECT_ML=$GCP_PROJECT_ML (workload & models)"
+          echo "  GCP_PROJECT_READINESS=$GCP_PROJECT_READINESS (VALD readiness data - source)"
           echo "  BQ_DATASET=$BQ_DATASET"
           echo "  BQ_LOCATION=$BQ_LOCATION"
           echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
-          echo "  READINESS_TABLE=$READINESS_TABLE (ingested directly to ML project)"
+          echo "  READINESS_TABLE=$READINESS_TABLE (now local copy in ML project)"
           echo "  ROSTER_TABLE=$ROSTER_TABLE"
           echo ""
 
           : "${GCP_PROJECT_ML:?GCP_PROJECT_ML is required}"
+          : "${GCP_PROJECT_READINESS:?GCP_PROJECT_READINESS is required}"
           : "${BQ_DATASET:?BQ_DATASET is required}"
           : "${BQ_LOCATION:?BQ_LOCATION is required}"
           : "${WORKLOAD_TABLE:?WORKLOAD_TABLE is required}"
@@ -331,18 +394,13 @@ jobs:
           echo "Checking workload table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
-          echo "Checking readiness table exists (in ML project)…"
-          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
-            echo "❌ Readiness table not found in ML project"
-            echo "   The ingest-readiness job should have created this table."
-            echo "   Please check the ingest-readiness job logs for errors."
-            exit 1
-          fi
+          echo "Checking readiness table exists (local copy in ML project)…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
 
           echo "Checking roster table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
 
-          echo "✅ Preflight OK - all required tables present"
+          echo "Preflight OK"
 
       - name: Validate roster mapping table
         shell: bash
@@ -577,6 +635,11 @@ jobs:
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
+
     outputs:
       has_matches:   ${{ steps.check.outputs.has_matches }}
       match_count:   ${{ steps.check.outputs.match_count }}
@@ -604,6 +667,12 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT_ML }}
+
+      - name: Auth to Readiness Project (for reading VALD data)
+        run: |
+          echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -758,6 +827,11 @@ jobs:
             Q2="$(envsubst <<<"$Q2")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
           fi
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
 
   summary:
     runs-on: ubuntu-latest
