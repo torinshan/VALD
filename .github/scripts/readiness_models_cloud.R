@@ -20,7 +20,10 @@ Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 ################################################################################
 # FIX 4.2: CONFIGURATION CONSTANTS (extracted magic numbers)
 ################################################################################
-project    <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
+# Dual-project configuration
+project    <- Sys.getenv("GCP_PROJECT", "my-ml-prod-1234")  # ML/Workload project (writes)
+project_readiness <- Sys.getenv("GCP_PROJECT_READINESS", "sac-vald-hub")  # Readiness project (reads)
+
 dataset    <- Sys.getenv("BQ_DATASET",  "analytics")
 location   <- Sys.getenv("BQ_LOCATION", "US")
 team_name  <- Sys.getenv("TEAM_NAME",   "sacstate-football")
@@ -966,7 +969,7 @@ if (!nzchar(has_matches_hint)) {
             0
           )
         ) AS readiness
-      FROM `{project}.{dataset}.{readiness_table}`
+      FROM `{project_readiness}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
@@ -1170,8 +1173,8 @@ workload_daily <- workload_daily_result[["result"]]
 workload_daily <- validate_dates(workload_daily, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_daily)} rows"))
 
-# Load vald_fd_jumps from BigQuery
-create_log_entry("Loading VALD FD jumps data from BigQuery")
+# Load vald_fd_jumps from BigQuery (from readiness project)
+create_log_entry("Loading VALD FD jumps data from BigQuery (readiness project)")
 vald_fd_jumps_result <- retry_operation(
   {
     sql <- glue("
@@ -1181,10 +1184,10 @@ vald_fd_jumps_result <- retry_operation(
         jump_height_readiness,
         epf_readiness,
         rsi_readiness
-      FROM `{project}.{dataset}.{readiness_table}`
+      FROM `{project_readiness}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
-    bq_table_download(bq_project_query(project, sql))
+    bq_table_download(bq_project_query(project_readiness, sql))
   },
   max_attempts = MAX_RETRY_ATTEMPTS,
   wait_seconds = RETRY_WAIT_SECONDS,

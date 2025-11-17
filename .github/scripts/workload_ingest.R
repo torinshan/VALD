@@ -17,7 +17,7 @@ options(bigrquery.use_bqstorage = FALSE)
 Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 
 # ===== Config =====
-project     <- Sys.getenv("GCP_PROJECT", "sac-vald-hub")
+project     <- Sys.getenv("GCP_PROJECT", "my-ml-prod-1234")
 dataset     <- Sys.getenv("BQ_DATASET",  "analytics")
 location    <- Sys.getenv("BQ_LOCATION","US")
 table_out   <- Sys.getenv("BQ_TABLE",    "workload_daily")
