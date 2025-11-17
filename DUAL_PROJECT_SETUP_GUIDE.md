@@ -176,6 +176,26 @@ The new project (`sac-ml-models`) may be on BigQuery's free tier, which has limi
 
 ## Troubleshooting
 
+### Error: "Source table not found" or "Readiness table doesn't exist"
+This is **expected behavior** when the workflow runs before the `saturday_makeup` workflow has populated the readiness data:
+
+**What happens:**
+1. The sync step checks if source table exists in `sac-vald-hub`
+2. If not found, sync is skipped with message: "Source table doesn't exist yet and no local copy available"
+3. The workflow continues successfully, but training is skipped with reason: `no_readiness_table`
+
+**This is OK when:**
+- Running the workflow for the first time
+- The `saturday_makeup` workflow hasn't run yet this week
+- VALD data hasn't been uploaded yet
+
+**How to resolve:**
+- Wait for the `saturday_makeup` workflow to run and populate the table
+- Or manually upload VALD data to `sac-vald-hub.analytics.vald_fd_jumps`
+- Once available, the next workflow run will sync the data
+
+**Note:** If a local copy of the readiness table already exists in `sac-ml-models`, the workflow will use that copy even if the source is unavailable.
+
 ### Error: "Access Denied"
 - Verify service account has required roles
 - Check that both secrets are properly set in GitHub
