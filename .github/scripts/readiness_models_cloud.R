@@ -969,7 +969,7 @@ if (!nzchar(has_matches_hint)) {
             0
           )
         ) AS readiness
-      FROM `{project_readiness}.{dataset}.{readiness_table}`
+      FROM `{project}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
@@ -1184,10 +1184,10 @@ vald_fd_jumps_result <- retry_operation(
         jump_height_readiness,
         epf_readiness,
         rsi_readiness
-      FROM `{project_readiness}.{dataset}.{readiness_table}`
+      FROM `{project}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
-    bq_table_download(bq_project_query(project_readiness, sql))
+    bq_table_download(bq_project_query(project, sql))
   },
   max_attempts = MAX_RETRY_ATTEMPTS,
   wait_seconds = RETRY_WAIT_SECONDS,
