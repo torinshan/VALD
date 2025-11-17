@@ -35,6 +35,9 @@ env:
 
   TEAM_NAME: sacstate-football
 
+permissions:
+  contents: read
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
