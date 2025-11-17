@@ -1,6 +1,6 @@
 # Dual BigQuery Project Setup Guide
 
-This repository now supports reading readiness data from one BigQuery project (`sac-vald-hub`) while writing workload and model data to another project (`my-ml-prod-1234`).
+This repository now supports reading readiness data from one BigQuery project (`sac-vald-hub`) while writing workload and model data to another project (`sac-ml-models`).
 
 ## Overview
 
@@ -13,7 +13,7 @@ This repository now supports reading readiness data from one BigQuery project (`
 └─────────────────────────────────────┘
 
 ┌─────────────────────────────────────┐
-│  my-ml-prod-1234 (New ML Project)   │
+│  sac-ml-models (New ML Project)   │
 │  - workload_daily                   │
 │  - roster_mapping                   │  ◄──── WRITE DATA
 │  - readiness_predictions_byname     │
@@ -27,8 +27,8 @@ This repository now supports reading readiness data from one BigQuery project (`
 You need to add two secrets to your GitHub repository:
 
 ### 1. `GCP_SA_KEY_ML`
-Service account JSON key for the **new ML project** (`my-ml-prod-1234`):
-- **Service Account**: `gh-actions-bq@my-ml-prod-1234.iam.gserviceaccount.com`
+Service account JSON key for the **new ML project** (`sac-ml-models`):
+- **Service Account**: `gh-actions-bq@sac-ml-models.iam.gserviceaccount.com`
 - **Required Roles**:
   - `roles/bigquery.jobUser` (to run queries)
   - `roles/bigquery.dataEditor` (to write data)
@@ -47,7 +47,7 @@ Service account JSON key for the **original readiness project** (`sac-vald-hub`)
 2. Click **Settings** → **Secrets and variables** → **Actions**
 3. Click **New repository secret**
 4. Add both secrets:
-   - Name: `GCP_SA_KEY_ML`, Value: (paste the JSON content for my-ml-prod-1234)
+   - Name: `GCP_SA_KEY_ML`, Value: (paste the JSON content for sac-ml-models)
    - Name: `GCP_SA_KEY_READINESS`, Value: (paste the JSON content for sac-vald-hub)
 
 ## Configuration Details
@@ -57,7 +57,7 @@ Service account JSON key for the **original readiness project** (`sac-vald-hub`)
 ```yaml
 env:
   # Workload & Model Project (new - destination for writes)
-  GCP_PROJECT_ML: my-ml-prod-1234
+  GCP_PROJECT_ML: sac-ml-models
   BQ_DATASET: analytics
   BQ_LOCATION: US
 
@@ -96,19 +96,19 @@ SELECT * FROM `sac-vald-hub.analytics.vald_fd_jumps`
 ### Writes to ML Project
 ```sql
 -- workload_daily, roster_mapping, predictions, etc.
-SELECT * FROM `my-ml-prod-1234.analytics.workload_daily`
+SELECT * FROM `sac-ml-models.analytics.workload_daily`
 ```
 
 ### Cross-Project Joins
 ```sql
 WITH workload AS (
-  SELECT * FROM `my-ml-prod-1234.analytics.workload_daily`
+  SELECT * FROM `sac-ml-models.analytics.workload_daily`
 ),
 readiness AS (
   SELECT * FROM `sac-vald-hub.analytics.vald_fd_jumps`
 ),
 roster AS (
-  SELECT * FROM `my-ml-prod-1234.analytics.roster_mapping`
+  SELECT * FROM `sac-ml-models.analytics.roster_mapping`
 )
 SELECT ... FROM workload JOIN readiness JOIN roster
 ```
@@ -122,13 +122,13 @@ SELECT ... FROM workload JOIN readiness JOIN roster
 - Updated all BigQuery SQL queries with proper project prefixes
 
 ### 2. `workload_ingest.R`
-- Default project changed from `sac-vald-hub` to `my-ml-prod-1234`
+- Default project changed from `sac-vald-hub` to `sac-ml-models`
 - Writes workload data to the new ML project
 
 ### 3. `readiness_models_cloud.R`
 - Added `project_readiness` variable for the original project
 - Reads readiness data from `sac-vald-hub`
-- Writes models and predictions to `my-ml-prod-1234`
+- Writes models and predictions to `sac-ml-models`
 - Cross-project queries properly reference both projects
 
 ## Verification Steps
@@ -150,7 +150,7 @@ After adding the secrets, verify the setup works:
 3. **Verify data in BigQuery**:
    ```bash
    # Check ML project tables
-   bq ls my-ml-prod-1234:analytics
+   bq ls sac-ml-models:analytics
    
    # Check readiness project tables  
    bq ls sac-vald-hub:analytics
@@ -159,7 +159,7 @@ After adding the secrets, verify the setup works:
 ## Important Notes
 
 ### DML Limitations
-The new project (`my-ml-prod-1234`) may be on BigQuery's free tier, which has limitations:
+The new project (`sac-ml-models`) may be on BigQuery's free tier, which has limitations:
 - **No MERGE/UPDATE/DELETE support** - Only INSERT/TRUNCATE
 - The workflow already handles this with `SKIP_REGISTRY_STAGES: 'true'`
 - R scripts use TRUNCATE instead of MERGE when appropriate
@@ -190,7 +190,7 @@ The new project (`my-ml-prod-1234`) may be on BigQuery's free tier, which has li
 
 ### Query Fails with "Permission Denied"
 - The ML project service account needs access to read from the readiness project
-- Add `gh-actions-bq@my-ml-prod-1234.iam.gserviceaccount.com` as a viewer on the readiness project dataset
+- Add `gh-actions-bq@sac-ml-models.iam.gserviceaccount.com` as a viewer on the readiness project dataset
 
 ## Support
 

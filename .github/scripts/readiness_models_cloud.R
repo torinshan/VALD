@@ -21,7 +21,7 @@ Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 # FIX 4.2: CONFIGURATION CONSTANTS (extracted magic numbers)
 ################################################################################
 # Dual-project configuration
-project    <- Sys.getenv("GCP_PROJECT", "my-ml-prod-1234")  # ML/Workload project (writes)
+project    <- Sys.getenv("GCP_PROJECT", "sac-ml-models")  # ML/Workload project (writes)
 project_readiness <- Sys.getenv("GCP_PROJECT_READINESS", "sac-vald-hub")  # Readiness project (reads)
 
 dataset    <- Sys.getenv("BQ_DATASET",  "analytics")

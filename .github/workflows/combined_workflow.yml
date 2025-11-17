@@ -21,7 +21,7 @@ on:
 
 env:
   # Workload & Model Project (new - destination for writes)
-  GCP_PROJECT_ML: my-ml-prod-1234
+  GCP_PROJECT_ML: sac-ml-models
   BQ_DATASET: analytics
   BQ_LOCATION: US
 
@@ -493,6 +493,11 @@ jobs:
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
+
     outputs:
       has_matches:   ${{ steps.check.outputs.has_matches }}
       match_count:   ${{ steps.check.outputs.match_count }}
@@ -680,6 +685,11 @@ jobs:
             Q2="$(envsubst <<<"$Q2")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
           fi
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
 
   summary:
     runs-on: ubuntu-latest
