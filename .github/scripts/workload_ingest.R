@@ -299,6 +299,7 @@ read_bq_table_rest <- function(tbl) {
         if (f$type == "DATE") return(as.Date(v))
         if (f$type == "TIMESTAMP") return(as.POSIXct(as.numeric(as.character(v)), origin="1970-01-01", tz="UTC"))
         if (f$type == "TIME") return(hms::as_hms(v))
+        if (f$type %in% c("BOOLEAN", "BOOL")) return(as.logical(v))
         as.character(v)
       })
       names(vals) <- vapply(fields, function(f) f$name, character(1))
