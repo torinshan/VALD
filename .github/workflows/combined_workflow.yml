@@ -35,6 +35,9 @@ env:
 
   TEAM_NAME: sacstate-football
 
+permissions:
+  contents: read
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
@@ -236,9 +239,13 @@ jobs:
 
           if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
                show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
-            echo "❌ Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
-            echo "   Please ensure the table exists in the source project."
-            exit 1
+            echo "⚠️  Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
+            echo "   This table is populated by the saturday_makeup workflow."
+            echo "   Sync will be skipped - using existing local copy if available."
+            echo ""
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            echo "sync_action=skipped_no_source" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # Get source table metadata
