@@ -213,6 +213,142 @@ jobs:
             sudo apt-get update && sudo apt-get install -y gettext-base
           fi
 
+      - name: Sync readiness table from sac-vald-hub to sac-ml-models
+        id: sync_readiness
+        shell: bash
+        env:
+          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
+        run: |
+          set -euo pipefail
+          
+          echo "🔄 Syncing readiness table from source to ML project..."
+          echo "  Source:      ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
+          echo "  Destination: ${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}"
+          echo ""
+          
+          # Check if source table exists in sac-vald-hub
+          echo "📋 Checking source table in ${GCP_PROJECT_READINESS}..."
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+          
+          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+               show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+            echo "❌ Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
+            echo "   Please ensure the table exists in the source project."
+            exit 1
+          fi
+          
+          # Get source table metadata
+          SOURCE_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+                          show --format=json "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}")
+          SOURCE_NUM_ROWS=$(echo "$SOURCE_INFO" | jq -r '.numRows // "0"')
+          SOURCE_SCHEMA_FIELDS=$(echo "$SOURCE_INFO" | jq -r '.schema.fields | length')
+          
+          # Get most recent date from source table
+          SOURCE_MAX_DATE=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" \
+                              query --use_legacy_sql=false --format=csv \
+                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}\`" \
+                              2>/dev/null | tail -n1)
+          
+          echo "  Source stats:"
+          echo "    Rows: $SOURCE_NUM_ROWS"
+          echo "    Columns: $SOURCE_SCHEMA_FIELDS"
+          echo "    Latest date: ${SOURCE_MAX_DATE:-none}"
+          echo ""
+          
+          # Switch back to ML project credentials
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          
+          # Check if destination table exists in sac-ml-models
+          echo "📋 Checking destination table in ${GCP_PROJECT_ML}..."
+          
+          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+               show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+            
+            # Destination table exists - check if sync is needed
+            DEST_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                          show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
+            DEST_NUM_ROWS=$(echo "$DEST_INFO" | jq -r '.numRows // "0"')
+            DEST_SCHEMA_FIELDS=$(echo "$DEST_INFO" | jq -r '.schema.fields | length')
+            
+            # Get most recent date from destination table
+            DEST_MAX_DATE=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                              query --use_legacy_sql=false --format=csv \
+                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}\`" \
+                              2>/dev/null | tail -n1)
+            
+            echo "  Destination stats:"
+            echo "    Rows: $DEST_NUM_ROWS"
+            echo "    Columns: $DEST_SCHEMA_FIELDS"
+            echo "    Latest date: ${DEST_MAX_DATE:-none}"
+            echo ""
+            
+            # Compare metadata
+            if [ "$SOURCE_MAX_DATE" = "$DEST_MAX_DATE" ] && [ "$SOURCE_SCHEMA_FIELDS" = "$DEST_SCHEMA_FIELDS" ]; then
+              echo "✅ Tables are in sync (same latest date and column count)"
+              echo "   Keeping existing copy in ${GCP_PROJECT_ML}"
+              echo "sync_action=skipped" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "⚠️  Tables are out of sync:"
+              if [ "$SOURCE_MAX_DATE" != "$DEST_MAX_DATE" ]; then
+                echo "   Latest dates differ: source=$SOURCE_MAX_DATE vs dest=$DEST_MAX_DATE"
+              fi
+              if [ "$SOURCE_SCHEMA_FIELDS" != "$DEST_SCHEMA_FIELDS" ]; then
+                echo "   Column counts differ: source=$SOURCE_SCHEMA_FIELDS vs dest=$DEST_SCHEMA_FIELDS"
+              fi
+              echo "   → Will update destination table"
+              echo ""
+              
+              # Delete old table
+              echo "🗑️  Deleting outdated table in ${GCP_PROJECT_ML}..."
+              bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                rm -f -t "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}"
+            fi
+          else
+            echo "ℹ️  Destination table does not exist"
+            echo "   → Will create new copy"
+            echo ""
+          fi
+          
+          # Copy table from source to destination
+          echo "📦 Copying table from ${GCP_PROJECT_READINESS} to ${GCP_PROJECT_ML}..."
+          
+          # Use a query-based copy to ensure cross-project compatibility
+          COPY_QUERY="CREATE OR REPLACE TABLE \`${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}\` AS
+          SELECT * FROM \`${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}\`"
+          
+          # Execute with readiness credentials to read source
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+          
+          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+               query --use_legacy_sql=false "$COPY_QUERY" 2>&1; then
+            
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            
+            # Verify the copy
+            COPIED_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
+                            show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
+            COPIED_ROWS=$(echo "$COPIED_INFO" | jq -r '.numRows // "0"')
+            
+            echo ""
+            echo "✅ Table copied successfully!"
+            echo "   Rows copied: $COPIED_ROWS"
+            echo "sync_action=updated" >> "$GITHUB_OUTPUT"
+          else
+            unset GOOGLE_APPLICATION_CREDENTIALS
+            echo ""
+            echo "❌ Failed to copy table"
+            echo "   Check that:"
+            echo "   1. GCP_SA_KEY_READINESS has read access to ${GCP_PROJECT_READINESS}"
+            echo "   2. GCP_SA_KEY_ML has write access to ${GCP_PROJECT_ML}"
+            echo "   3. Cross-project queries are allowed"
+            exit 1
+          fi
+
       - name: Preflight validation
         id: preflight
         shell: bash
@@ -229,11 +365,11 @@ jobs:
 
           echo "=== Environment Configuration ==="
           echo "  GCP_PROJECT_ML=$GCP_PROJECT_ML (workload & models)"
-          echo "  GCP_PROJECT_READINESS=$GCP_PROJECT_READINESS (VALD readiness data)"
+          echo "  GCP_PROJECT_READINESS=$GCP_PROJECT_READINESS (VALD readiness data - source)"
           echo "  BQ_DATASET=$BQ_DATASET"
           echo "  BQ_LOCATION=$BQ_LOCATION"
           echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
-          echo "  READINESS_TABLE=$READINESS_TABLE"
+          echo "  READINESS_TABLE=$READINESS_TABLE (now local copy in ML project)"
           echo "  ROSTER_TABLE=$ROSTER_TABLE"
           echo ""
 
@@ -251,11 +387,8 @@ jobs:
           echo "Checking workload table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
-          echo "Checking readiness table exists (in readiness project)…"
-          # Temporarily use readiness project credentials
-          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
-          unset GOOGLE_APPLICATION_CREDENTIALS
+          echo "Checking readiness table exists (local copy in ML project)…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
 
           echo "Checking roster table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
@@ -302,14 +435,14 @@ jobs:
         shell: bash
         env:
           GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
-          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET: ${{ env.BQ_DATASET }}
           ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
+          READINESS_TABLE: ${{ env.READINESS_TABLE }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
         run: |
           set -euo pipefail
 
-          echo "Building MATCH_QUERY (with identifiers)..."
+          echo "Building MATCH_QUERY (using local copy of readiness data)..."
 
           MATCH_QUERY=$(cat <<SQL
           SELECT
@@ -317,7 +450,7 @@ jobs:
             r.vald_name    AS vald_name,
             v.full_name    AS vald_full_name
           FROM \`$GCP_PROJECT_ML.$BQ_DATASET.$ROSTER_TABLE\` AS r
-          JOIN \`$GCP_PROJECT_READINESS.$BQ_DATASET.vald_fd_jumps\` AS v
+          JOIN \`$GCP_PROJECT_ML.$BQ_DATASET.$READINESS_TABLE\` AS v
             ON r.vald_name = v.full_name
           WHERE 1=1;
           SQL
@@ -337,7 +470,6 @@ jobs:
         shell: bash
         env:
           GCP_PROJECT_ML:    ${{ env.GCP_PROJECT_ML }}
-          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET:     ${{ env.BQ_DATASET }}
           BQ_LOCATION:    ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
@@ -349,7 +481,7 @@ jobs:
           echo ""
           echo "DATA FLOW:"
           echo "  workload_daily.roster_name (ID) = roster_mapping.official_id (in ML project)"
-          echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name (in readiness project)"
+          echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name (local copy in ML project)"
           echo ""
 
           # Match the data connection logic from user's local implementation
@@ -371,7 +503,7 @@ jobs:
               v.jump_height_readiness,
               v.epf_readiness,
               v.rsi_readiness
-            FROM `${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}` v
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}` v
             LEFT JOIN `${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}` r
               ON v.full_name = r.vald_name
             WHERE v.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
@@ -441,7 +573,7 @@ jobs:
             if echo "$RESULT_JSON" | grep -qi "not found\|does not exist"; then
               echo "❗ Issue: Table/Dataset Not Found"
               echo "   Check: ${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}"
-              echo "   Check: ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
+              echo "   Check: ${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE} (local copy)"
               echo "   Check: ${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}"
             fi
             
