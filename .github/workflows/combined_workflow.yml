@@ -20,9 +20,13 @@ on:
         default: "2025-12-31"
 
 env:
-  GCP_PROJECT: sac-vald-hub
+  # Workload & Model Project (new - destination for writes)
+  GCP_PROJECT_ML: sac-ml-models
   BQ_DATASET: analytics
   BQ_LOCATION: US
+
+  # Readiness Data Project (original - source for reads)
+  GCP_PROJECT_READINESS: sac-vald-hub
 
   WORKLOAD_TABLE: workload_daily
   READINESS_TABLE: vald_fd_jumps
@@ -40,14 +44,16 @@ jobs:
           lfs: true
           fetch-depth: 1
 
-      - name: Auth to Google Cloud
+      - name: Auth to Google Cloud (ML Project - for writes)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY_ML }}
           create_credentials_file: true
           export_environment_variables: true
 
       - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ML }}
 
       - uses: r-lib/actions/setup-r@v2
         with:
@@ -90,7 +96,7 @@ jobs:
 
       - name: Ingest workload (local xlsx)
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT_ML }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           BQ_TABLE:    ${{ env.WORKLOAD_TABLE }}
@@ -116,14 +122,16 @@ jobs:
           lfs: true
           fetch-depth: 1
 
-      - name: Auth to Google Cloud
+      - name: Auth to Google Cloud (ML Project - for writes)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY_ML }}
           create_credentials_file: true
           export_environment_variables: true
 
       - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ML }}
 
       - uses: r-lib/actions/setup-r@v2
         with:
@@ -154,7 +162,7 @@ jobs:
 
       - name: Ingest roster (local xlsx → BigQuery)
         env:
-          GCP_PROJECT:        ${{ env.GCP_PROJECT }}
+          GCP_PROJECT:        ${{ env.GCP_PROJECT_ML }}
           BQ_DATASET:         ${{ env.BQ_DATASET }}
           BQ_LOCATION:        ${{ env.BQ_LOCATION }}
           ROSTER_TABLE:       ${{ env.ROSTER_TABLE }}
@@ -179,14 +187,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Auth to Google Cloud
+      - name: Auth to Google Cloud (ML Project - primary)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY_ML }}
           create_credentials_file: true
           export_environment_variables: true
 
       - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ML }}
+
+      - name: Auth to Readiness Project (for reading VALD data)
+        run: |
+          echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
 
       - name: Ensure jq + envsubst present
         run: |
@@ -201,7 +217,8 @@ jobs:
         id: preflight
         shell: bash
         env:
-          GCP_PROJECT:    ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML:    ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET:     ${{ env.BQ_DATASET }}
           BQ_LOCATION:    ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
@@ -211,7 +228,8 @@ jobs:
           set -euo pipefail
 
           echo "=== Environment Configuration ==="
-          echo "  GCP_PROJECT=$GCP_PROJECT"
+          echo "  GCP_PROJECT_ML=$GCP_PROJECT_ML (workload & models)"
+          echo "  GCP_PROJECT_READINESS=$GCP_PROJECT_READINESS (VALD readiness data)"
           echo "  BQ_DATASET=$BQ_DATASET"
           echo "  BQ_LOCATION=$BQ_LOCATION"
           echo "  WORKLOAD_TABLE=$WORKLOAD_TABLE"
@@ -219,31 +237,32 @@ jobs:
           echo "  ROSTER_TABLE=$ROSTER_TABLE"
           echo ""
 
-          : "${GCP_PROJECT:?GCP_PROJECT is required}"
+          : "${GCP_PROJECT_ML:?GCP_PROJECT_ML is required}"
+          : "${GCP_PROJECT_READINESS:?GCP_PROJECT_READINESS is required}"
           : "${BQ_DATASET:?BQ_DATASET is required}"
           : "${BQ_LOCATION:?BQ_LOCATION is required}"
           : "${WORKLOAD_TABLE:?WORKLOAD_TABLE is required}"
           : "${READINESS_TABLE:?READINESS_TABLE is required}"
           : "${ROSTER_TABLE:?ROSTER_TABLE is required}"
 
-          echo "Checking dataset exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "$BQ_DATASET" >/dev/null
+          echo "Checking ML project dataset exists…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" ls "$BQ_DATASET" >/dev/null
 
-          echo "Checking workload table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
+          echo "Checking workload table exists (in ML project)…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
-          echo "Checking readiness table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          echo "Checking readiness table exists (in readiness project)…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_READINESS" show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
 
-          echo "Checking roster table exists…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
+          echo "Checking roster table exists (in ML project)…"
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
 
           echo "Preflight OK"
 
       - name: Validate roster mapping table
         shell: bash
         env:
-          GCP_PROJECT:  ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML:  ${{ env.GCP_PROJECT_ML }}
           BQ_DATASET:   ${{ env.BQ_DATASET }}
           BQ_LOCATION:  ${{ env.BQ_LOCATION }}
           ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
@@ -252,9 +271,9 @@ jobs:
 
           echo "🔍 Validating roster mapping table..."
 
-          TABLE_REF="${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}"
+          TABLE_REF="${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}"
           ROSTER_COUNT=$(
-            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
               query --use_legacy_sql=false --format=csv \
               "$(printf 'SELECT COUNT(*) FROM `%s`' "$TABLE_REF")" | tail -n1
           )
@@ -265,8 +284,8 @@ jobs:
           fi
           echo "✅ Roster rows: $ROSTER_COUNT"
 
-          SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" show \
-            --schema --format=prettyjson "${GCP_PROJECT}:${BQ_DATASET}.${ROSTER_TABLE}")
+          SCHEMA=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show \
+            --schema --format=prettyjson "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}")
 
           echo "$SCHEMA" | jq -r '.[].name' | grep -q "^official_id$" || {
             echo "❌ Column 'official_id' missing in roster_mapping"; echo "$SCHEMA" | jq -r '.[].name'; exit 1; }
@@ -279,7 +298,8 @@ jobs:
       - name: Build and run BigQuery MATCH_QUERY (use backticks for identifiers with spaces)
         shell: bash
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET: ${{ env.BQ_DATASET }}
           ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
@@ -293,8 +313,8 @@ jobs:
             r.official_id AS official_id,
             r.vald_name    AS vald_name,
             v.full_name    AS vald_full_name
-          FROM \`$GCP_PROJECT.$BQ_DATASET.$ROSTER_TABLE\` AS r
-          JOIN \`$GCP_PROJECT.$BQ_DATASET.vald_fd_jumps\` AS v
+          FROM \`$GCP_PROJECT_ML.$BQ_DATASET.$ROSTER_TABLE\` AS r
+          JOIN \`$GCP_PROJECT_READINESS.$BQ_DATASET.vald_fd_jumps\` AS v
             ON r.vald_name = v.full_name
           WHERE 1=1;
           SQL
@@ -306,14 +326,15 @@ jobs:
           echo "-----------------------"
 
           echo "▶ Executing BigQuery query..."
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
              query --use_legacy_sql=false --format=json "$MATCH_QUERY"
 
       - name: Check for matching readiness data (CORRECTED MAPPING)
         id: check
         shell: bash
         env:
-          GCP_PROJECT:    ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML:    ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET:     ${{ env.BQ_DATASET }}
           BQ_LOCATION:    ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
@@ -324,8 +345,8 @@ jobs:
           echo "🔍 Checking workload ↔ readiness matches (via roster mapping, same DATE)…"
           echo ""
           echo "DATA FLOW:"
-          echo "  workload_daily.roster_name (ID) = roster_mapping.official_id"
-          echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name"
+          echo "  workload_daily.roster_name (ID) = roster_mapping.official_id (in ML project)"
+          echo "  roster_mapping.vald_name (NAME) = vald_fd_jumps.full_name (in readiness project)"
           echo ""
 
           # Match the data connection logic from user's local implementation
@@ -336,7 +357,7 @@ jobs:
             SELECT DISTINCT
               roster_name AS official_id,
               DATE(date) AS date
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}`
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}`
             WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
               AND roster_name IS NOT NULL
           ),
@@ -347,8 +368,8 @@ jobs:
               v.jump_height_readiness,
               v.epf_readiness,
               v.rsi_readiness
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}` v
-            LEFT JOIN `${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}` r
+            FROM `${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}` v
+            LEFT JOIN `${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}` r
               ON v.full_name = r.vald_name
             WHERE v.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
               AND r.official_id IS NOT NULL
@@ -400,7 +421,7 @@ jobs:
           echo "▶ Executing BigQuery query..."
           set +e  # Don't exit on error yet - capture it
           RESULT_JSON=$(
-            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
                query --use_legacy_sql=false --format=json "$MATCH_QUERY" 2>&1
           )
           QUERY_EXIT_CODE=$?
@@ -416,9 +437,9 @@ jobs:
             
             if echo "$RESULT_JSON" | grep -qi "not found\|does not exist"; then
               echo "❗ Issue: Table/Dataset Not Found"
-              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${WORKLOAD_TABLE}"
-              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${READINESS_TABLE}"
-              echo "   Check: ${GCP_PROJECT}.${BQ_DATASET}.${ROSTER_TABLE}"
+              echo "   Check: ${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}"
+              echo "   Check: ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
+              echo "   Check: ${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}"
             fi
             
             if echo "$RESULT_JSON" | grep -qi "unrecognized\|column"; then
@@ -472,6 +493,11 @@ jobs:
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
+
     outputs:
       has_matches:   ${{ steps.check.outputs.has_matches }}
       match_count:   ${{ steps.check.outputs.match_count }}
@@ -489,14 +515,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Auth to Google Cloud
+      - name: Auth to Google Cloud (ML Project - primary)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY_ML }}
           create_credentials_file: true
           export_environment_variables: true
 
       - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ML }}
+
+      - name: Auth to Readiness Project (for reading VALD data)
+        run: |
+          echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -537,31 +571,31 @@ jobs:
 
       - name: Verify BigQuery write access
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
         run: |
           set -euo pipefail
           echo "=== BigQuery Access Validation ==="
-          echo "Checking access to dataset ${BQ_DATASET}..."
+          echo "Checking access to dataset ${BQ_DATASET} in ML project ${GCP_PROJECT_ML}..."
           
-          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls "${BQ_DATASET}" >/dev/null 2>&1; then
+          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" ls "${BQ_DATASET}" >/dev/null 2>&1; then
             echo ""
             echo "❌ Cannot list dataset ${BQ_DATASET}"
             echo ""
             echo "Troubleshooting:"
             echo "  1. Service account needs BigQuery Data Editor permission"
             echo "  2. Or roles/bigquery.dataEditor on the dataset"
-            echo "  3. Verify GCP_SA_KEY has BigQuery write access"
+            echo "  3. Verify GCP_SA_KEY_ML has BigQuery write access"
             echo ""
             echo "Attempting to show more details:"
-            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" ls 2>&1 || true
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" ls 2>&1 || true
             exit 1
           fi
           echo "✅ BigQuery dataset accessible"
           
           # Verify we can query the dataset
-          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "SELECT 1" >/dev/null 2>&1; then
+          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "SELECT 1" >/dev/null 2>&1; then
             echo "❌ Cannot execute queries in BigQuery"
             exit 1
           fi
@@ -569,7 +603,8 @@ jobs:
 
       - name: Run model training
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          GCP_PROJECT: ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           TEAM_NAME:   ${{ env.TEAM_NAME }}
@@ -593,7 +628,7 @@ jobs:
       - name: Show today's training summary (best-effort)
         if: success()
         env:
-          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
           BQ_DATASET:  ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
         run: |
@@ -603,7 +638,7 @@ jobs:
           fi
 
           # Check if model_training_summary table exists before querying
-          TABLE_EXISTS=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" \
+          TABLE_EXISTS=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
             ls -n 1000 "${BQ_DATASET}" 2>/dev/null | grep -c "model_training_summary" || echo "0")
 
           echo ""
@@ -621,14 +656,14 @@ jobs:
               ROUND(primary_rmse, 3) AS rmse,
               n_train,
               FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.model_training_summary`
             WHERE DATE(trained_at) = CURRENT_DATE()
             ORDER BY trained_at DESC
             LIMIT 10
             SQL
             )
             Q1="$(envsubst <<<"$Q1")"
-            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false --max_rows=10 "$Q1" 2>&1 || echo "No training results yet"
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false --max_rows=10 "$Q1" 2>&1 || echo "No training results yet"
           fi
 
           echo ""
@@ -643,13 +678,18 @@ jobs:
               COUNT(*) AS total_models,
               ROUND(AVG(primary_rmse), 3) AS avg_rmse,
               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
-            FROM `${GCP_PROJECT}.${BQ_DATASET}.model_training_summary`
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.model_training_summary`
             WHERE DATE(trained_at) = CURRENT_DATE()
             SQL
             )
             Q2="$(envsubst <<<"$Q2")"
-            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
+            bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
           fi
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f /tmp/readiness-sa-key.json
 
   summary:
     runs-on: ubuntu-latest
