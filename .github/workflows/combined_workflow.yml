@@ -367,6 +367,7 @@ jobs:
           WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
           ROSTER_TABLE:   ${{ env.ROSTER_TABLE }}
+          SYNC_ACTION:    ${{ steps.sync_readiness.outputs.sync_action }}
         run: |
           set -euo pipefail
 
@@ -395,7 +396,21 @@ jobs:
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${WORKLOAD_TABLE}" >/dev/null
 
           echo "Checking readiness table exists (local copy in ML project)…"
-          bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null
+          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
+            echo "✅ Readiness table exists in ML project"
+            echo "readiness_available=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$SYNC_ACTION" = "skipped_no_source" ]; then
+              echo "⚠️  Readiness table not found in ML project"
+              echo "   Source table doesn't exist yet and no local copy available"
+              echo "   Workflow will continue but readiness data checks will be skipped"
+              echo "readiness_available=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ Readiness table not found in ML project"
+              echo "   Expected after sync action: $SYNC_ACTION"
+              exit 1
+            fi
+          fi
 
           echo "Checking roster table exists (in ML project)…"
           bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" show "${GCP_PROJECT_ML}:${BQ_DATASET}.${ROSTER_TABLE}" >/dev/null
@@ -439,6 +454,7 @@ jobs:
           echo "✅ Required columns present (official_id, vald_name)"
 
       - name: Build and run BigQuery MATCH_QUERY (use backticks for identifiers with spaces)
+        if: steps.preflight.outputs.readiness_available == 'true'
         shell: bash
         env:
           GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
@@ -473,6 +489,7 @@ jobs:
              query --use_legacy_sql=false --format=json "$MATCH_QUERY"
 
       - name: Check for matching readiness data (CORRECTED MAPPING)
+        if: steps.preflight.outputs.readiness_available == 'true'
         id: check
         shell: bash
         env:
@@ -635,16 +652,27 @@ jobs:
             echo "reason=no_readiness_match" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Handle missing readiness data
+        if: steps.preflight.outputs.readiness_available == 'false'
+        id: check_fallback
+        run: |
+          echo "⚠️  Readiness table not available"
+          echo "   Source table doesn't exist yet and no local copy available"
+          echo "   Training will be skipped until readiness data is available"
+          echo ""
+          echo "has_matches=false" >> "$GITHUB_OUTPUT"
+          echo "reason=no_readiness_table" >> "$GITHUB_OUTPUT"
+
       - name: Cleanup credentials
         if: always()
         run: |
           rm -f /tmp/readiness-sa-key.json
 
     outputs:
-      has_matches:   ${{ steps.check.outputs.has_matches }}
-      match_count:   ${{ steps.check.outputs.match_count }}
-      athlete_count: ${{ steps.check.outputs.athlete_count }}
-      reason:        ${{ steps.check.outputs.reason }}
+      has_matches:   ${{ steps.check.outputs.has_matches || steps.check_fallback.outputs.has_matches }}
+      match_count:   ${{ steps.check.outputs.match_count || '0' }}
+      athlete_count: ${{ steps.check.outputs.athlete_count || '0' }}
+      reason:        ${{ steps.check.outputs.reason || steps.check_fallback.outputs.reason }}
 
   train-models:
     runs-on: ubuntu-latest
