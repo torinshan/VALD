@@ -205,6 +205,7 @@ jobs:
         run: |
           echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
           gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          gcloud config set project ${{ env.GCP_PROJECT_READINESS }}
           echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
 
       - name: Ensure jq + envsubst present
@@ -236,6 +237,9 @@ jobs:
           # Check if source table exists in sac-vald-hub
           echo "📋 Checking source table in ${GCP_PROJECT_READINESS}..."
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+
+          # Re-activate service account to ensure bq uses the correct credentials
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json --project="$GCP_PROJECT_READINESS"
 
           # Try to show the table and capture the output
           set +e  # Temporarily disable exit on error
@@ -291,6 +295,7 @@ jobs:
 
           # Switch back to ML project credentials
           unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project "$GCP_PROJECT_ML"
 
           # Check if destination table exists in sac-ml-models
           echo "📋 Checking destination table in ${GCP_PROJECT_ML}..."
@@ -353,11 +358,13 @@ jobs:
 
           # Execute with readiness credentials to read source
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
+          gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json --project="$GCP_PROJECT_READINESS"
 
           if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
                query --use_legacy_sql=false "$COPY_QUERY" 2>&1; then
 
             unset GOOGLE_APPLICATION_CREDENTIALS
+            gcloud config set project "$GCP_PROJECT_ML"
 
             # Verify the copy
             COPIED_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
@@ -370,6 +377,7 @@ jobs:
             echo "sync_action=updated" >> "$GITHUB_OUTPUT"
           else
             unset GOOGLE_APPLICATION_CREDENTIALS
+            gcloud config set project "$GCP_PROJECT_ML"
             echo ""
             echo "❌ Failed to copy table"
             echo "   Check that:"
@@ -723,6 +731,7 @@ jobs:
         run: |
           echo '${{ secrets.GCP_SA_KEY_READINESS }}' > /tmp/readiness-sa-key.json
           gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json
+          gcloud config set project ${{ env.GCP_PROJECT_READINESS }}
           echo "GOOGLE_APPLICATION_CREDENTIALS_READINESS=/tmp/readiness-sa-key.json" >> $GITHUB_ENV
 
       - uses: actions/setup-python@v5
