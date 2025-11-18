@@ -237,7 +237,7 @@ jobs:
           # Check if source table exists in sac-vald-hub
           echo "📋 Checking source table in ${GCP_PROJECT_READINESS}..."
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/readiness-sa-key.json
-          
+
           # Re-activate service account to ensure bq uses the correct credentials
           gcloud auth activate-service-account --key-file=/tmp/readiness-sa-key.json --project="$GCP_PROJECT_READINESS"
 
