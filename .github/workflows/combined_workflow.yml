@@ -427,33 +427,32 @@ jobs:
           fi
 
           # Query to find matches
-          MATCH_SQL=$(cat <<'SQL'
-WITH workload AS (
-  SELECT DISTINCT 
-    w.roster_name as official_id,
-    DATE(w.date) as date
-  FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}` w
-  WHERE w.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
-),
-readiness AS (
-  SELECT DISTINCT
-    r.full_name as vald_name,
-    DATE(r.date) as date
-  FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}` r
-  WHERE r.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
-),
-roster AS (
-  SELECT official_id, vald_name
-  FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}`
-)
-SELECT 
-  COUNT(*) as match_count,
-  COUNT(DISTINCT w.official_id) as athlete_count
-FROM workload w
-JOIN roster ros ON w.official_id = ros.official_id
-JOIN readiness r ON ros.vald_name = r.vald_name AND w.date = r.date
-SQL
-)
+          MATCH_SQL='
+          WITH workload AS (
+            SELECT DISTINCT 
+              w.roster_name as official_id,
+              DATE(w.date) as date
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}` w
+            WHERE w.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          ),
+          readiness AS (
+            SELECT DISTINCT
+              r.full_name as vald_name,
+              DATE(r.date) as date
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}` r
+            WHERE r.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          ),
+          roster AS (
+            SELECT official_id, vald_name
+            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}`
+          )
+          SELECT 
+            COUNT(*) as match_count,
+            COUNT(DISTINCT w.official_id) as athlete_count
+          FROM workload w
+          JOIN roster ros ON w.official_id = ros.official_id
+          JOIN readiness r ON ros.vald_name = r.vald_name AND w.date = r.date
+          '
 
           # Substitute environment variables
           MATCH_SQL="$(envsubst <<<"$MATCH_SQL")"
@@ -639,8 +638,8 @@ SQL
           if [ "$TABLE_EXISTS" -eq "0" ]; then
             echo "No training results yet (table not created)"
           else
-            # Use cat with heredoc instead of read to avoid exit code issues
-            Q1=$(cat <<'SQL'
+            # Use multi-line string instead of heredoc for proper YAML syntax
+            Q1='
             SELECT
               athlete_id,
               roster_name,
@@ -652,8 +651,7 @@ SQL
             WHERE DATE(trained_at) = CURRENT_DATE()
             ORDER BY trained_at DESC
             LIMIT 10
-            SQL
-            )
+            '
             Q1="$(envsubst <<<"$Q1")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false --max_rows=10 "$Q1" 2>&1 || echo "No training results yet"
           fi
@@ -664,16 +662,15 @@ SQL
           if [ "$TABLE_EXISTS" -eq "0" ]; then
             echo "No stats available (table not created)"
           else
-            Q2=$(cat <<'SQL'
+            Q2='
             SELECT
               COUNT(DISTINCT athlete_id) AS athletes_trained,
               COUNT(*) AS total_models,
               ROUND(AVG(primary_rmse), 3) AS avg_rmse,
-              FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', MAX(trained_at)) AS last_run
+              FORMAT_TIMESTAMP('%H:%M', MAX(trained_at)) AS last_run
             FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.model_training_summary`
             WHERE DATE(trained_at) = CURRENT_DATE()
-            SQL
-            )
+            '
             Q2="$(envsubst <<<"$Q2")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
           fi
