@@ -1299,17 +1299,17 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
     select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
-      "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "triallimb","test_ID","test_type","vald_id","full_name","position","team","date","time","body_weight_lbs",
       "start_to_peak_force","peak_vertical_force","rfd_at_100ms","rfd_at_250ms",
       "iso_bm_rel_force_peak","iso_bm_rel_force_100","iso_bm_rel_force_200","iso_abs_impulse_100"
     ))) %>%
-    group_by(test_ID, vald_id, triallimb) %>%
+    group_by(test_ID, vald_id, test_type, triallimb) %>%
     summarise(across(any_of(c("full_name","position","team")), first),
               across(any_of(c("date","time","body_weight_lbs")), first),
               across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
     tidyr::pivot_wider(
-      id_cols = any_of(c("test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs")),
-      names_from = triallimb, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs, triallimb),
+      id_cols = any_of(c("test_ID","vald_id","test_type","full_name","position","team","date","time","body_weight_lbs")),
+      names_from = triallimb, values_from = -c(test_ID, vald_id, test_type, full_name, position, team, date, time, body_weight_lbs, triallimb),
       names_sep = "_"
     ) %>%
     rename_with(~str_replace(.x, "_Left$", "_left")) %>%
