@@ -19,6 +19,7 @@ jobs:
       GCP_PROJECT: sac-vald-hub
       BQ_DATASET: analytics
       BIGRQUERY_USE_BQ_STORAGE: 'false'
+      KEYRING_BACKEND: env
     steps:
     - name: Show current time (UTC/PT)
       run: 'echo "UTC now: $(date -u)"
@@ -109,6 +110,7 @@ jobs:
         VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
         VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
         VALD_REGION: use
+        KEYRING_BACKEND: env
       run: 'set -e
 
         Rscript .github/scripts/run.R

@@ -358,28 +358,27 @@ validate_and_fix_schema <- function(data, table_name, ds) {
     existing_fields <- sapply(meta$schema$fields, function(f) f$name)
     data_fields <- names(data)
     
-    # Find missing columns in BigQuery schema
-    missing_in_bq <- setdiff(data_fields, existing_fields)
+    # Find new columns that will be added to BigQuery schema
+    new_columns <- setdiff(data_fields, existing_fields)
     
-    if (length(missing_in_bq) > 0) {
+    if (length(new_columns) > 0) {
       create_log_entry(paste(
-        "Schema mismatch in", table_name, "-",
-        length(missing_in_bq), "columns missing from BigQuery schema:",
-        paste(head(missing_in_bq, 10), collapse = ", ")
-      ), "WARN")
+        "Schema evolution in", table_name, "-",
+        length(new_columns), "new columns will be added to BigQuery:",
+        paste(head(new_columns, 10), collapse = ", ")
+      ), "INFO")
       
-      # Log each missing column
-      for (col in missing_in_bq) {
+      # Log each new column for tracking
+      for (col in new_columns) {
         col_type <- infer_bq_type(data[[col]])
         log_schema_mismatch(table_name, col, col_type)
       }
       
-      # Drop the missing columns from data to prevent upload failure
+      # Keep the new columns - BigQuery will auto-extend schema on WRITE_TRUNCATE
       create_log_entry(paste(
-        "Dropping", length(missing_in_bq),
-        "columns from upload to match existing schema"
-      ), "WARN")
-      data <- data %>% select(-all_of(missing_in_bq))
+        "Allowing", length(new_columns),
+        "new columns to be added to BigQuery schema"
+      ), "INFO")
     }
     
     # Check for columns in schema but not in data (less critical, just informational)
@@ -1300,17 +1299,17 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
     select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
-      "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
+      "triallimb","test_ID","test_type","vald_id","full_name","position","team","date","time","body_weight_lbs",
       "start_to_peak_force","peak_vertical_force","rfd_at_100ms","rfd_at_250ms",
       "iso_bm_rel_force_peak","iso_bm_rel_force_100","iso_bm_rel_force_200","iso_abs_impulse_100"
     ))) %>%
-    group_by(test_ID, vald_id, triallimb) %>%
+    group_by(test_ID, vald_id, test_type, triallimb) %>%
     summarise(across(any_of(c("full_name","position","team")), first),
               across(any_of(c("date","time","body_weight_lbs")), first),
               across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
     tidyr::pivot_wider(
-      id_cols = any_of(c("test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs")),
-      names_from = triallimb, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs),
+      id_cols = any_of(c("test_ID","vald_id","test_type","full_name","position","team","date","time","body_weight_lbs")),
+      names_from = triallimb, values_from = -c(test_ID, vald_id, test_type, full_name, position, team, date, time, body_weight_lbs, triallimb),
       names_sep = "_"
     ) %>%
     rename_with(~str_replace(.x, "_Left$", "_left")) %>%
@@ -1351,7 +1350,7 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
     )) %>%
     tidyr::pivot_wider(
       id_cols = any_of(c("test_ID","vald_id","test_type","full_name","position","team","date","time","body_weight_lbs")),
-      names_from = limb_suffix, values_from = -c(test_ID, vald_id, test_type, full_name, position, team, date, time, body_weight_lbs),
+      names_from = limb_suffix, values_from = -c(test_ID, vald_id, test_type, full_name, position, team, date, time, body_weight_lbs, triallimb, limb_suffix),
       names_sep = "_"
     )
   bq_upsert(rebound_new, "vald_fd_rebound", key="test_ID", mode="MERGE",
@@ -1381,13 +1380,17 @@ if ("SLJ" %in% new_test_types) {
     summarise(across(any_of(c("full_name","position","team")), first),
               across(any_of(c("date","time","body_weight_lbs")), first),
               across(where(is.numeric), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+    mutate(limb_suffix = case_when(
+      triallimb == "Left" ~ "left",
+      triallimb == "Right" ~ "right",
+      triallimb == "Bilateral" ~ "bilateral",
+      TRUE ~ "bilateral"
+    )) %>%
     tidyr::pivot_wider(
       id_cols = any_of(c("test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs")),
-      names_from = triallimb, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs),
+      names_from = limb_suffix, values_from = -c(test_ID, vald_id, full_name, position, team, date, time, body_weight_lbs, triallimb),
       names_sep = "_"
-    ) %>%
-    rename_with(~str_replace(.x, "_Left$", "_left")) %>%
-    rename_with(~str_replace(.x, "_Right$", "_right"))
+    )
   bq_upsert(slj_new, "vald_fd_sl_jumps", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
 } else {
