@@ -265,7 +265,7 @@ jobs:
           set -e  # Re-enable exit on error
 
           if [ $BQ_SHOW_EXIT_CODE -ne 0 ]; then
-            # Check if it's a "Not found" error vs other errors
+            # Check if it's a "Not found" error, permission error, or other errors
             if echo "$BQ_SHOW_OUTPUT" | grep -qi "not found\|does not exist"; then
               echo "⚠️  Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
               echo "   This table is populated by the saturday_makeup workflow."
@@ -273,28 +273,36 @@ jobs:
               echo ""
               echo "sync_action=skipped_no_source" >> "$GITHUB_OUTPUT"
               exit 0
+            elif echo "$BQ_SHOW_OUTPUT" | grep -qi "permission.*denied\|access denied"; then
+              # Permission error - skip sync gracefully
+              echo "⚠️  Permission denied accessing ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
+              echo "   Service account does not have read access to the source table."
+              echo "   Sync will be skipped - training will use local data if available."
+              echo ""
+              echo "Error details:"
+              echo "$BQ_SHOW_OUTPUT"
+              echo ""
+              echo "To fix this issue, grant read permissions to the service account:"
+              echo "gcloud projects add-iam-policy-binding ${GCP_PROJECT_READINESS} \\"
+              echo "  --member='serviceAccount:gha-bq@sac-vald-hub.iam.gserviceaccount.com' \\"
+              echo "  --role='roles/bigquery.dataViewer'"
+              echo ""
+              echo "sync_action=skipped_no_permission" >> "$GITHUB_OUTPUT"
+              exit 0
             else
-              # Other error (permissions, location, etc.)
+              # Other error (location, authentication, etc.)
               echo "❌ Failed to check source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
               echo ""
               echo "Error output:"
               echo "$BQ_SHOW_OUTPUT"
               echo ""
               echo "Possible issues:"
-              echo "  1. GCP_SA_KEY_READINESS does not have read access to ${GCP_PROJECT_READINESS}"
-              echo "  2. Dataset or table name is incorrect"
-              echo "  3. Location mismatch (currently using: $BQ_LOCATION)"
-              echo "  4. Service account authentication failed"
+              echo "  1. Location mismatch (currently using: $BQ_LOCATION)"
+              echo "  2. Service account authentication failed"
+              echo "  3. Dataset or table name is incorrect"
               echo ""
-              echo "Required permissions for GCP_SA_KEY_READINESS on ${GCP_PROJECT_READINESS}:"
-              echo "  - roles/bigquery.dataViewer (project level) OR"
-              echo "  - roles/bigquery.dataViewer on dataset ${BQ_DATASET}"
-              echo ""
-              echo "To grant permissions, run:"
-              echo "gcloud projects add-iam-policy-binding ${GCP_PROJECT_READINESS} \\"
-              echo "  --member='serviceAccount:SERVICE_ACCOUNT_EMAIL' \\"
-              echo "  --role='roles/bigquery.dataViewer'"
-              exit 1
+              echo "sync_action=skipped_error" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           fi
 
