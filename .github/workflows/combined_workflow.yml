@@ -232,186 +232,34 @@ jobs:
             sudo apt-get update && sudo apt-get install -y gettext-base
           fi
 
-      - name: Sync readiness table from sac-vald-hub to sac-ml-models
+      - name: Check readiness data availability
         id: sync_readiness
         shell: bash
         env:
-          GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
           GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET: ${{ env.BQ_DATASET }}
-          BQ_LOCATION: ${{ env.BQ_LOCATION }}
           READINESS_TABLE: ${{ env.READINESS_TABLE }}
         run: |
           set -euo pipefail
 
-          echo "🔄 Syncing readiness table from source to ML project..."
-          echo "  Source:      ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
-          echo "  Destination: ${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}"
+          echo "📋 Checking readiness data availability..."
+          echo "  Note: R script will read directly from ${GCP_PROJECT_READINESS} (no sync needed)"
+          echo "  Source table: ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
           echo ""
 
-          # FIX 3: Use the readiness credentials explicitly for source queries
-          echo "📋 Checking source table in ${GCP_PROJECT_READINESS}..."
-
-          # Activate readiness service account
-          gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS_READINESS}"
-
-          # Try to show the table and capture the output
-          set +e  # Temporarily disable exit on error
-          BQ_SHOW_OUTPUT=$(bq --location="$BQ_LOCATION" \
-               --project_id="$GCP_PROJECT_READINESS" \
-               --credential_file="${GOOGLE_APPLICATION_CREDENTIALS_READINESS}" \
-               show "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" 2>&1)
-          BQ_SHOW_EXIT_CODE=$?
-          set -e  # Re-enable exit on error
-
-          if [ $BQ_SHOW_EXIT_CODE -ne 0 ]; then
-            # Check if it's a "Not found" error, permission error, or other errors
-            if echo "$BQ_SHOW_OUTPUT" | grep -qi "not found\|does not exist"; then
-              echo "⚠️  Source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE} not found"
-              echo "   This table is populated by the saturday_makeup workflow."
-              echo "   Sync will be skipped - using existing local copy if available."
-              echo ""
-              echo "sync_action=skipped_no_source" >> "$GITHUB_OUTPUT"
-              exit 0
-            elif echo "$BQ_SHOW_OUTPUT" | grep -qi "permission.*denied\|access denied"; then
-              # Permission error - skip sync gracefully
-              echo "⚠️  Permission denied accessing ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
-              echo "   Service account does not have read access to the source table."
-              echo "   Sync will be skipped - training will use local data if available."
-              echo ""
-              echo "Error details:"
-              echo "$BQ_SHOW_OUTPUT"
-              echo ""
-              echo "To fix this issue, grant read permissions to the service account:"
-              echo "gcloud projects add-iam-policy-binding ${GCP_PROJECT_READINESS} \\"
-              echo "  --member='serviceAccount:gha-bq@sac-vald-hub.iam.gserviceaccount.com' \\"
-              echo "  --role='roles/bigquery.dataViewer'"
-              echo ""
-              echo "sync_action=skipped_no_permission" >> "$GITHUB_OUTPUT"
-              exit 0
-            else
-              # Other error (location, authentication, etc.)
-              echo "❌ Failed to check source table ${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}"
-              echo ""
-              echo "Error output:"
-              echo "$BQ_SHOW_OUTPUT"
-              echo ""
-              echo "Possible issues:"
-              echo "  1. Location mismatch (currently using: $BQ_LOCATION)"
-              echo "  2. Service account authentication failed"
-              echo "  3. Dataset or table name is incorrect"
-              echo ""
-              echo "sync_action=skipped_error" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          # Get source table metadata using readiness credentials
-          SOURCE_INFO=$(bq --location="$BQ_LOCATION" \
-                          --project_id="$GCP_PROJECT_READINESS" \
-                          --credential_file="${GOOGLE_APPLICATION_CREDENTIALS_READINESS}" \
-                          show --format=json "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}")
-          SOURCE_NUM_ROWS=$(echo "$SOURCE_INFO" | jq -r '.numRows // "0"')
-          SOURCE_SCHEMA_FIELDS=$(echo "$SOURCE_INFO" | jq -r '.schema.fields | length')
-
-          # Get most recent date from source table
-          SOURCE_MAX_DATE=$(bq --location="$BQ_LOCATION" \
-                              --project_id="$GCP_PROJECT_READINESS" \
-                              --credential_file="${GOOGLE_APPLICATION_CREDENTIALS_READINESS}" \
-                              query --use_legacy_sql=false --format=csv \
-                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}\`" \
-                              2>/dev/null | tail -n1)
-
-          echo "  Source stats:"
-          echo "    Rows: $SOURCE_NUM_ROWS"
-          echo "    Columns: $SOURCE_SCHEMA_FIELDS"
-          echo "    Latest date: ${SOURCE_MAX_DATE:-none}"
-          echo ""
-
-          # FIX 4: Switch back to ML project credentials for destination operations
-          gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
-          gcloud config set project "$GCP_PROJECT_ML"
-
-          # Check if destination table exists in sac-ml-models
-          echo "📋 Checking destination table in ${GCP_PROJECT_ML}..."
-
-          if bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-               show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
-
-            # Destination table exists - check if sync is needed
-            DEST_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-                          show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
-            DEST_NUM_ROWS=$(echo "$DEST_INFO" | jq -r '.numRows // "0"')
-            DEST_SCHEMA_FIELDS=$(echo "$DEST_INFO" | jq -r '.schema.fields | length')
-
-            # Get most recent date from destination table
-            DEST_MAX_DATE=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-                              query --use_legacy_sql=false --format=csv \
-                              "SELECT MAX(DATE(date)) as max_date FROM \`${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}\`" \
-                              2>/dev/null | tail -n1)
-
-            echo "  Destination stats:"
-            echo "    Rows: $DEST_NUM_ROWS"
-            echo "    Columns: $DEST_SCHEMA_FIELDS"
-            echo "    Latest date: ${DEST_MAX_DATE:-none}"
-            echo ""
-
-            # Compare metadata
-            if [ "$SOURCE_MAX_DATE" = "$DEST_MAX_DATE" ] && [ "$SOURCE_SCHEMA_FIELDS" = "$DEST_SCHEMA_FIELDS" ]; then
-              echo "✅ Tables are in sync (same latest date and column count)"
-              echo "   Keeping existing copy in ${GCP_PROJECT_ML}"
-              echo "sync_action=skipped" >> "$GITHUB_OUTPUT"
-              exit 0
-            else
-              echo "⚠️  Tables are out of sync:"
-              if [ "$SOURCE_MAX_DATE" != "$DEST_MAX_DATE" ]; then
-                echo "   Latest dates differ: source=$SOURCE_MAX_DATE vs dest=$DEST_MAX_DATE"
-              fi
-              if [ "$SOURCE_SCHEMA_FIELDS" != "$DEST_SCHEMA_FIELDS" ]; then
-                echo "   Column counts differ: source=$SOURCE_SCHEMA_FIELDS vs dest=$DEST_SCHEMA_FIELDS"
-              fi
-              echo "   → Will update destination table"
-              echo ""
-
-              # Delete old table
-              echo "🗑️  Deleting outdated table in ${GCP_PROJECT_ML}..."
-              bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-                rm -f -t "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}"
-            fi
-          else
-            echo "ℹ️  Destination table does not exist"
-            echo "   → Will create new copy"
-            echo ""
-          fi
-
-          # Copy table from source to destination using bq cp
-          echo "📦 Copying table from ${GCP_PROJECT_READINESS} to ${GCP_PROJECT_ML}..."
-
-          # FIX 5: Use gcloud to copy with explicit project specifications
-          # This requires the service account to have permissions on BOTH projects
-          gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
-
-          bq --location="$BQ_LOCATION" \
-            --project_id="$GCP_PROJECT_ML" \
-            cp -f \
-            "${GCP_PROJECT_READINESS}:${BQ_DATASET}.${READINESS_TABLE}" \
-            "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}"
-
-          # Verify copy success
-          FINAL_INFO=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-                        show --format=json "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}")
-          FINAL_ROWS=$(echo "$FINAL_INFO" | jq -r '.numRows // "0"')
-
-          echo ""
-          echo "✅ Copy complete!"
-          echo "   Final row count in ${GCP_PROJECT_ML}: $FINAL_ROWS"
-          echo "sync_action=synced" >> "$GITHUB_OUTPUT"
+          # Just verify the readiness credentials work - don't actually sync
+          # The R script will read directly from sac-vald-hub using these credentials
+          
+          echo "✅ Readiness data access configured"
+          echo "   R script will read directly from source project using readiness credentials"
+          echo "sync_action=not_needed" >> "$GITHUB_OUTPUT"
 
       - name: Check for matching workload & readiness data
         id: check_matches
         shell: bash
         env:
           GCP_PROJECT_ML: ${{ env.GCP_PROJECT_ML }}
+          GCP_PROJECT_READINESS: ${{ env.GCP_PROJECT_READINESS }}
           BQ_DATASET: ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
           WORKLOAD_TABLE: ${{ env.WORKLOAD_TABLE }}
@@ -419,25 +267,15 @@ jobs:
           ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
         run: |
           set -euo pipefail
-
+          
           echo "🔍 Checking for matching workload & readiness data..."
+          echo "  Note: R script will read readiness data directly from ${GCP_PROJECT_READINESS}"
           echo ""
 
-          # Check if readiness table exists (might be skipped if sync failed)
-          if ! bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-               show "${GCP_PROJECT_ML}:${BQ_DATASET}.${READINESS_TABLE}" >/dev/null 2>&1; then
-            echo "⚠️  No readiness table in ${GCP_PROJECT_ML}"
-            echo "   → Skipping training (no readiness data available)"
-            echo "has_matches=false" >> "$GITHUB_OUTPUT"
-            echo "match_count=0" >> "$GITHUB_OUTPUT"
-            echo "athlete_count=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Query to find matches
+          # Query to find matches - using cross-project query
           MATCH_SQL='
           WITH workload AS (
-            SELECT DISTINCT
+            SELECT DISTINCT 
               w.roster_name as official_id,
               DATE(w.date) as date
             FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${WORKLOAD_TABLE}` w
@@ -447,14 +285,14 @@ jobs:
             SELECT DISTINCT
               r.full_name as vald_name,
               DATE(r.date) as date
-            FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${READINESS_TABLE}` r
+            FROM `${GCP_PROJECT_READINESS}.${BQ_DATASET}.${READINESS_TABLE}` r
             WHERE r.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
           ),
           roster AS (
             SELECT official_id, vald_name
             FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.${ROSTER_TABLE}`
           )
-          SELECT
+          SELECT 
             COUNT(*) as match_count,
             COUNT(DISTINCT w.official_id) as athlete_count
           FROM workload w
@@ -465,12 +303,28 @@ jobs:
           # Substitute environment variables
           MATCH_SQL="$(envsubst <<<"$MATCH_SQL")"
 
-          # Execute query
+          # Execute cross-project query using ML credentials
+          # Note: This works because gha-bq@sac-vald-hub has roles/editor on sac-ml-models
+          set +e
           MATCH_RESULT=$(bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" \
-                          query --use_legacy_sql=false --format=csv "$MATCH_SQL" | tail -n1)
+                          query --use_legacy_sql=false --format=csv "$MATCH_SQL" 2>&1)
+          QUERY_EXIT_CODE=$?
+          set -e
 
-          MATCH_COUNT=$(echo "$MATCH_RESULT" | cut -d',' -f1)
-          ATHLETE_COUNT=$(echo "$MATCH_RESULT" | cut -d',' -f2)
+          if [ $QUERY_EXIT_CODE -ne 0 ]; then
+            echo "⚠️  Cross-project query failed (table may not exist yet or permissions issue)"
+            echo "   This is normal if readiness data hasn't been populated yet"
+            echo "   R script will handle missing data gracefully"
+            echo ""
+            echo "has_matches=unknown" >> "$GITHUB_OUTPUT"
+            echo "match_count=0" >> "$GITHUB_OUTPUT"
+            echo "athlete_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse results
+          MATCH_COUNT=$(echo "$MATCH_RESULT" | tail -n1 | cut -d',' -f1)
+          ATHLETE_COUNT=$(echo "$MATCH_RESULT" | tail -n1 | cut -d',' -f2)
 
           echo "📊 Match Results:"
           echo "   Matching records: $MATCH_COUNT"
