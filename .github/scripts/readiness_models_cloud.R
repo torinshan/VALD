@@ -23,6 +23,8 @@ Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
 # Dual-project configuration
 project    <- Sys.getenv("GCP_PROJECT", "sac-ml-models")  # ML/Workload project (writes)
 project_readiness <- Sys.getenv("GCP_PROJECT_READINESS", "sac-vald-hub")  # Readiness project (reads)
+# NOTE: This script reads readiness data DIRECTLY from sac-vald-hub using readiness credentials,
+# then writes all data (workload, roster, models) to sac-ml-models using ML credentials.
 
 dataset    <- Sys.getenv("BQ_DATASET",  "analytics")
 location   <- Sys.getenv("BQ_LOCATION", "US")
@@ -125,25 +127,71 @@ script_start <- Sys.time()
 create_log_entry("=== READINESS MODEL TRAINING START ===", "START")
 
 ################################################################################
-# AUTHENTICATION
+# DUAL-PROJECT AUTHENTICATION
 ################################################################################
-GLOBAL_ACCESS_TOKEN <- NULL
+# Primary auth: ML project (for writes and most operations)
+ML_ACCESS_TOKEN <- NULL
+READINESS_ACCESS_TOKEN <- NULL
+
 tryCatch({
-  create_log_entry("Authenticating to BigQuery via gcloud")
+  create_log_entry("Authenticating to ML project (sac-ml-models)")
   tok <- system("gcloud auth print-access-token", intern = TRUE)
-  GLOBAL_ACCESS_TOKEN <<- tok[1]
-  stopifnot(nzchar(GLOBAL_ACCESS_TOKEN))
+  ML_ACCESS_TOKEN <<- tok[1]
+  stopifnot(nzchar(ML_ACCESS_TOKEN))
   
   bq_auth(token = gargle::gargle2.0_token(
     scope = 'https://www.googleapis.com/auth/bigquery',
     client = gargle::gargle_client(),
-    credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+    credentials = list(access_token = ML_ACCESS_TOKEN)
   ))
-  create_log_entry("Authentication successful")
+  create_log_entry("ML project authentication successful")
 }, error = function(e) {
-  create_log_entry(paste("Authentication failed:", conditionMessage(e)), "ERROR")
+  create_log_entry(paste("ML project authentication failed:", conditionMessage(e)), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
 })
+
+# Secondary auth: Readiness project (for reading VALD data)
+readiness_creds_path <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS_READINESS", "")
+
+if (nzchar(readiness_creds_path) && file.exists(readiness_creds_path)) {
+  tryCatch({
+    create_log_entry("Authenticating to Readiness project (sac-vald-hub)")
+    cmd <- sprintf("gcloud auth print-access-token --key-file='%s'", readiness_creds_path)
+    tok <- system(cmd, intern = TRUE)
+    READINESS_ACCESS_TOKEN <<- tok[1]
+    
+    if (nzchar(READINESS_ACCESS_TOKEN)) {
+      create_log_entry("Readiness project authentication successful")
+    } else {
+      create_log_entry("Warning: Could not get readiness token, will use ML token for all operations", "WARN")
+      READINESS_ACCESS_TOKEN <<- ML_ACCESS_TOKEN
+    }
+  }, error = function(e) {
+    create_log_entry(paste("Readiness auth warning:", conditionMessage(e), "- will use ML token"), "WARN")
+    READINESS_ACCESS_TOKEN <<- ML_ACCESS_TOKEN
+  })
+} else {
+  create_log_entry("No separate readiness credentials - will use ML credentials for all operations", "INFO")
+  READINESS_ACCESS_TOKEN <- ML_ACCESS_TOKEN
+}
+
+# Helper function to switch to ML project credentials
+use_ml_credentials <- function() {
+  bq_auth(token = gargle::gargle2.0_token(
+    scope = 'https://www.googleapis.com/auth/bigquery',
+    client = gargle::gargle_client(),
+    credentials = list(access_token = ML_ACCESS_TOKEN)
+  ))
+}
+
+# Helper function to switch to Readiness project credentials
+use_readiness_credentials <- function() {
+  bq_auth(token = gargle::gargle2.0_token(
+    scope = 'https://www.googleapis.com/auth/bigquery',
+    client = gargle::gargle_client(),
+    credentials = list(access_token = READINESS_ACCESS_TOKEN)
+  ))
+}
 
 ################################################################################
 # HELPER FUNCTIONS
@@ -944,7 +992,7 @@ if (nzchar(has_matches_hint)) {
 if (!nzchar(has_matches_hint)) {
   create_log_entry("No HAS_MATCHES hint; performing readiness match check")
   
-  # Build SQL from template
+  # Build SQL from template - reads readiness from readiness project
   match_sql <- glue("
     WITH workload AS (
       SELECT DISTINCT
@@ -955,6 +1003,7 @@ if (!nzchar(has_matches_hint)) {
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
     readiness_raw AS (
+      -- Reading directly from readiness project (sac-vald-hub)
       SELECT
         DATE(date) AS date,
         LOWER(TRIM(full_name)) AS vald_full_name_norm,
@@ -969,7 +1018,7 @@ if (!nzchar(has_matches_hint)) {
             0
           )
         ) AS readiness
-      FROM `{project}.{dataset}.{readiness_table}`
+      FROM `{project_readiness}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
@@ -996,6 +1045,9 @@ if (!nzchar(has_matches_hint)) {
      AND rd.date       = w.date
   ")
   
+  # Switch to ML credentials for query (accesses both projects via cross-project query)
+  use_ml_credentials()
+  
   mres <- tryCatch(
     bq_table_download(bq_project_query(project, match_sql)),
     error = function(e) { 
@@ -1019,6 +1071,10 @@ if (!nzchar(has_matches_hint)) {
 # Uniqueness is enforced via MERGE logic instead of table constraints.
 ################################################################################
 create_log_entry("Initializing model registry tables")
+
+# Ensure we're using ML credentials for all writes to sac-ml-models
+use_ml_credentials()
+
 tryCatch({
   ds <- bq_dataset(project, dataset)
   if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
@@ -1139,11 +1195,13 @@ tryCatch({
 })
 
 ################################################################################
-# LOAD DATA (MATCHING LOCAL IMPLEMENTATION)
+# LOAD DATA (USING APPROPRIATE CREDENTIALS FOR EACH PROJECT)
 ################################################################################
 
-# Load workload_daily from BigQuery
-create_log_entry("Loading workload data from BigQuery")
+# Load workload_daily from BigQuery (from ML project using ML credentials)
+create_log_entry("Loading workload data from BigQuery (sac-ml-models)")
+use_ml_credentials()
+
 workload_daily_result <- retry_operation(
   {
     sql <- glue("
@@ -1173,8 +1231,12 @@ workload_daily <- workload_daily_result[["result"]]
 workload_daily <- validate_dates(workload_daily, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_daily)} rows"))
 
-# Load vald_fd_jumps from BigQuery (from readiness project)
-create_log_entry("Loading VALD FD jumps data from BigQuery (readiness project)")
+# Load vald_fd_jumps from BigQuery (directly from readiness project)
+create_log_entry("Loading VALD FD jumps data directly from readiness project (sac-vald-hub)")
+
+# Switch to readiness credentials for reading
+use_readiness_credentials()
+
 vald_fd_jumps_result <- retry_operation(
   {
     sql <- glue("
@@ -1184,15 +1246,18 @@ vald_fd_jumps_result <- retry_operation(
         jump_height_readiness,
         epf_readiness,
         rsi_readiness
-      FROM `{project}.{dataset}.{readiness_table}`
+      FROM `{project_readiness}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
-    bq_table_download(bq_project_query(project, sql))
+    bq_table_download(bq_project_query(project_readiness, sql))
   },
   max_attempts = MAX_RETRY_ATTEMPTS,
   wait_seconds = RETRY_WAIT_SECONDS,
-  operation_name = "VALD FD jumps data load"
+  operation_name = "VALD FD jumps data load from readiness project"
 )
+
+# Switch back to ML credentials for subsequent operations
+use_ml_credentials()
 
 if (!isTRUE(vald_fd_jumps_result[["success"]])) {
   create_log_entry("VALD FD jumps data load failed after retries", "ERROR")
@@ -1204,8 +1269,10 @@ vald_fd_jumps <- vald_fd_jumps_result[["result"]]
 vald_fd_jumps <- validate_dates(vald_fd_jumps, "date", "VALD FD jumps")
 create_log_entry(glue("VALD FD jumps data loaded: {nrow(vald_fd_jumps)} rows"))
 
-# Load roster_mapping from BigQuery
-create_log_entry("Loading roster mapping from BigQuery")
+# Load roster_mapping from BigQuery (from ML project using ML credentials)
+create_log_entry("Loading roster mapping from BigQuery (sac-ml-models)")
+use_ml_credentials()
+
 roster_mapping_result <- retry_operation(
   {
     sql <- glue("
