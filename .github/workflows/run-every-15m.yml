@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     concurrency:
       group: vald-q15
       cancel-in-progress: false
@@ -27,17 +27,17 @@ jobs:
         echo "LA  now: $(TZ=America/Los_Angeles date)"
 
         '
-    - name: "Gate to 06:00–19:59 PT"
-      id: gate
-      shell: bash
-      run: "LA_HOUR=$(TZ=America/Los_Angeles date +%H)\nif [ \"$LA_HOUR\" -ge 6 ]\
-        \ && [ \"$LA_HOUR\" -lt 20 ]; then\n  echo \"ok=true\" >> \"$GITHUB_OUTPUT\"\
-        \n  echo \"Proceeding (within 06:00–19:59 PT).\"\nelse\n  echo \"ok=false\"\
-        \ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00–19:59 PT — skipping.\"\
-        \nfi\n"
-    - name: Stop if gate says skip
-      if: steps.gate.outputs.ok != 'true'
-      run: exit 0
+    #- name: "Gate to 06:00–19:59 PT"
+      #id: gate
+      #shell: bash
+      #run: "LA_HOUR=$(TZ=America/Los_Angeles date +%H)\nif [ \"$LA_HOUR\" -ge 6 ]\
+        #\ && [ \"$LA_HOUR\" -lt 20 ]; then\n  echo \"ok=true\" >> \"$GITHUB_OUTPUT\"\
+        #\n  echo \"Proceeding (within 06:00–19:59 PT).\"\nelse\n  echo \"ok=false\"\
+        #\ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00–19:59 PT — skipping.\"\
+        #\nfi\n"
+    - #name: Stop if gate says skip
+      #if: steps.gate.outputs.ok != 'true'
+      #run: exit 0
     - uses: actions/checkout@v4
       if: steps.gate.outputs.ok == 'true'
     - name: Authenticate to Google Cloud (WIF)
