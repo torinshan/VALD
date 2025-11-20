@@ -31,6 +31,7 @@ team_name  <- Sys.getenv("TEAM_NAME",   "sacstate-football")
 # Table names
 workload_table    <- Sys.getenv("WORKLOAD_TABLE",    "workload_daily")
 readiness_table   <- Sys.getenv("READINESS_TABLE",   "vald_fd_jumps")
+readiness_table_ML   <- Sys.getenv("READINESS_TABLE_ML",   "vald_fd_jumps_test_copy")
 roster_table      <- Sys.getenv("ROSTER_TABLE",      "roster_mapping")
 predictions_table <- Sys.getenv("PREDICTIONS_TABLE", "readiness_predictions_byname")
 
@@ -1184,7 +1185,7 @@ vald_fd_jumps_result <- retry_operation(
         jump_height_readiness,
         epf_readiness,
         rsi_readiness
-      FROM `{project}.{dataset}.{readiness_table}`
+      FROM `{project}.{dataset}.{readiness_table_ML}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
     bq_table_download(bq_project_query(project, sql))
