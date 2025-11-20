@@ -165,12 +165,12 @@ jobs:
 
       - name: Ingest roster (local xlsx → BigQuery)
         env:
-          GCP_PROJECT:        ${{ env.GCP_PROJECT_ML }}
-          BQ_DATASET:         ${{ env.BQ_DATASET }}
-          BQ_LOCATION:        ${{ env.BQ_LOCATION }}
-          ROSTER_TABLE:       ${{ env.ROSTER_TABLE }}
-          ROSTER_LOCAL_FILE:  ".github/Sac State Roster - Summer 2025.xlsx"
-          ROSTER_SHEET:       "Master"
+          GCP_PROJECT: ${{ env.GCP_PROJECT_ML }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          ROSTER_TABLE: ${{ env.ROSTER_TABLE }}
+          ROSTER_LOCAL_FILE: ".github/Sac State Roster - Summer 2025.xlsx"
+          ROSTER_SHEET: "Master"
         run: Rscript ".github/scripts/roster_ingest.R"
 
       - name: Check roster ingest success
