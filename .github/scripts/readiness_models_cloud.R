@@ -156,8 +156,10 @@ readiness_creds_path <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS_READINESS", "
 if (nzchar(readiness_creds_path) && file.exists(readiness_creds_path)) {
   tryCatch({
     create_log_entry("Authenticating to Readiness project (sac-vald-hub)")
-    cmd <- sprintf("gcloud auth print-access-token --key-file='%s'", readiness_creds_path)
-    tok <- system(cmd, intern = TRUE)
+    # Activate service account first, then get access token
+    cmd1 <- sprintf("gcloud auth activate-service-account --key-file='%s'", readiness_creds_path)
+    system(cmd1)
+    tok <- system("gcloud auth print-access-token", intern = TRUE)
     READINESS_ACCESS_TOKEN <<- tok[1]
     
     if (nzchar(READINESS_ACCESS_TOKEN)) {
@@ -172,7 +174,7 @@ if (nzchar(readiness_creds_path) && file.exists(readiness_creds_path)) {
   })
 } else {
   create_log_entry("No separate readiness credentials - will use ML credentials for all operations", "INFO")
-  READINESS_ACCESS_TOKEN <- ML_ACCESS_TOKEN
+  READINESS_ACCESS_TOKEN <<- ML_ACCESS_TOKEN
 }
 
 # Helper function to switch to ML project credentials
@@ -1045,7 +1047,8 @@ if (!nzchar(has_matches_hint)) {
      AND rd.date       = w.date
   ")
   
-  # Switch to ML credentials for query (accesses both projects via cross-project query)
+  # Note: This cross-project query requires ML account to have read access to readiness project
+  # The gha-bq service account has roles/editor on sac-ml-models which provides cross-project access
   use_ml_credentials()
   
   mres <- tryCatch(
