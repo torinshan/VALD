@@ -1233,12 +1233,8 @@ workload_daily <- workload_daily_result[["result"]]
 workload_daily <- validate_dates(workload_daily, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_daily)} rows"))
 
-# Load vald_fd_jumps from BigQuery (from ML project - already synced by workflow)
-create_log_entry("Loading VALD FD jumps data from ML project (sac-ml-models)")
-
-# Use ML credentials for reading (data is in sac-ml-models)
-use_ml_credentials()
-
+# Load vald_fd_jumps from BigQuery (from ML project after sync)
+create_log_entry("Loading VALD FD jumps data from BigQuery (ML project)")
 vald_fd_jumps_result <- retry_operation(
   {
     sql <- glue("
