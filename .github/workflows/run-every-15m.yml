@@ -35,9 +35,9 @@ jobs:
         #\n  echo \"Proceeding (within 06:00–19:59 PT).\"\nelse\n  echo \"ok=false\"\
         #\ >> \"$GITHUB_OUTPUT\"\n  echo \"Outside 06:00–19:59 PT — skipping.\"\
         #\nfi\n"
-    - #name: Stop if gate says skip
-      #if: steps.gate.outputs.ok != 'true'
-      #run: exit 0
+    # - name: Stop if gate says skip
+      # if: steps.gate.outputs.ok != 'true'
+      # run: exit 0
     - uses: actions/checkout@v4
     - name: Authenticate to Google Cloud (WIF)
       id: auth
@@ -133,7 +133,7 @@ jobs:
         password: your-app-password-here
         subject: "VALD q15 FAILED – run #${{ github.run_number }} on ${{ github.ref_name }}"
         to: "torinshan@gmail.com, torin.shanahan@csus.edu"
-        from: VALD Bot <vald-bot@example.com>
+        from: "VALD Bot <vald-bot@example.com>"
         html_body: |
           <p><strong>Status:</strong> Failed</p>
           <p><strong>Repo:</strong> ${{ github.repository }}<br/>
