@@ -29,7 +29,7 @@ env:
   GCP_PROJECT_READINESS: sac-vald-hub
 
   WORKLOAD_TABLE: workload_daily
-  READINESS_TABLE: vald_fd_jumps
+  READINESS_TABLE: vald_fd_jumps_test_copy
   ROSTER_TABLE: roster_mapping
   PREDICTIONS_TABLE: readiness_predictions_byname
 
