@@ -39,10 +39,8 @@ jobs:
       #if: steps.gate.outputs.ok != 'true'
       #run: exit 0
     - uses: actions/checkout@v4
-      if: steps.gate.outputs.ok == 'true'
     - name: Authenticate to Google Cloud (WIF)
       id: auth
-      if: steps.gate.outputs.ok == 'true'
       uses: google-github-actions/auth@v2
       with:
         workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
@@ -51,24 +49,20 @@ jobs:
         token_format: access_token
         access_token_lifetime: 3600s
     - name: Setup gcloud SDK
-      if: steps.gate.outputs.ok == 'true'
       uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: sac-vald-hub
         install_components: bq
     - name: Test GCP Authentication
-      if: steps.gate.outputs.ok == 'true'
       run: 'gcloud auth list
 
         bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
 
         '
     - uses: r-lib/actions/setup-r@v2
-      if: steps.gate.outputs.ok == 'true'
       with:
         use-public-rspm: true
     - name: Install R dependencies (pak)
-      if: steps.gate.outputs.ok == 'true'
       uses: r-lib/actions/setup-r-dependencies@v2
       with:
         extra-packages: 'DBI
@@ -95,16 +89,13 @@ jobs:
           R.utils'
         cache: true
     - name: System libs
-      if: steps.gate.outputs.ok == 'true'
       run: "sudo apt-get update\nsudo apt-get install -y \\\n  libcurl4-openssl-dev\
         \ libssl-dev libxml2-dev \\\n  libfontconfig1-dev libfreetype6-dev libpng-dev\
         \ \\\n  libtiff5-dev libjpeg-dev zlib1g-dev \\\n  libharfbuzz-dev libfribidi-dev\
         \ \\\n  libsecret-1-dev libsecret-1-0\n"
     - name: Verify script exists
-      if: steps.gate.outputs.ok == 'true'
       run: test -f .github/scripts/run.R
     - name: Run R pipeline
-      if: steps.gate.outputs.ok == 'true'
       env:
         VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
         VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
@@ -117,14 +108,14 @@ jobs:
 
         '
     - name: Ensure BigQuery dataset exists
-      if: steps.gate.outputs.ok == 'true' && always()
+      if: always()
       run: 'bq mk --dataset --location=US "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset
         exists or creation failed"
 
         '
     - name: Check processing logs (tail)
       id: tail_logs
-      if: steps.gate.outputs.ok == 'true' && always()
+      if: always()
       run: "{\n  bq query --use_legacy_sql=false --location=US --format=pretty \\\n\
         \    \"SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', timestamp) AS ts, level,\
         \ message\n     FROM \\`${GCP_PROJECT}.${BQ_DATASET}.vald_processing_log\\\
@@ -133,7 +124,7 @@ jobs:
         \ found for this run.\"\necho 'last<<EOF' >> \"$GITHUB_OUTPUT\"\ncat /tmp/log_tail.txt\
         \ >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"\n"
     - name: Send failure notification
-      if: failure() && steps.gate.outputs.ok == 'true'
+      if: failure()
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
