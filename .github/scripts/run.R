@@ -1546,7 +1546,7 @@ if (nrow(nord_tests) > 0) {
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
 tests_delta <- forcedecks_raw %>% select(test_ID, test_type) %>% distinct()
 bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
-bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = character())
+bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = c("test_type"))
 
 # RSI fix
 fix_rsi_data_type()
