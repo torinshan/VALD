@@ -714,6 +714,8 @@ bq_upsert <- function(data, table_name, key="test_ID",
       select(-.row_id)
 
     combined <- standardize_data_types(combined, table_name)
+    # Validate schema again after merge to handle new columns
+    combined <- validate_and_fix_schema(combined, table_name, ds)
     bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
   }
 
