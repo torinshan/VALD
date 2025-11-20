@@ -103,7 +103,7 @@ jobs:
 
       - name: Verify makeup script exists
         if: steps.gate.outputs.ok == 'true'
-        run: test -f .github/scripts/saturday_makeup.r
+        run: test -f .github/scripts/saturday_makeup.R
 
       - name: Install R packages (CRAN)
         if: steps.gate.outputs.ok == 'true'
@@ -135,7 +135,7 @@ jobs:
           VALD_REGION: use
         run: |
           set -e
-          Rscript .github/scripts/saturday_makeup.r
+          Rscript .github/scripts/saturday_makeup.R
 
       - name: Check makeup logs (tail)
         id: tail_logs
