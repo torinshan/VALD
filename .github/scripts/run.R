@@ -381,14 +381,48 @@ validate_and_fix_schema <- function(data, table_name, ds) {
       ), "INFO")
     }
     
-    # Check for columns in schema but not in data (less critical, just informational)
+    # Check for columns in schema but not in data
+    # CRITICAL: Add these columns with NA values to prevent upload errors
+    # especially for clustering fields like test_type
     missing_in_data <- setdiff(existing_fields, data_fields)
     if (length(missing_in_data) > 0) {
       create_log_entry(paste(
-        "Note:", length(missing_in_data),
-        "columns exist in BigQuery schema but not in current data:",
+        "Adding", length(missing_in_data),
+        "missing columns from BigQuery schema to data with NA values:",
         paste(head(missing_in_data, 10), collapse = ", ")
       ), "INFO")
+      
+      # Add missing columns with NA values based on their type in the schema
+      for (col in missing_in_data) {
+        # Find the field type from the schema
+        field_info <- meta$schema$fields[sapply(meta$schema$fields, function(f) f$name == col)]
+        if (length(field_info) > 0) {
+          field_type <- field_info[[1]]$type
+          
+          # Assign NA of the appropriate type
+          if (field_type %in% c("STRING", "BYTES")) {
+            data[[col]] <- NA_character_
+          } else if (field_type %in% c("INTEGER", "INT64")) {
+            data[[col]] <- NA_integer_
+          } else if (field_type %in% c("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC")) {
+            data[[col]] <- NA_real_
+          } else if (field_type == "BOOLEAN") {
+            data[[col]] <- NA
+          } else if (field_type == "DATE") {
+            data[[col]] <- as.Date(NA)
+          } else if (field_type == "TIMESTAMP") {
+            data[[col]] <- as.POSIXct(NA)
+          } else if (field_type == "TIME") {
+            data[[col]] <- hms::as_hms(NA)
+          } else {
+            # Default to character for unknown types
+            data[[col]] <- NA_character_
+          }
+        } else {
+          # If we can't determine type, use character
+          data[[col]] <- NA_character_
+        }
+      }
     }
     
   }, error = function(e) {
