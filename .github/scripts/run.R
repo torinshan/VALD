@@ -1587,6 +1587,19 @@ if (nrow(nord_tests) > 0) {
 # Dates & Tests (MERGE)
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
 tests_delta <- forcedecks_raw %>% select(test_ID, test_type) %>% distinct()
+
+# Ensure tests table has only unique test_IDs
+tests_before_dedup <- nrow(tests_delta)
+tests_delta <- tests_delta %>% distinct(test_ID, .keep_all = TRUE)
+tests_after_dedup <- nrow(tests_delta)
+if (tests_before_dedup != tests_after_dedup) {
+  create_log_entry(paste(
+    "Removed", tests_before_dedup - tests_after_dedup, 
+    "duplicate test_IDs from tests table"
+  ), "WARN")
+}
+create_log_entry(paste("Uploading", tests_after_dedup, "unique test_IDs to tests table"), "INFO")
+
 bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
 bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = c("test_type"))
 
