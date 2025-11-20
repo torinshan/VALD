@@ -994,7 +994,7 @@ if (nzchar(has_matches_hint)) {
 if (!nzchar(has_matches_hint)) {
   create_log_entry("No HAS_MATCHES hint; performing readiness match check")
   
-  # Build SQL from template - reads readiness from readiness project
+  # Build SQL from template - reads all data from ML project
   match_sql <- glue("
     WITH workload AS (
       SELECT DISTINCT
@@ -1005,7 +1005,7 @@ if (!nzchar(has_matches_hint)) {
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
     readiness_raw AS (
-      -- Reading directly from readiness project (sac-vald-hub)
+      -- Reading from ML project (data synced by workflow)
       SELECT
         DATE(date) AS date,
         LOWER(TRIM(full_name)) AS vald_full_name_norm,
@@ -1020,7 +1020,7 @@ if (!nzchar(has_matches_hint)) {
             0
           )
         ) AS readiness
-      FROM `{project_readiness}.{dataset}.{readiness_table}`
+      FROM `{project}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
         AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {match_lookback_days} DAY)
     ),
@@ -1047,8 +1047,7 @@ if (!nzchar(has_matches_hint)) {
      AND rd.date       = w.date
   ")
   
-  # Note: This cross-project query requires ML account to have read access to readiness project
-  # The gha-bq service account has roles/editor on sac-ml-models which provides cross-project access
+  # Use ML credentials for query (all data is in sac-ml-models)
   use_ml_credentials()
   
   mres <- tryCatch(
@@ -1234,11 +1233,11 @@ workload_daily <- workload_daily_result[["result"]]
 workload_daily <- validate_dates(workload_daily, "date", "workload")
 create_log_entry(glue("Workload data loaded: {nrow(workload_daily)} rows"))
 
-# Load vald_fd_jumps from BigQuery (directly from readiness project)
-create_log_entry("Loading VALD FD jumps data directly from readiness project (sac-vald-hub)")
+# Load vald_fd_jumps from BigQuery (from ML project - already synced by workflow)
+create_log_entry("Loading VALD FD jumps data from ML project (sac-ml-models)")
 
-# Switch to readiness credentials for reading
-use_readiness_credentials()
+# Use ML credentials for reading (data is in sac-ml-models)
+use_ml_credentials()
 
 vald_fd_jumps_result <- retry_operation(
   {
@@ -1249,18 +1248,17 @@ vald_fd_jumps_result <- retry_operation(
         jump_height_readiness,
         epf_readiness,
         rsi_readiness
-      FROM `{project_readiness}.{dataset}.{readiness_table}`
+      FROM `{project}.{dataset}.{readiness_table}`
       WHERE date BETWEEN '{cfg_start_date}' AND '{cfg_end_date}'
     ")
-    bq_table_download(bq_project_query(project_readiness, sql))
+    bq_table_download(bq_project_query(project, sql))
   },
   max_attempts = MAX_RETRY_ATTEMPTS,
   wait_seconds = RETRY_WAIT_SECONDS,
-  operation_name = "VALD FD jumps data load from readiness project"
+  operation_name = "VALD FD jumps data load from ML project"
 )
 
-# Switch back to ML credentials for subsequent operations
-use_ml_credentials()
+# Continue with ML credentials for subsequent operations
 
 if (!isTRUE(vald_fd_jumps_result[["success"]])) {
   create_log_entry("VALD FD jumps data load failed after retries", "ERROR")
