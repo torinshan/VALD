@@ -615,6 +615,38 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   invisible(TRUE)
 }
 
+# Update table schema if new columns are present
+update_table_schema <- function(tbl, data) {
+  if (!bq_table_exists(tbl)) return(invisible(FALSE))
+  
+  tryCatch({
+    meta <- bq_table_meta(tbl)
+    existing_fields <- sapply(meta$schema$fields, function(f) f$name)
+    data_fields <- names(data)
+    new_columns <- setdiff(data_fields, existing_fields)
+    
+    if (length(new_columns) > 0) {
+      create_log_entry(paste(
+        "Updating schema for", tbl$table, "- adding", length(new_columns), 
+        "new columns:", paste(new_columns, collapse = ", ")
+      ), "INFO")
+      
+      # Get new schema with all fields (existing + new)
+      new_schema <- as_bq_fields(data)
+      
+      # Use bq_table_patch to update schema
+      bq_table_patch(tbl, fields = new_schema)
+      create_log_entry(paste("Schema updated successfully for", tbl$table), "INFO")
+      return(invisible(TRUE))
+    }
+    
+    return(invisible(FALSE))
+  }, error = function(e) {
+    create_log_entry(paste("Error updating schema for", tbl$table, ":", e$message), "ERROR")
+    return(invisible(FALSE))
+  })
+}
+
 is_character_col <- function(colname) {
   colname %in% c("name","full_name","given_name","family_name","email","team",
                  "position","position_class","sport","sex","test_type","triallimb",
@@ -680,6 +712,9 @@ bq_upsert <- function(data, table_name, key="test_ID",
   }
 
   if (mode == "TRUNCATE") {
+    # Update schema if there are new columns
+    update_table_schema(tbl, data)
+    
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
     meta <- bq_table_meta(tbl)
     num_rows <- if (!is.null(meta$numRows)) meta$numRows else "NA"
@@ -694,6 +729,9 @@ bq_upsert <- function(data, table_name, key="test_ID",
   existing <- read_bq_table(table_name)
 
   if (nrow(existing) == 0) {
+    # Update schema if there are new columns
+    update_table_schema(tbl, data)
+    
     bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
   } else {
     existing[[key]] <- as.character(existing[[key]])
@@ -716,6 +754,10 @@ bq_upsert <- function(data, table_name, key="test_ID",
     combined <- standardize_data_types(combined, table_name)
     # Validate schema again after merge to handle new columns
     combined <- validate_and_fix_schema(combined, table_name, ds)
+    
+    # Update schema if there are new columns
+    update_table_schema(tbl, combined)
+    
     bq_table_upload(tbl, combined, write_disposition = "WRITE_TRUNCATE")
   }
 
@@ -1545,6 +1587,19 @@ if (nrow(nord_tests) > 0) {
 # Dates & Tests (MERGE)
 dates_delta <- forcedecks_raw %>% select(date) %>% distinct()
 tests_delta <- forcedecks_raw %>% select(test_ID, test_type) %>% distinct()
+
+# Ensure tests table has only unique test_IDs
+tests_before_dedup <- nrow(tests_delta)
+tests_delta <- tests_delta %>% distinct(test_ID, .keep_all = TRUE)
+tests_after_dedup <- nrow(tests_delta)
+if (tests_before_dedup != tests_after_dedup) {
+  create_log_entry(paste(
+    "Removed", tests_before_dedup - tests_after_dedup, 
+    "duplicate test_IDs from tests table"
+  ), "WARN")
+}
+create_log_entry(paste("Uploading", tests_after_dedup, "unique test_IDs to tests table"), "INFO")
+
 bq_upsert(dates_delta, "dates", key="date", mode="MERGE", partition_field="date", cluster_fields = character())
 bq_upsert(tests_delta, "tests", key="test_ID", mode="MERGE", partition_field=NULL, cluster_fields = c("test_type"))
 
