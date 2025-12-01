@@ -1860,6 +1860,7 @@ create_log_entry(glue("Generated version ID: {version_id}"))
 
 all_results <- list()
 all_predictions <- list()
+trained_models <- list()  # Store trained models for later prediction generation
 success_count <- 0
 fail_count <- 0
 
@@ -2462,75 +2463,13 @@ for (i in seq_len(n_athletes)) {
       create_log_entry(glue("  SUCCESS: {best_cand[['model_type']]} (RMSE={round(best_cand[['primary_rmse']], 3)})"))
       success_count <- success_count + 1
       
-      # Generate predictions
-      all_data <- rbind(ath_train_df, ath_test_df)
-      if (nrow(all_data) > 0) {
-        preds_model <- tryCatch({
-          fitted_type <- best_cand[["fitted"]][["type"]]
-          if (identical(fitted_type, "lm")) {
-            predict(best_cand[["fitted"]][["model"]], all_data)
-          } else if (identical(fitted_type, "glmnet")) {
-            if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
-              X_scaled <- safe_scale_apply(all_data, best_cand[["fitted"]][["preprocessing"]])
-              as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
-            } else {
-              X <- as.matrix(all_data[, preds, drop=FALSE])
-              as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
-            }
-          } else if (identical(fitted_type, "bnlearn")) {
-            as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = all_data[, preds, drop=FALSE]))
-          } else {
-            rep(NA_real_, nrow(all_data))
-          }
-        }, error = function(e) {
-          create_log_entry(glue("  Prediction generation failed: {conditionMessage(e)}"), "WARN")
-          rep(NA_real_, nrow(all_data))
-        })
-        
-        # Defensive extraction of metadata columns - handle empty data.tables safely
-        # Only include metadata for rows that actually have predictions (i.e., in all_data)
-        meta_cols <- c("official_id", "date", "readiness", "is_test")
-        train_meta <- if (nrow(ath_train) > 0 && all(meta_cols %in% names(ath_train))) {
-          ath_train[, ..meta_cols]
-        } else {
-          data.table(official_id = character(), date = as.Date(character()), 
-                    readiness = numeric(), is_test = integer())
-        }
-        
-        # Only include test_meta if ath_test_df has rows (i.e., not cleared for CV mode)
-        test_meta <- if (nrow(ath_test_df) > 0 && nrow(ath_test) > 0 && all(meta_cols %in% names(ath_test))) {
-          ath_test[, ..meta_cols]
-        } else {
-          data.table(official_id = character(), date = as.Date(character()), 
-                    readiness = numeric(), is_test = integer())
-        }
-        
-        pred_meta <- rbind(train_meta, test_meta)
-        
-        # Validate that prediction vector matches metadata rows
-        if (length(preds_model) != nrow(pred_meta)) {
-          create_log_entry(
-            glue("  WARNING: Prediction vector size mismatch: expected {nrow(pred_meta)}, got {length(preds_model)}. ",
-                 "Padding with NAs to match."),
-            "WARN"
-          )
-          # Pad or truncate to match
-          if (length(preds_model) < nrow(pred_meta)) {
-            preds_model <- c(preds_model, rep(NA_real_, nrow(pred_meta) - length(preds_model)))
-          } else {
-            preds_model <- preds_model[1:nrow(pred_meta)]
-          }
-        }
-        
-        pred_df <- pred_meta %>%
-          mutate(
-            predicted_readiness = preds_model,
-            model_id = save_result[["model_id"]] %||% NA_character_,
-            version_id = save_result[["version_id"]] %||% NA_character_,
-            prediction_date = Sys.time()
-          )
-        all_predictions[[length(all_predictions) + 1]] <- pred_df
-      }
+      # Store the trained model for later use in generating predictions for ALL workload days
+      trained_models[[athlete_id]] <- list(
+        candidate = best_cand,
+        predictors = preds,
+        imputation_medians = imp[["medians"]],
+        save_result = save_result
+      )
       
       # Save summary row
       all_results[[length(all_results) + 1]] <- tibble(
@@ -2562,6 +2501,150 @@ for (i in seq_len(n_athletes)) {
     create_log_entry(glue("  ERROR: {conditionMessage(e)}"), "ERROR")
     fail_count <- fail_count + 1
   })
+}
+
+################################################################################
+# GENERATE PREDICTIONS FOR ALL WORKLOAD DATA
+################################################################################
+create_log_entry("Generating predictions for ALL workload days (not just train/test)")
+
+# Prepare ALL workload data for prediction (all athletes, all dates)
+workload_for_prediction <- workload_with_off_id %>%
+  transmute(
+    official_id,
+    date,
+    distance              = distance,
+    hsd                   = high_speed_distance,
+    ml                    = mechanical_load,
+    distance_7_day        = distance_7d,
+    hsd_7_day             = hsd_7d,
+    ml_7_day              = ml_7d,
+    distance_28_day       = distance_28d,
+    hsd_28_day            = hsd_28d,
+    ml_28_day             = ml_28d,
+    distance_montony      = distance_monotony_7d,
+    ml_montony            = ml_monotony_7d
+  )
+
+create_log_entry(glue("Total workload rows to predict: {nrow(workload_for_prediction)} athlete-days"))
+
+# Get unique athletes in workload data
+workload_athletes <- unique(workload_for_prediction$official_id)
+create_log_entry(glue("Athletes in workload data: {length(workload_athletes)}"))
+create_log_entry(glue("Athletes with trained models: {length(trained_models)}"))
+
+# Generate predictions for each athlete
+prediction_results <- list()
+athletes_with_predictions <- 0
+athletes_skipped <- 0
+
+for (athlete_id in workload_athletes) {
+  # Get workload data for this athlete
+  athlete_workload <- workload_for_prediction %>%
+    filter(official_id == athlete_id)
+  
+  if (nrow(athlete_workload) == 0) {
+    next
+  }
+  
+  # Check if this athlete has a trained model
+  if (athlete_id %in% names(trained_models)) {
+    # Use trained model to generate predictions
+    model_info <- trained_models[[athlete_id]]
+    best_cand <- model_info$candidate
+    preds <- model_info$predictors
+    imp_medians <- model_info$imputation_medians
+    save_result <- model_info$save_result
+    
+    # Prepare data for prediction
+    pred_data <- as.data.frame(athlete_workload)
+    pred_data <- to_numeric_df(pred_data, preds)
+    
+    # Apply imputation using the same medians from training
+    for (p in preds) {
+      if (p %in% names(pred_data) && p %in% names(imp_medians)) {
+        pred_data[[p]][is.na(pred_data[[p]])] <- imp_medians[[p]]
+      }
+    }
+    
+    # Generate predictions based on model type
+    preds_model <- tryCatch({
+      fitted_type <- best_cand[["fitted"]][["type"]]
+      if (identical(fitted_type, "lm")) {
+        predict(best_cand[["fitted"]][["model"]], pred_data)
+      } else if (identical(fitted_type, "glmnet")) {
+        if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
+          X_scaled <- safe_scale_apply(pred_data, best_cand[["fitted"]][["preprocessing"]])
+          as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
+        } else {
+          X <- as.matrix(pred_data[, preds, drop=FALSE])
+          as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
+        }
+      } else if (identical(fitted_type, "bnlearn")) {
+        as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = pred_data[, preds, drop=FALSE]))
+      } else if (identical(fitted_type, "bayesridge_params")) {
+        # Bayesian Ridge with stored parameters
+        preprocessing <- best_cand[["fitted"]][["preprocessing"]]
+        coefs <- best_cand[["fitted"]][["coefficients"]]
+        intercept <- best_cand[["fitted"]][["intercept"]]
+        
+        # Scale data
+        if (isTRUE(preprocessing[["normalization"]])) {
+          X_scaled <- safe_scale_apply(pred_data, preprocessing)
+        } else {
+          X_scaled <- as.matrix(pred_data[, preds, drop=FALSE])
+        }
+        
+        # Manual prediction: intercept + sum(coef * feature)
+        preds_vec <- rep(intercept, nrow(X_scaled))
+        for (i in seq_along(coefs)) {
+          preds_vec <- preds_vec + coefs[i] * X_scaled[, i]
+        }
+        preds_vec
+      } else {
+        rep(NA_real_, nrow(pred_data))
+      }
+    }, error = function(e) {
+      create_log_entry(glue("  Prediction failed for {athlete_id}: {conditionMessage(e)}"), "WARN")
+      rep(NA_real_, nrow(pred_data))
+    })
+    
+    # Create prediction dataframe
+    pred_df <- athlete_workload %>%
+      mutate(
+        predicted_readiness = preds_model,
+        model_id = save_result[["model_id"]] %||% NA_character_,
+        version_id = save_result[["version_id"]] %||% NA_character_,
+        prediction_method = "trained_model",
+        model_type = best_cand[["model_type"]]
+      )
+    
+    prediction_results[[length(prediction_results) + 1]] <- pred_df
+    athletes_with_predictions <- athletes_with_predictions + 1
+    
+  } else {
+    # No trained model for this athlete - skip for now
+    # (Could implement DAX-based fallback here in future)
+    athletes_skipped <- athletes_skipped + 1
+  }
+}
+
+create_log_entry(glue("Predictions generated: {athletes_with_predictions} athletes with models"))
+create_log_entry(glue("Athletes skipped (no model): {athletes_skipped}"))
+
+# Combine all predictions
+if (length(prediction_results) > 0) {
+  all_predictions_combined <- bind_rows(prediction_results)
+  
+  create_log_entry(glue("Total prediction rows generated: {nrow(all_predictions_combined)}"))
+  create_log_entry(glue("Date range: {min(all_predictions_combined$date)} to {max(all_predictions_combined$date)}"))
+  create_log_entry(glue("Unique athletes with predictions: {length(unique(all_predictions_combined$official_id))}"))
+  
+  # Replace the old all_predictions list with the new comprehensive predictions
+  all_predictions <- list(all_predictions_combined)
+} else {
+  create_log_entry("No predictions generated", "WARN")
+  all_predictions <- list()
 }
 
 ################################################################################
