@@ -2612,10 +2612,10 @@ for (athlete_id in workload_athletes) {
     # Get train/test split information for this athlete (if available)
     athlete_split_info <- data_clean %>%
       filter(official_id == athlete_id) %>%
-      select(official_id, date, is_test, readiness) %>%
+      select(official_id, date, is_test) %>%
       as.data.frame()
     
-    # Create prediction dataframe and join with split/readiness info
+    # Create prediction dataframe and join with split info
     pred_df <- athlete_workload %>%
       left_join(athlete_split_info, by = c("official_id", "date")) %>%
       mutate(
@@ -2630,9 +2630,7 @@ for (athlete_id in workload_athletes) {
           is_test == 1 ~ "train",
           is_test == 2 ~ "test",
           TRUE ~ "out_of_sample"
-        ),
-        # Actual readiness from VALD data (for validation)
-        actual_readiness = readiness
+        )
       ) %>%
       select(-is_test)  # Remove is_test column, keep validation_split instead
     
@@ -2662,7 +2660,6 @@ if (length(prediction_results) > 0) {
     group_by(validation_split_label) %>%
     summarise(
       count = n(),
-      with_actual_readiness = sum(!is.na(actual_readiness)),
       .groups = "drop"
     )
   
@@ -2670,24 +2667,30 @@ if (length(prediction_results) > 0) {
   for (i in seq_len(nrow(split_summary))) {
     split_name <- split_summary$validation_split_label[i]
     count <- split_summary$count[i]
-    with_actual <- split_summary$with_actual_readiness[i]
-    create_log_entry(glue("  {split_name}: {count} rows ({with_actual} with actual readiness for validation)"))
+    create_log_entry(glue("  {split_name}: {count} rows"))
   }
   
-  # Calculate validation metrics for train and test sets
-  train_preds <- all_predictions_combined %>%
-    filter(validation_split_label == "train", !is.na(actual_readiness), !is.na(predicted_readiness))
+  # Calculate validation metrics for train and test sets by joining with actual readiness data
+  # This allows validation without storing actual_readiness in the predictions table
+  validation_data <- all_predictions_combined %>%
+    inner_join(
+      data_clean %>% select(official_id, date, readiness),
+      by = c("official_id", "date")
+    )
   
-  test_preds <- all_predictions_combined %>%
-    filter(validation_split_label == "test", !is.na(actual_readiness), !is.na(predicted_readiness))
+  train_preds <- validation_data %>%
+    filter(validation_split_label == "train", !is.na(readiness), !is.na(predicted_readiness))
+  
+  test_preds <- validation_data %>%
+    filter(validation_split_label == "test", !is.na(readiness), !is.na(predicted_readiness))
   
   if (nrow(train_preds) > 0) {
-    train_rmse <- sqrt(mean((train_preds$actual_readiness - train_preds$predicted_readiness)^2, na.rm=TRUE))
+    train_rmse <- sqrt(mean((train_preds$readiness - train_preds$predicted_readiness)^2, na.rm=TRUE))
     create_log_entry(glue("Training set validation RMSE: {round(train_rmse, 3)} ({nrow(train_preds)} rows)"))
   }
   
   if (nrow(test_preds) > 0) {
-    test_rmse <- sqrt(mean((test_preds$actual_readiness - test_preds$predicted_readiness)^2, na.rm=TRUE))
+    test_rmse <- sqrt(mean((test_preds$readiness - test_preds$predicted_readiness)^2, na.rm=TRUE))
     create_log_entry(glue("Test set validation RMSE: {round(test_rmse, 3)} ({nrow(test_preds)} rows)"))
   }
   
