@@ -2609,15 +2609,32 @@ for (athlete_id in workload_athletes) {
       rep(NA_real_, nrow(pred_data))
     })
     
-    # Create prediction dataframe
+    # Get train/test split information for this athlete (if available)
+    athlete_split_info <- data_clean %>%
+      filter(official_id == athlete_id) %>%
+      select(official_id, date, is_test, readiness) %>%
+      as.data.frame()
+    
+    # Create prediction dataframe and join with split/readiness info
     pred_df <- athlete_workload %>%
+      left_join(athlete_split_info, by = c("official_id", "date")) %>%
       mutate(
         predicted_readiness = preds_model,
         model_id = save_result[["model_id"]] %||% NA_character_,
         version_id = save_result[["version_id"]] %||% NA_character_,
         prediction_method = "trained_model",
-        model_type = best_cand[["model_type"]]
-      )
+        model_type = best_cand[["model_type"]],
+        # Mark validation split: 1=train, 2=test, NA=not in training data (future/out-of-sample)
+        validation_split = is_test,
+        validation_split_label = case_when(
+          is_test == 1 ~ "train",
+          is_test == 2 ~ "test",
+          TRUE ~ "out_of_sample"
+        ),
+        # Actual readiness from VALD data (for validation)
+        actual_readiness = readiness
+      ) %>%
+      select(-is_test)  # Remove is_test column, keep validation_split instead
     
     prediction_results[[length(prediction_results) + 1]] <- pred_df
     athletes_with_predictions <- athletes_with_predictions + 1
@@ -2639,6 +2656,40 @@ if (length(prediction_results) > 0) {
   create_log_entry(glue("Total prediction rows generated: {nrow(all_predictions_combined)}"))
   create_log_entry(glue("Date range: {min(all_predictions_combined$date)} to {max(all_predictions_combined$date)}"))
   create_log_entry(glue("Unique athletes with predictions: {length(unique(all_predictions_combined$official_id))}"))
+  
+  # Log validation split breakdown
+  split_summary <- all_predictions_combined %>%
+    group_by(validation_split_label) %>%
+    summarise(
+      count = n(),
+      with_actual_readiness = sum(!is.na(actual_readiness)),
+      .groups = "drop"
+    )
+  
+  create_log_entry("Prediction breakdown by validation split:")
+  for (i in seq_len(nrow(split_summary))) {
+    split_name <- split_summary$validation_split_label[i]
+    count <- split_summary$count[i]
+    with_actual <- split_summary$with_actual_readiness[i]
+    create_log_entry(glue("  {split_name}: {count} rows ({with_actual} with actual readiness for validation)"))
+  }
+  
+  # Calculate validation metrics for train and test sets
+  train_preds <- all_predictions_combined %>%
+    filter(validation_split_label == "train", !is.na(actual_readiness), !is.na(predicted_readiness))
+  
+  test_preds <- all_predictions_combined %>%
+    filter(validation_split_label == "test", !is.na(actual_readiness), !is.na(predicted_readiness))
+  
+  if (nrow(train_preds) > 0) {
+    train_rmse <- sqrt(mean((train_preds$actual_readiness - train_preds$predicted_readiness)^2, na.rm=TRUE))
+    create_log_entry(glue("Training set validation RMSE: {round(train_rmse, 3)} ({nrow(train_preds)} rows)"))
+  }
+  
+  if (nrow(test_preds) > 0) {
+    test_rmse <- sqrt(mean((test_preds$actual_readiness - test_preds$predicted_readiness)^2, na.rm=TRUE))
+    create_log_entry(glue("Test set validation RMSE: {round(test_rmse, 3)} ({nrow(test_preds)} rows)"))
+  }
   
   # Replace the old all_predictions list with the new comprehensive predictions
   all_predictions <- list(all_predictions_combined)
