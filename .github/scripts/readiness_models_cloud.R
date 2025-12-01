@@ -2645,7 +2645,21 @@ for (athlete_id in workload_athletes) {
     preds_model <- tryCatch({
       fitted_type <- best_cand[["fitted"]][["type"]]
       if (identical(fitted_type, "lm")) {
-        predict(best_cand[["fitted"]][["model"]], pred_data)
+        # For lm models, predict.lm may drop rows with NA values
+        # We need to ensure the prediction vector matches the input length
+        pred_result <- predict(best_cand[["fitted"]][["model"]], pred_data)
+        # If predictions are shorter, it means some rows were dropped
+        # Create a full-length vector and fill in predictions where available
+        if (length(pred_result) != nrow(pred_data)) {
+          full_preds <- rep(NA_real_, nrow(pred_data))
+          # Identify which rows have complete data for all predictors
+          complete_rows <- complete.cases(pred_data[, preds, drop=FALSE])
+          # Fill in predictions for complete rows
+          full_preds[complete_rows] <- as.numeric(pred_result)
+          full_preds
+        } else {
+          as.numeric(pred_result)
+        }
       } else if (identical(fitted_type, "glmnet")) {
         if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
           X_scaled <- safe_scale_apply(pred_data, best_cand[["fitted"]][["preprocessing"]])
@@ -2682,6 +2696,22 @@ for (athlete_id in workload_athletes) {
       create_log_entry(glue("  Prediction failed for {athlete_id}: {conditionMessage(e)}"), "WARN")
       rep(NA_real_, nrow(pred_data))
     })
+    
+    # Safety check: ensure predictions match the data size
+    if (length(preds_model) != nrow(athlete_workload)) {
+      create_log_entry(
+        glue("  WARNING: Prediction size mismatch for {athlete_id}: got {length(preds_model)}, expected {nrow(athlete_workload)}. Filling with NA."),
+        "WARN"
+      )
+      # Resize the prediction vector to match
+      if (length(preds_model) < nrow(athlete_workload)) {
+        # Pad with NAs if too short
+        preds_model <- c(preds_model, rep(NA_real_, nrow(athlete_workload) - length(preds_model)))
+      } else {
+        # Truncate if too long (shouldn't happen, but be safe)
+        preds_model <- preds_model[1:nrow(athlete_workload)]
+      }
+    }
     
     # Get train/test split information for this athlete (if available)
     athlete_split_info <- data_clean %>%
