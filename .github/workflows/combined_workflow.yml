@@ -13,11 +13,11 @@ on:
       start_date:
         description: "Model training start date (YYYY-MM-DD)"
         required: false
-        default: "2025-06-01"
+        default: "2025-03-01"
       end_date:
         description: "Model training end date (YYYY-MM-DD)"
         required: false
-        default: "2025-12-31"
+        default: "2026-12-31"
 
 env:
   # Workload & Model Project (new - destination for writes)
@@ -543,8 +543,8 @@ jobs:
           ROSTER_TABLE:      ${{ env.ROSTER_TABLE }}
           PREDICTIONS_TABLE: ${{ env.PREDICTIONS_TABLE }}
 
-          START_DATE:        ${{ github.event.inputs.start_date || '2025-06-01' }}
-          END_DATE:          ${{ github.event.inputs.end_date   || '2025-12-31' }}
+          START_DATE:        ${{ github.event.inputs.start_date || '2025-03-01' }}
+          END_DATE:          ${{ github.event.inputs.end_date   || '2026-12-31' }}
           TRAIN_FRACTION:    '0.80'
           MIN_TRAIN_OBS:     '3'
 
