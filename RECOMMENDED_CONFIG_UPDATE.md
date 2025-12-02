@@ -34,8 +34,6 @@ END_DATE:   ${{ github.event.inputs.end_date   || '2026-12-31' }}
 
 ## Impact Summary
 
-## Impact Summary
-
 ### Before Fix
 - **Time period used:** June 1, 2025 - November 11, 2025 (~5.5 months)
 - **Estimated records:** ~6,000-7,000 records
