@@ -592,7 +592,7 @@ parse_date_robust <- function(vec) {
 
 #' Extract coefficients from glmnet models (elastic_net, lasso, ridge)
 #' Returns a data frame in LONG format: one row per coefficient
-flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
+flatten_glmnet_model <- function(model_obj, model_id, athlete_id, athlete_display_name, model_type) {
   tryCatch({
     # Unwrap model if nested
     fit <- model_obj
@@ -628,6 +628,7 @@ flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
     coef_df <- tibble(
       model_id = model_id,
       athlete_id = athlete_id,
+      athlete_display_name = athlete_display_name,
       model_type = model_type,
       coefficient_name = coef_names,
       coefficient_value = coef_values,
@@ -640,6 +641,7 @@ flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
     hyper_df <- tibble(
       model_id = model_id,
       athlete_id = athlete_id,
+      athlete_display_name = athlete_display_name,
       model_type = model_type,
       coefficient_name = c("_lambda", "_alpha", "_n_features"),
       coefficient_value = c(lambda, alpha, sum(!coef_df$is_zero & coef_df$coefficient_type == "predictor")),
@@ -660,7 +662,7 @@ flatten_glmnet_model <- function(model_obj, model_id, athlete_id, model_type) {
 }
 
 #' Extract structure from Bayesian Network models
-flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
+flatten_bn_model <- function(model_obj, model_id, athlete_id, athlete_display_name, model_type) {
   tryCatch({
     # Unwrap model if nested
     bn_model <- model_obj
@@ -676,6 +678,7 @@ flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
       arc_df <- tibble(
         model_id = model_id,
         athlete_id = athlete_id,
+        athlete_display_name = athlete_display_name,
         model_type = model_type,
         coefficient_name = paste0(arcs[, "from"], " -> ", arcs[, "to"]),
         coefficient_value = 1.0,  # Presence of edge
@@ -691,6 +694,7 @@ flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
     meta_df <- tibble(
       model_id = model_id,
       athlete_id = athlete_id,
+      athlete_display_name = athlete_display_name,
       model_type = model_type,
       coefficient_name = c("_n_nodes", "_n_edges"),
       coefficient_value = c(length(nodes), nrow(arcs)),
@@ -710,18 +714,69 @@ flatten_bn_model <- function(model_obj, model_id, athlete_id, model_type) {
   })
 }
 
+#' Extract coefficients from linear models (lm)
+#' Returns a data frame in LONG format: one row per coefficient
+flatten_linear_model <- function(model_obj, model_id, athlete_id, athlete_display_name, model_type) {
+  tryCatch({
+    # Unwrap model if nested
+    fit <- model_obj
+    if (is.list(fit) && !is.null(fit$model)) fit <- fit$model
+    
+    # Get coefficients
+    coef_values <- as.numeric(coef(fit))
+    coef_names <- names(coef(fit))
+    
+    # Create long format data frame
+    coef_df <- tibble(
+      model_id = model_id,
+      athlete_id = athlete_id,
+      athlete_display_name = athlete_display_name,
+      model_type = model_type,
+      coefficient_name = coef_names,
+      coefficient_value = coef_values,
+      coefficient_type = if_else(coefficient_name == "(Intercept)", "intercept", "predictor"),
+      is_zero = abs(coefficient_value) < 1e-10,
+      extracted_at = Sys.time()
+    )
+    
+    # Add model metadata as special rows
+    meta_df <- tibble(
+      model_id = model_id,
+      athlete_id = athlete_id,
+      athlete_display_name = athlete_display_name,
+      model_type = model_type,
+      coefficient_name = c("_n_features"),
+      coefficient_value = c(sum(!coef_df$is_zero & coef_df$coefficient_type == "predictor")),
+      coefficient_type = "hyperparameter",
+      is_zero = FALSE,
+      extracted_at = Sys.time()
+    )
+    
+    bind_rows(coef_df, meta_df)
+    
+  }, error = function(e) {
+    create_log_entry(
+      sprintf("Failed to flatten linear model %s: %s", model_id, conditionMessage(e)),
+      "WARN"
+    )
+    NULL
+  })
+}
+
 #' Main function to flatten any model type
 #' Returns data frame ready for BigQuery upload
-flatten_model <- function(model_obj, model_id, athlete_id, model_type) {
+flatten_model <- function(model_obj, model_id, athlete_id, athlete_display_name, model_type) {
   
   # Normalize model_type
   model_type_lower <- tolower(model_type)
   
   # Route to appropriate flattener
   if (model_type_lower %in% c("elastic_net", "lasso", "ridge")) {
-    return(flatten_glmnet_model(model_obj, model_id, athlete_id, model_type))
+    return(flatten_glmnet_model(model_obj, model_id, athlete_id, athlete_display_name, model_type))
+  } else if (model_type_lower == "linear") {
+    return(flatten_linear_model(model_obj, model_id, athlete_id, athlete_display_name, model_type))
   } else if (model_type_lower == "bayesian_network") {
-    return(flatten_bn_model(model_obj, model_id, athlete_id, model_type))
+    return(flatten_bn_model(model_obj, model_id, athlete_id, athlete_display_name, model_type))
   } else {
     create_log_entry(
       sprintf("Unknown model type for flattening: %s", model_type),
@@ -1168,6 +1223,7 @@ tryCatch({
       CREATE TABLE IF NOT EXISTS `{project}.{dataset}.model_coefficients` (
         model_id STRING NOT NULL,
         athlete_id STRING,
+        athlete_display_name STRING,
         model_type STRING NOT NULL,
         coefficient_name STRING NOT NULL,
         coefficient_value FLOAT64,
@@ -1296,11 +1352,12 @@ create_log_entry(glue("Roster mapping loaded: {nrow(roster_mapping)} rows"))
 # CONNECT DATA (AS PER USER'S LOCAL IMPLEMENTATION)
 ################################################################################
 
-# Step 1: workload_with_off_id = workload_daily %>% mutate(official_id = roster_name) %>% select(-roster_name)
+# Step 1: workload_with_off_id = workload_daily %>% mutate(official_id = roster_name) 
+# Keep both roster_name (ID format) and create official_id for joins
 create_log_entry("Creating workload_with_off_id")
 workload_with_off_id <- workload_daily %>% 
-  mutate(official_id = roster_name) %>%
-  select(-roster_name)
+  mutate(official_id = roster_name)
+  # DO NOT select(-roster_name) - keep it for display purposes
 
 # Validate required columns
 required_workload_cols <- c("official_id", "date", "distance", "high_speed_distance", "mechanical_load")
@@ -1321,10 +1378,11 @@ if (null_id_count > 0) {
 # Step 2: vald_fd_jumps_with_off_id = vald_fd_jumps %>% 
 #         mutate(vald_name = full_name) %>% select(-full_name) %>% 
 #         left_join(roster_mapping, by = "vald_name") %>% filter(!is.na(official_id))
+# Keep vald_name (display name) for consistency
 create_log_entry("Creating vald_fd_jumps_with_off_id via roster mapping")
 vald_fd_jumps_with_off_id <- vald_fd_jumps %>% 
   mutate(vald_name = full_name) %>%
-  select(-full_name) %>% 
+  # Keep full_name for display purposes
   left_join(roster_mapping, by = "vald_name") %>% 
   filter(!is.na(official_id))
 
@@ -1335,16 +1393,17 @@ create_log_entry(glue("VALD FD jumps with official_id: {nrow(vald_fd_jumps_with_
 #         select(date,official_id,jump_height_readiness,epf_readiness,rsi_readiness) %>% 
 #         mutate(readiness = (jump_height_readiness + epf_readiness + rsi_readiness) / 3 ) %>% 
 #         select(-jump_height_readiness,-epf_readiness,-rsi_readiness)
+# Keep vald_name (display name) for later use
 create_log_entry("Calculating readiness scores")
 readiness <- vald_fd_jumps_with_off_id %>% 
-  select(date, official_id, jump_height_readiness, epf_readiness, rsi_readiness) %>% 
+  select(date, official_id, vald_name, jump_height_readiness, epf_readiness, rsi_readiness) %>% 
   mutate(
     # Use SAFE_DIVIDE logic: sum non-NULL values, divide by count of non-NULL values
     readiness_sum = coalesce(jump_height_readiness, 0) + coalesce(epf_readiness, 0) + coalesce(rsi_readiness, 0),
     readiness_count = (!is.na(jump_height_readiness)) + (!is.na(epf_readiness)) + (!is.na(rsi_readiness)),
     readiness = if_else(readiness_count > 0, readiness_sum / readiness_count, NA_real_)
   ) %>% 
-  select(date, official_id, readiness)
+  select(date, official_id, vald_name, readiness)
 
 create_log_entry(glue("Readiness data calculated: {nrow(readiness)} rows"))
 
@@ -1406,10 +1465,13 @@ tryCatch({
 # Step 4: merged_data = readiness %>% 
 #         left_join(workload_with_off_id, by = c("official_id" = "official_id", "date" = "date")) %>% 
 #         filter(!is.na(distance))
+# Preserve both roster_name (from workload, ID format) and vald_name (from readiness, display name)
 create_log_entry("Merging readiness and workload data by official_id and date")
 merged_data <- readiness %>% 
   left_join(workload_with_off_id, by = c("official_id" = "official_id", "date" = "date")) %>% 
-  filter(!is.na(distance))
+  filter(!is.na(distance)) %>%
+  # Create a unified display_name column: prefer vald_name if available, otherwise use roster_name
+  mutate(display_name = coalesce(vald_name, roster_name))
 
 create_log_entry(glue("Merged data: {nrow(merged_data)} rows with both readiness and workload"))
 if (nrow(merged_data) == 0) {
@@ -1440,6 +1502,7 @@ response_var <- "readiness"
 data_model <- data_split %>%
   transmute(
     official_id,
+    display_name,
     date,
     is_test,
     distance              = distance,
@@ -1883,6 +1946,13 @@ for (i in seq_len(n_athletes)) {
   
   tryCatch({
     ath_data  <- data_clean[official_id == athlete_id]
+    
+    # Get display name for this athlete (first non-NA value)
+    athlete_display_name <- ath_data$display_name[!is.na(ath_data$display_name)][1]
+    if (is.na(athlete_display_name)) {
+      athlete_display_name <- athlete_id  # Fallback to ID if no display name
+    }
+    
     ath_train <- ath_data[is_test == 1]
     ath_test  <- ath_data[is_test == 2]
     
@@ -1970,7 +2040,7 @@ for (i in seq_len(n_athletes)) {
     }
     
     # Save best model to registry (coefficients saved to BigQuery)
-    save_model_to_registry <- function(athlete_id, model_name, candidate, version_id) {
+    save_model_to_registry <- function(athlete_id, athlete_display_name, model_name, candidate, version_id) {
       # Defensive check: ensure candidate is a list
       if (!is.list(candidate)) {
         create_log_entry(
@@ -2345,7 +2415,8 @@ for (i in seq_len(n_athletes)) {
           model_id=model_id, 
           version_id=version_id, 
           artifact_uri=artifact_uri,
-          model_object=candidate[["fitted"]][["model"]]  # Model object for coefficient flattening
+          model_object=candidate[["fitted"]][["model"]],  # Model object for coefficient flattening
+          athlete_display_name=athlete_display_name  # Store for later use
         )
       }, error = function(e) {
         # Top-level error handler with full details
@@ -2395,7 +2466,7 @@ for (i in seq_len(n_athletes)) {
     }
     
     model_name <- paste(athlete_id, best_cand[["model_type"]], sep = "_")
-    save_result <- save_model_to_registry(athlete_id, model_name, best_cand, version_id)
+    save_result <- save_model_to_registry(athlete_id, athlete_display_name, model_name, best_cand, version_id)
     
     # ============================================
     # FLATTEN AND UPLOAD COEFFICIENTS TO BIGQUERY
@@ -2409,6 +2480,7 @@ for (i in seq_len(n_athletes)) {
         model_obj = save_result[["model_object"]],
         model_id = save_result[["model_id"]],
         athlete_id = athlete_id,
+        athlete_display_name = athlete_display_name,
         model_type = best_cand[["model_type"]]
       )
       
@@ -2474,7 +2546,7 @@ for (i in seq_len(n_athletes)) {
       # Save summary row
       all_results[[length(all_results) + 1]] <- tibble(
         athlete_id = athlete_id,
-        roster_name = NA_character_,
+        roster_name = athlete_display_name,
         model_type = best_cand[["model_type"]],
         model_id = save_result[["model_id"]] %||% NA_character_,
         version_id = save_result[["version_id"]] %||% NA_character_,
@@ -2509,9 +2581,11 @@ for (i in seq_len(n_athletes)) {
 create_log_entry("Generating predictions for ALL workload days (not just train/test)")
 
 # Prepare ALL workload data for prediction (all athletes, all dates)
+# Keep roster_name for display purposes
 workload_for_prediction <- workload_with_off_id %>%
   transmute(
     official_id,
+    roster_name,
     date,
     distance              = distance,
     hsd                   = high_speed_distance,
@@ -2571,7 +2645,21 @@ for (athlete_id in workload_athletes) {
     preds_model <- tryCatch({
       fitted_type <- best_cand[["fitted"]][["type"]]
       if (identical(fitted_type, "lm")) {
-        predict(best_cand[["fitted"]][["model"]], pred_data)
+        # For lm models, predict.lm may drop rows with NA values
+        # We need to ensure the prediction vector matches the input length
+        pred_result <- predict(best_cand[["fitted"]][["model"]], pred_data)
+        # If predictions are shorter, it means some rows were dropped
+        # Create a full-length vector and fill in predictions where available
+        if (length(pred_result) != nrow(pred_data)) {
+          full_preds <- rep(NA_real_, nrow(pred_data))
+          # Identify which rows have complete data for all predictors
+          complete_rows <- complete.cases(pred_data[, preds, drop=FALSE])
+          # Fill in predictions for complete rows
+          full_preds[complete_rows] <- as.numeric(pred_result)
+          full_preds
+        } else {
+          as.numeric(pred_result)
+        }
       } else if (identical(fitted_type, "glmnet")) {
         if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
           X_scaled <- safe_scale_apply(pred_data, best_cand[["fitted"]][["preprocessing"]])
@@ -2608,6 +2696,22 @@ for (athlete_id in workload_athletes) {
       create_log_entry(glue("  Prediction failed for {athlete_id}: {conditionMessage(e)}"), "WARN")
       rep(NA_real_, nrow(pred_data))
     })
+    
+    # Safety check: ensure predictions match the data size
+    if (length(preds_model) != nrow(athlete_workload)) {
+      create_log_entry(
+        glue("  WARNING: Prediction size mismatch for {athlete_id}: got {length(preds_model)}, expected {nrow(athlete_workload)}. Filling with NA."),
+        "WARN"
+      )
+      # Resize the prediction vector to match
+      if (length(preds_model) < nrow(athlete_workload)) {
+        # Pad with NAs if too short
+        preds_model <- c(preds_model, rep(NA_real_, nrow(athlete_workload) - length(preds_model)))
+      } else {
+        # Truncate if too long (shouldn't happen, but be safe)
+        preds_model <- preds_model[1:nrow(athlete_workload)]
+      }
+    }
     
     # Get train/test split information for this athlete (if available)
     athlete_split_info <- data_clean %>%
