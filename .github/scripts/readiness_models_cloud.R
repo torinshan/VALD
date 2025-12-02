@@ -2612,6 +2612,9 @@ prediction_results <- list()
 athletes_with_predictions <- 0
 athletes_skipped <- 0
 
+# Use consistent prediction_date for all predictions in this run
+run_prediction_date <- Sys.time()
+
 for (athlete_id in workload_athletes) {
   # Get workload data for this athlete
   athlete_workload <- workload_for_prediction %>%
@@ -2713,10 +2716,10 @@ for (athlete_id in workload_athletes) {
       }
     }
     
-    # Get train/test split information for this athlete (if available)
+    # Get train/test split information and readiness for this athlete (if available)
     athlete_split_info <- data_clean %>%
       filter(official_id == athlete_id) %>%
-      select(official_id, date, is_test) %>%
+      select(official_id, date, is_test, readiness) %>%
       as.data.frame()
     
     # Create prediction dataframe and join with split info
@@ -2726,17 +2729,28 @@ for (athlete_id in workload_athletes) {
         predicted_readiness = preds_model,
         model_id = save_result[["model_id"]] %||% NA_character_,
         version_id = save_result[["version_id"]] %||% NA_character_,
-        prediction_method = "trained_model",
-        model_type = best_cand[["model_type"]],
         # Mark validation split: 1=train, 2=test, NA=not in training data (future/out-of-sample)
         validation_split = is_test,
         validation_split_label = case_when(
           is_test == 1 ~ "train",
           is_test == 2 ~ "test",
           TRUE ~ "out_of_sample"
-        )
+        ),
+        prediction_date = run_prediction_date
       ) %>%
-      select(-is_test)  # Remove is_test column, keep validation_split instead
+      # Select only columns needed for BigQuery table
+      select(
+        official_id,
+        date,
+        readiness,
+        is_test,
+        predicted_readiness,
+        model_id,
+        version_id,
+        prediction_date,
+        validation_split,
+        validation_split_label
+      )
     
     prediction_results[[length(prediction_results) + 1]] <- pred_df
     athletes_with_predictions <- athletes_with_predictions + 1
@@ -2774,18 +2788,12 @@ if (length(prediction_results) > 0) {
     create_log_entry(glue("  {split_name}: {count} rows"))
   }
   
-  # Calculate validation metrics for train and test sets by joining with actual readiness data
-  # This allows validation without storing actual_readiness in the predictions table
-  validation_data <- all_predictions_combined %>%
-    inner_join(
-      data_clean %>% select(official_id, date, readiness),
-      by = c("official_id", "date")
-    )
-  
-  train_preds <- validation_data %>%
+  # Calculate validation metrics for train and test sets
+  # Readiness is already included in all_predictions_combined from the join above
+  train_preds <- all_predictions_combined %>%
     filter(validation_split_label == "train", !is.na(readiness), !is.na(predicted_readiness))
   
-  test_preds <- validation_data %>%
+  test_preds <- all_predictions_combined %>%
     filter(validation_split_label == "test", !is.na(readiness), !is.na(predicted_readiness))
   
   if (nrow(train_preds) > 0) {
