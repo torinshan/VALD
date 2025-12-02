@@ -380,7 +380,7 @@ jobs:
           '
 
           # Substitute environment variables
-          MATCH_SQL="$(envsubst <<<"$MATCH_SQL")"
+          MATCH_SQL="$(envsubst '${GCP_PROJECT_ML} ${BQ_DATASET} ${WORKLOAD_TABLE} ${READINESS_TABLE} ${ROSTER_TABLE}' <<<"$MATCH_SQL")"
 
           # Execute query
           set +e
@@ -584,13 +584,13 @@ jobs:
               model_type,
               ROUND(primary_rmse, 3) AS rmse,
               n_train,
-              FORMAT_TIMESTAMP('%H:%M', trained_at) AS time
+              FORMAT_TIMESTAMP("%H:%M", trained_at) AS time
             FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.model_training_summary`
             WHERE DATE(trained_at) = CURRENT_DATE()
             ORDER BY trained_at DESC
             LIMIT 10
             '
-            Q1="$(envsubst <<<"$Q1")"
+            Q1="$(envsubst '${GCP_PROJECT_ML} ${BQ_DATASET}' <<<"$Q1")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false --max_rows=10 "$Q1" 2>&1 || echo "No training results yet"
           fi
 
@@ -605,11 +605,11 @@ jobs:
               COUNT(DISTINCT athlete_id) AS athletes_trained,
               COUNT(*) AS total_models,
               ROUND(AVG(primary_rmse), 3) AS avg_rmse,
-              FORMAT_TIMESTAMP('%H:%M', MAX(trained_at)) AS last_run
+              FORMAT_TIMESTAMP("%H:%M", MAX(trained_at)) AS last_run
             FROM `${GCP_PROJECT_ML}.${BQ_DATASET}.model_training_summary`
             WHERE DATE(trained_at) = CURRENT_DATE()
             '
-            Q2="$(envsubst <<<"$Q2")"
+            Q2="$(envsubst '${GCP_PROJECT_ML} ${BQ_DATASET}' <<<"$Q2")"
             bq --location="$BQ_LOCATION" --project_id="$GCP_PROJECT_ML" query --use_legacy_sql=false "$Q2" 2>&1 || echo "No stats available"
           fi
 
