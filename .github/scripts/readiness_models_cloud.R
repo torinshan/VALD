@@ -2612,6 +2612,9 @@ prediction_results <- list()
 athletes_with_predictions <- 0
 athletes_skipped <- 0
 
+# Use consistent prediction_date for all predictions in this run
+run_prediction_date <- Sys.time()
+
 for (athlete_id in workload_athletes) {
   # Get workload data for this athlete
   athlete_workload <- workload_for_prediction %>%
@@ -2733,7 +2736,7 @@ for (athlete_id in workload_athletes) {
           is_test == 2 ~ "test",
           TRUE ~ "out_of_sample"
         ),
-        prediction_date = Sys.time()
+        prediction_date = run_prediction_date
       ) %>%
       # Select only columns needed for BigQuery table
       select(
