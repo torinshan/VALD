@@ -299,8 +299,8 @@ WHERE DATE(trained_at) = CURRENT_DATE()
 | Workload Ingestion | ✅ Operational | ⚠️ First 6 days/athlete dropped | Processing requirement |
 | Workload Table | ✅ Operational | ❌ None - stores all data | N/A |
 | Readiness Check | ✅ Operational | ⚠️ Last 90 days only | Pre-flight validation |
-| Model Training | ✅ Operational | ⚠️ Yes - 2025-06-01 to 2025-12-31 | Configurable |
-| Training Data Query | ✅ Operational | ⚠️ Uses same range as training | Configurable |
+| Model Training | ✅ Operational | ✅ 2025-03-01 to 2026-12-31 | Configurable |
+| Training Data Query | ✅ Operational | ✅ Uses same range as training | Configurable |
 
 **Key Takeaways:**
 1. ✅ Pipeline is **fully operational** - runs every 15 minutes automatically
