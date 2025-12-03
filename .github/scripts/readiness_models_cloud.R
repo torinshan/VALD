@@ -2664,15 +2664,35 @@ for (athlete_id in workload_athletes) {
           as.numeric(pred_result)
         }
       } else if (identical(fitted_type, "glmnet")) {
+        # For glmnet models, handle potential NA values that might cause size mismatches
         if (isTRUE(best_cand[["fitted"]][["preprocessing"]][["normalization"]])) {
           X_scaled <- safe_scale_apply(pred_data, best_cand[["fitted"]][["preprocessing"]])
-          as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
+          pred_result <- as.numeric(predict(best_cand[["fitted"]][["model"]], X_scaled, s="lambda.min"))
         } else {
           X <- as.matrix(pred_data[, preds, drop=FALSE])
-          as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
+          pred_result <- as.numeric(predict(best_cand[["fitted"]][["model"]], X, s="lambda.min"))
+        }
+        # Check if prediction length matches input
+        if (length(pred_result) != nrow(pred_data)) {
+          full_preds <- rep(NA_real_, nrow(pred_data))
+          complete_rows <- complete.cases(pred_data[, preds, drop=FALSE])
+          full_preds[complete_rows] <- pred_result
+          full_preds
+        } else {
+          pred_result
         }
       } else if (identical(fitted_type, "bnlearn")) {
-        as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = pred_data[, preds, drop=FALSE]))
+        # For bnlearn models, handle potential NA values that might cause size mismatches
+        pred_result <- as.numeric(predict(best_cand[["fitted"]][["model"]], node = response_var, data = pred_data[, preds, drop=FALSE]))
+        # Check if prediction length matches input
+        if (length(pred_result) != nrow(pred_data)) {
+          full_preds <- rep(NA_real_, nrow(pred_data))
+          complete_rows <- complete.cases(pred_data[, preds, drop=FALSE])
+          full_preds[complete_rows] <- pred_result
+          full_preds
+        } else {
+          pred_result
+        }
       } else if (identical(fitted_type, "bayesridge_params")) {
         # Bayesian Ridge with stored parameters
         preprocessing <- best_cand[["fitted"]][["preprocessing"]]

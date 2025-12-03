@@ -240,13 +240,13 @@ roll_features <- daily_sum %>%
     hsd_prev_day      = dplyr::lag(hsd_sum, 1),
     ml_prev_day       = dplyr::lag(ml_sum, 1),
 
-    distance_7d  = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    distance_7d  = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = FALSE),
     distance_28d = slider::slide_index_dbl(distance_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
-    hsd_7d  = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    hsd_7d  = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = FALSE),
     hsd_28d = slider::slide_index_dbl(hsd_sum, date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
-    ml_7d  = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = TRUE),
+    ml_7d  = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(6),  .complete = FALSE),
     ml_28d = slider::slide_index_dbl(ml_sum,  date, ~sum(.x, na.rm=TRUE), .before = days(27), .complete = FALSE),
 
     distance_monotony_7d = monotony_roll(distance_sum, date, 7),
@@ -272,7 +272,7 @@ work_data <- roll_features %>%
   ) %>%
   arrange(roster_name, date)
 
-create_log_entry(glue("Rows after 7d filter (drop only first 6 days per athlete): {nrow(work_data)}"))
+create_log_entry(glue("Rows after processing rolling features: {nrow(work_data)}"))
 
 # ===== Upsert helpers =====
 read_bq_table_rest <- function(tbl) {
