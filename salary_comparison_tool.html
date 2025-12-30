@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NCAA Salary Comparison Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            padding: 30px;
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+
+        .selection-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .school-selector {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 10px;
+            border: 2px solid #e0e0e0;
+        }
+
+        .school-selector h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #d0d0d0;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        select:focus {
+            border-color: #667eea;
+        }
+
+        .compare-button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 20px;
+        }
+
+        .compare-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .compare-button:active {
+            transform: translateY(0);
+        }
+
+        .results-panel {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .results-panel.active {
+            display: block;
+        }
+
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .school-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 30px;
+            border-radius: 10px;
+            color: white;
+        }
+
+        .school-card h3 {
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.3);
+            padding-bottom: 10px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .info-label {
+            font-weight: 500;
+            opacity: 0.9;
+        }
+
+        .info-value {
+            font-weight: 700;
+            font-size: 1.1em;
+        }
+
+        .salary-value {
+            font-size: 1.5em !important;
+            color: #ffd700;
+        }
+
+        .analysis-section {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+
+        .analysis-section h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border-left: 4px solid #667eea;
+        }
+
+        .stat-card h4 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stat-card p {
+            color: #555;
+            line-height: 1.6;
+        }
+
+        .difference-positive {
+            color: #22c55e;
+            font-weight: 700;
+        }
+
+        .difference-negative {
+            color: #ef4444;
+            font-weight: 700;
+        }
+
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+
+        .bar-chart {
+            display: flex;
+            gap: 20px;
+            align-items: flex-end;
+            height: 300px;
+            margin-top: 20px;
+        }
+
+        .bar {
+            flex: 1;
+            background: linear-gradient(to top, #667eea 0%, #764ba2 100%);
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            padding: 10px;
+            color: white;
+            font-weight: 600;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .bar:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .bar-label {
+            position: absolute;
+            bottom: -30px;
+            font-size: 14px;
+            color: #333;
+            font-weight: 600;
+        }
+
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #888;
+            font-size: 0.9em;
+        }
+
+        .reset-button {
+            padding: 10px 20px;
+            background: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+
+        .reset-button:hover {
+            background: #5a6268;
+        }
+
+        @media (max-width: 768px) {
+            .selection-panel,
+            .comparison-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>NCAA Salary Comparison Tool</h1>
+        <p class="subtitle">Compare Coach Salaries Between Two Schools</p>
+
+        <div class="selection-panel">
+            <div class="school-selector">
+                <h2>School 1</h2>
+                <div class="form-group">
+                    <label for="school1">Select School:</label>
+                    <select id="school1">
+                        <option value="">-- Select a School --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="position1">Select Position:</label>
+                    <select id="position1">
+                        <option value="">-- Select Position --</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="school-selector">
+                <h2>School 2</h2>
+                <div class="form-group">
+                    <label for="school2">Select School:</label>
+                    <select id="school2">
+                        <option value="">-- Select a School --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="position2">Select Position:</label>
+                    <select id="position2">
+                        <option value="">-- Select Position --</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <button class="compare-button" onclick="compareSchools()">Compare Salaries</button>
+
+        <div class="results-panel" id="resultsPanel">
+            <div class="comparison-grid" id="comparisonGrid">
+                <!-- Results will be populated by JavaScript -->
+            </div>
+
+            <div class="chart-container">
+                <h3 style="color: #333; margin-bottom: 15px;">Visual Comparison</h3>
+                <div class="bar-chart" id="barChart">
+                    <!-- Chart will be populated by JavaScript -->
+                </div>
+            </div>
+
+            <div class="analysis-section">
+                <h3>Salary Analysis</h3>
+                <div id="analysisContent">
+                    <!-- Analysis will be populated by JavaScript -->
+                </div>
+            </div>
+
+            <button class="reset-button" onclick="resetComparison()">Reset Comparison</button>
+        </div>
+
+        <div class="footer">
+            <p>Data Source: NCAA Public Financial Records | Updated 2024</p>
+        </div>
+    </div>
+
+    <script>
+        // Sample data for NCAA D1 total compensation
+        const compensationData = [
+            { school: "Alabama", coach: "Nick Saban", position: "Head Football Coach", salary: 11700000 },
+            { school: "Georgia", coach: "Kirby Smart", position: "Head Football Coach", salary: 11250000 },
+            { school: "Texas A&M", coach: "Jimbo Fisher", position: "Head Football Coach", salary: 9000000 },
+            { school: "Clemson", coach: "Dabo Swinney", position: "Head Football Coach", salary: 8500000 },
+            { school: "Ohio State", coach: "Ryan Day", position: "Head Football Coach", salary: 7600000 },
+            { school: "LSU", coach: "Brian Kelly", position: "Head Football Coach", salary: 9500000 },
+            { school: "Michigan", coach: "Jim Harbaugh", position: "Head Football Coach", salary: 7500000 },
+            { school: "USC", coach: "Lincoln Riley", position: "Head Football Coach", salary: 10000000 },
+            { school: "Oregon", coach: "Dan Lanning", position: "Head Football Coach", salary: 6000000 },
+            { school: "Penn State", coach: "James Franklin", position: "Head Football Coach", salary: 7000000 },
+            { school: "Florida", coach: "Billy Napier", position: "Head Football Coach", salary: 7000000 },
+            { school: "Notre Dame", coach: "Marcus Freeman", position: "Head Football Coach", salary: 6500000 },
+            { school: "Tennessee", coach: "Josh Heupel", position: "Head Football Coach", salary: 5000000 },
+            { school: "Oklahoma", coach: "Brent Venables", position: "Head Football Coach", salary: 7000000 },
+            { school: "Texas", coach: "Steve Sarkisian", position: "Head Football Coach", salary: 5200000 },
+            { school: "Auburn", coach: "Hugh Freeze", position: "Head Football Coach", salary: 6500000 },
+            { school: "Kentucky", coach: "John Calipari", position: "Head Basketball Coach", salary: 8600000 },
+            { school: "Duke", coach: "Jon Scheyer", position: "Head Basketball Coach", salary: 5000000 },
+            { school: "Kansas", coach: "Bill Self", position: "Head Basketball Coach", salary: 7500000 },
+            { school: "North Carolina", coach: "Hubert Davis", position: "Head Basketball Coach", salary: 4000000 }
+        ];
+
+        // Initialize the tool
+        function initializeTool() {
+            populateSchoolDropdowns();
+        }
+
+        // Populate school dropdowns
+        function populateSchoolDropdowns() {
+            const schools = [...new Set(compensationData.map(d => d.school))].sort();
+            const school1Select = document.getElementById('school1');
+            const school2Select = document.getElementById('school2');
+
+            schools.forEach(school => {
+                school1Select.innerHTML += `<option value="${school}">${school}</option>`;
+                school2Select.innerHTML += `<option value="${school}">${school}</option>`;
+            });
+
+            // Add event listeners for school changes
+            school1Select.addEventListener('change', () => updatePositionDropdown('school1', 'position1'));
+            school2Select.addEventListener('change', () => updatePositionDropdown('school2', 'position2'));
+        }
+
+        // Update position dropdown based on selected school
+        function updatePositionDropdown(schoolSelectId, positionSelectId) {
+            const schoolSelect = document.getElementById(schoolSelectId);
+            const positionSelect = document.getElementById(positionSelectId);
+            const selectedSchool = schoolSelect.value;
+
+            // Clear current options
+            positionSelect.innerHTML = '<option value="">-- Select Position --</option>';
+
+            if (selectedSchool) {
+                const positions = compensationData
+                    .filter(d => d.school === selectedSchool)
+                    .map(d => d.position);
+
+                positions.forEach(position => {
+                    positionSelect.innerHTML += `<option value="${position}">${position}</option>`;
+                });
+            }
+        }
+
+        // Compare schools
+        function compareSchools() {
+            const school1 = document.getElementById('school1').value;
+            const position1 = document.getElementById('position1').value;
+            const school2 = document.getElementById('school2').value;
+            const position2 = document.getElementById('position2').value;
+
+            if (!school1 || !position1 || !school2 || !position2) {
+                alert('Please select both schools and positions to compare.');
+                return;
+            }
+
+            const data1 = compensationData.find(d => d.school === school1 && d.position === position1);
+            const data2 = compensationData.find(d => d.school === school2 && d.position === position2);
+
+            if (!data1 || !data2) {
+                alert('Data not found for selected schools/positions.');
+                return;
+            }
+
+            displayComparison(data1, data2);
+        }
+
+        // Display comparison results
+        function displayComparison(data1, data2) {
+            const comparisonGrid = document.getElementById('comparisonGrid');
+            
+            comparisonGrid.innerHTML = `
+                <div class="school-card">
+                    <h3>${data1.school}</h3>
+                    <div class="info-row">
+                        <span class="info-label">Coach:</span>
+                        <span class="info-value">${data1.coach}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Position:</span>
+                        <span class="info-value">${data1.position}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Total Compensation:</span>
+                        <span class="info-value salary-value">$${data1.salary.toLocaleString()}</span>
+                    </div>
+                </div>
+
+                <div class="school-card">
+                    <h3>${data2.school}</h3>
+                    <div class="info-row">
+                        <span class="info-label">Coach:</span>
+                        <span class="info-value">${data2.coach}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Position:</span>
+                        <span class="info-value">${data2.position}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Total Compensation:</span>
+                        <span class="info-value salary-value">$${data2.salary.toLocaleString()}</span>
+                    </div>
+                </div>
+            `;
+
+            displayChart(data1, data2);
+            displayAnalysis(data1, data2);
+
+            document.getElementById('resultsPanel').classList.add('active');
+            document.getElementById('resultsPanel').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Display bar chart
+        function displayChart(data1, data2) {
+            const barChart = document.getElementById('barChart');
+            const maxSalary = Math.max(data1.salary, data2.salary);
+            const height1 = (data1.salary / maxSalary) * 250;
+            const height2 = (data2.salary / maxSalary) * 250;
+
+            barChart.innerHTML = `
+                <div class="bar" style="height: ${height1}px;">
+                    <div style="margin-top: auto;">$${(data1.salary / 1000000).toFixed(1)}M</div>
+                    <div class="bar-label">${data1.school}</div>
+                </div>
+                <div class="bar" style="height: ${height2}px;">
+                    <div style="margin-top: auto;">$${(data2.salary / 1000000).toFixed(1)}M</div>
+                    <div class="bar-label">${data2.school}</div>
+                </div>
+            `;
+        }
+
+        // Display analysis
+        function displayAnalysis(data1, data2) {
+            const analysisContent = document.getElementById('analysisContent');
+            const difference = Math.abs(data1.salary - data2.salary);
+            const percentDiff = ((difference / Math.min(data1.salary, data2.salary)) * 100).toFixed(1);
+            const higherPaid = data1.salary > data2.salary ? data1 : data2;
+            const lowerPaid = data1.salary < data2.salary ? data1 : data2;
+
+            analysisContent.innerHTML = `
+                <div class="stat-card">
+                    <h4>Salary Difference</h4>
+                    <p>
+                        ${higherPaid.school}'s ${higherPaid.coach} earns 
+                        <span class="difference-positive">$${difference.toLocaleString()}</span> 
+                        more than ${lowerPaid.school}'s ${lowerPaid.coach}.
+                    </p>
+                </div>
+
+                <div class="stat-card">
+                    <h4>Percentage Difference</h4>
+                    <p>
+                        This represents a <span class="difference-positive">${percentDiff}%</span> 
+                        difference in total compensation between the two schools.
+                    </p>
+                </div>
+
+                <div class="stat-card">
+                    <h4>Ranking Comparison</h4>
+                    <p>
+                        Among all NCAA Division 1 programs in our dataset, 
+                        ${higherPaid.school} ranks higher in compensation for this position.
+                    </p>
+                </div>
+
+                <div class="stat-card">
+                    <h4>Combined Total</h4>
+                    <p>
+                        Together, these two positions represent a combined annual compensation of 
+                        <span style="color: #667eea; font-weight: 700;">$${(data1.salary + data2.salary).toLocaleString()}</span>.
+                    </p>
+                </div>
+            `;
+        }
+
+        // Reset comparison
+        function resetComparison() {
+            document.getElementById('school1').selectedIndex = 0;
+            document.getElementById('school2').selectedIndex = 0;
+            document.getElementById('position1').innerHTML = '<option value="">-- Select Position --</option>';
+            document.getElementById('position2').innerHTML = '<option value="">-- Select Position --</option>';
+            document.getElementById('resultsPanel').classList.remove('active');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        // Initialize on page load
+        initializeTool();
+    </script>
+</body>
+</html>

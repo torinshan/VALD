@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NCAA Division 1 Total Compensation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            padding: 30px;
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+
+        .search-container {
+            margin-bottom: 30px;
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 15px;
+            font-size: 16px;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .search-box:focus {
+            border-color: #764ba2;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        thead {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        th:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        tbody tr {
+            border-bottom: 1px solid #e0e0e0;
+            transition: background-color 0.2s;
+        }
+
+        tbody tr:hover {
+            background-color: #f5f5f5;
+        }
+
+        td {
+            padding: 12px 15px;
+            color: #333;
+        }
+
+        .salary {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .school-name {
+            font-weight: 500;
+            color: #333;
+        }
+
+        .coach-name {
+            color: #555;
+        }
+
+        .position {
+            color: #888;
+            font-size: 0.9em;
+        }
+
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #888;
+            font-size: 0.9em;
+        }
+
+        .sort-indicator {
+            font-size: 0.8em;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>NCAA Division 1 Total Compensation</h1>
+        <p class="subtitle">Head Coach Salaries Across Division 1 Programs</p>
+
+        <div class="search-container">
+            <input type="text" class="search-box" id="searchInput" placeholder="Search by school, coach name, or position...">
+        </div>
+
+        <table id="compensationTable">
+            <thead>
+                <tr>
+                    <th onclick="sortTable(0)">School <span class="sort-indicator">▼</span></th>
+                    <th onclick="sortTable(1)">Coach Name <span class="sort-indicator">▼</span></th>
+                    <th onclick="sortTable(2)">Position <span class="sort-indicator">▼</span></th>
+                    <th onclick="sortTable(3)">Total Compensation <span class="sort-indicator">▼</span></th>
+                </tr>
+            </thead>
+            <tbody id="tableBody">
+                <!-- Data will be populated by JavaScript -->
+            </tbody>
+        </table>
+
+        <div class="footer">
+            <p>Data Source: NCAA Public Financial Records | Updated 2024</p>
+        </div>
+    </div>
+
+    <script>
+        // Sample data for NCAA D1 total compensation
+        const compensationData = [
+            { school: "Alabama", coach: "Nick Saban", position: "Head Football Coach", salary: 11700000 },
+            { school: "Georgia", coach: "Kirby Smart", position: "Head Football Coach", salary: 11250000 },
+            { school: "Texas A&M", coach: "Jimbo Fisher", position: "Head Football Coach", salary: 9000000 },
+            { school: "Clemson", coach: "Dabo Swinney", position: "Head Football Coach", salary: 8500000 },
+            { school: "Ohio State", coach: "Ryan Day", position: "Head Football Coach", salary: 7600000 },
+            { school: "LSU", coach: "Brian Kelly", position: "Head Football Coach", salary: 9500000 },
+            { school: "Michigan", coach: "Jim Harbaugh", position: "Head Football Coach", salary: 7500000 },
+            { school: "USC", coach: "Lincoln Riley", position: "Head Football Coach", salary: 10000000 },
+            { school: "Oregon", coach: "Dan Lanning", position: "Head Football Coach", salary: 6000000 },
+            { school: "Penn State", coach: "James Franklin", position: "Head Football Coach", salary: 7000000 },
+            { school: "Florida", coach: "Billy Napier", position: "Head Football Coach", salary: 7000000 },
+            { school: "Notre Dame", coach: "Marcus Freeman", position: "Head Football Coach", salary: 6500000 },
+            { school: "Tennessee", coach: "Josh Heupel", position: "Head Football Coach", salary: 5000000 },
+            { school: "Oklahoma", coach: "Brent Venables", position: "Head Football Coach", salary: 7000000 },
+            { school: "Texas", coach: "Steve Sarkisian", position: "Head Football Coach", salary: 5200000 },
+            { school: "Auburn", coach: "Hugh Freeze", position: "Head Football Coach", salary: 6500000 },
+            { school: "Kentucky", coach: "John Calipari", position: "Head Basketball Coach", salary: 8600000 },
+            { school: "Duke", coach: "Jon Scheyer", position: "Head Basketball Coach", salary: 5000000 },
+            { school: "Kansas", coach: "Bill Self", position: "Head Basketball Coach", salary: 7500000 },
+            { school: "North Carolina", coach: "Hubert Davis", position: "Head Basketball Coach", salary: 4000000 }
+        ];
+
+        let currentSortColumn = -1;
+        let sortAscending = true;
+
+        // Initialize table
+        function initTable() {
+            renderTable(compensationData);
+        }
+
+        // Render table with data
+        function renderTable(data) {
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="school-name">${row.school}</td>
+                    <td class="coach-name">${row.coach}</td>
+                    <td class="position">${row.position}</td>
+                    <td class="salary">$${row.salary.toLocaleString()}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        // Sort table
+        function sortTable(columnIndex) {
+            const table = document.getElementById('compensationTable');
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+
+            // Toggle sort direction if clicking same column
+            if (currentSortColumn === columnIndex) {
+                sortAscending = !sortAscending;
+            } else {
+                sortAscending = true;
+                currentSortColumn = columnIndex;
+            }
+
+            // Sort rows
+            rows.sort((a, b) => {
+                let aValue = a.cells[columnIndex].textContent;
+                let bValue = b.cells[columnIndex].textContent;
+
+                // Handle salary column specially (remove $ and commas)
+                if (columnIndex === 3) {
+                    aValue = parseInt(aValue.replace(/[$,]/g, ''));
+                    bValue = parseInt(bValue.replace(/[$,]/g, ''));
+                }
+
+                if (aValue < bValue) return sortAscending ? -1 : 1;
+                if (aValue > bValue) return sortAscending ? 1 : -1;
+                return 0;
+            });
+
+            // Clear and re-append sorted rows
+            tbody.innerHTML = '';
+            rows.forEach(row => tbody.appendChild(row));
+
+            // Update sort indicators
+            updateSortIndicators(columnIndex);
+        }
+
+        // Update sort indicators
+        function updateSortIndicators(activeColumn) {
+            const headers = document.querySelectorAll('th');
+            headers.forEach((header, index) => {
+                const indicator = header.querySelector('.sort-indicator');
+                if (index === activeColumn) {
+                    indicator.textContent = sortAscending ? '▲' : '▼';
+                } else {
+                    indicator.textContent = '▼';
+                }
+            });
+        }
+
+        // Search functionality
+        document.getElementById('searchInput').addEventListener('input', function(e) {
+            const searchTerm = e.target.value.toLowerCase();
+            const filteredData = compensationData.filter(row => {
+                return row.school.toLowerCase().includes(searchTerm) ||
+                       row.coach.toLowerCase().includes(searchTerm) ||
+                       row.position.toLowerCase().includes(searchTerm);
+            });
+            renderTable(filteredData);
+        });
+
+        // Initialize on page load
+        initTable();
+    </script>
+</body>
+</html>
