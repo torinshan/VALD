@@ -370,22 +370,238 @@
     </div>
 
     <script>
-        // List of NCAA Division 1 schools
+        // Complete list of NCAA Division 1 schools (364 schools)
         const schools = [
-            "Alabama", "Arizona", "Arizona State", "Arkansas", "Auburn",
-            "Baylor", "Boston College", "BYU", "California", "Clemson",
-            "Colorado", "Duke", "Florida", "Florida State", "Georgia",
-            "Georgia Tech", "Illinois", "Indiana", "Iowa", "Iowa State",
-            "Kansas", "Kansas State", "Kentucky", "Louisville", "LSU",
-            "Maryland", "Miami", "Michigan", "Michigan State", "Minnesota",
-            "Mississippi State", "Missouri", "Nebraska", "North Carolina",
-            "NC State", "Northwestern", "Notre Dame", "Ohio State", "Oklahoma",
-            "Oklahoma State", "Ole Miss", "Oregon", "Oregon State", "Penn State",
-            "Purdue", "Rutgers", "South Carolina", "Stanford", "Syracuse",
-            "TCU", "Tennessee", "Texas", "Texas A&M", "Texas Tech", "UCLA",
-            "USC", "Utah", "Vanderbilt", "Virginia", "Virginia Tech",
-            "Washington", "Washington State", "West Virginia", "Wisconsin"
+            "Abilene Christian", "Air Force", "Akron", "Alabama", "Alabama A&M", "Alabama State",
+            "Albany", "Alcorn State", "American", "Appalachian State", "Arizona", "Arizona State",
+            "Arkansas", "Arkansas-Pine Bluff", "Arkansas State", "Army", "Auburn", "Austin Peay",
+            "Ball State", "Baylor", "Bellarmine", "Belmont", "Bethune-Cookman", "Binghamton",
+            "Boise State", "Boston College", "Boston University", "Bowling Green", "Bradley", "Brown",
+            "Bryant", "Bucknell", "Buffalo", "Butler", "BYU", "Cal Poly", "Cal State Bakersfield",
+            "Cal State Fullerton", "Cal State Northridge", "California", "California Baptist", "Campbell",
+            "Canisius", "Central Arkansas", "Central Connecticut", "Central Michigan", "Charleston Southern",
+            "Charlotte", "Chattanooga", "Chicago State", "Cincinnati", "Citadel", "Clemson", "Cleveland State",
+            "Coastal Carolina", "Colgate", "College of Charleston", "Colorado", "Colorado State", "Columbia",
+            "Connecticut", "Coppin State", "Cornell", "Creighton", "Dartmouth", "Davidson", "Dayton",
+            "Delaware", "Delaware State", "Denver", "DePaul", "Detroit Mercy", "Drake", "Drexel", "Duke",
+            "Duquesne", "East Carolina", "East Tennessee State", "Eastern Illinois", "Eastern Kentucky",
+            "Eastern Michigan", "Eastern Washington", "Elon", "Evansville", "Fairfield", "Fairleigh Dickinson",
+            "FGCU", "FIU", "Florida", "Florida A&M", "Florida Atlantic", "Florida Gulf Coast", "Florida State",
+            "Fordham", "Fresno State", "Furman", "Gardner-Webb", "George Mason", "George Washington",
+            "Georgetown", "Georgia", "Georgia Southern", "Georgia State", "Georgia Tech", "Gonzaga",
+            "Grambling", "Grand Canyon", "Green Bay", "Hampton", "Hartford", "Harvard", "Hawaii",
+            "High Point", "Hofstra", "Holy Cross", "Houston", "Houston Christian", "Howard", "Idaho",
+            "Idaho State", "Illinois", "Illinois State", "Incarnate Word", "Indiana", "Indiana State",
+            "Iona", "Iowa", "Iowa State", "IUPUI", "Jackson State", "Jacksonville", "Jacksonville State",
+            "James Madison", "Kansas", "Kansas City", "Kansas State", "Kennesaw State", "Kent State",
+            "Kentucky", "La Salle", "Lafayette", "Lamar", "Le Moyne", "Lehigh", "Liberty", "Lindenwood",
+            "Lipscomb", "LIU", "Louisiana", "Louisiana Monroe", "Louisiana Tech", "Louisville", "Loyola Chicago",
+            "Loyola Marymount", "Loyola Maryland", "LSU", "Maine", "Manhattan", "Marist", "Marquette",
+            "Marshall", "Maryland", "Massachusetts", "McNeese", "Memphis", "Mercer", "Merrimack", "Miami",
+            "Miami Ohio", "Michigan", "Michigan State", "Middle Tennessee", "Minnesota", "Mississippi State",
+            "Mississippi Valley State", "Missouri", "Missouri State", "Monmouth", "Montana", "Montana State",
+            "Morehead State", "Morgan State", "Mount St. Mary's", "Murray State", "Navy", "Nebraska",
+            "Nevada", "New Hampshire", "New Mexico", "New Mexico State", "New Orleans", "Niagara",
+            "Nicholls", "NJIT", "Norfolk State", "North Alabama", "North Carolina", "North Carolina A&T",
+            "North Carolina Central", "North Carolina State", "North Dakota", "North Dakota State", "North Florida",
+            "North Texas", "Northeastern", "Northern Arizona", "Northern Colorado", "Northern Illinois",
+            "Northern Iowa", "Northern Kentucky", "Northwestern", "Northwestern State", "Notre Dame",
+            "Oakland", "Ohio", "Ohio State", "Oklahoma", "Oklahoma State", "Old Dominion", "Ole Miss",
+            "Omaha", "Oral Roberts", "Oregon", "Oregon State", "Pacific", "Penn", "Penn State",
+            "Pepperdine", "Pittsburgh", "Portland", "Portland State", "Prairie View A&M", "Presbyterian",
+            "Princeton", "Providence", "Purdue", "Purdue Fort Wayne", "Queens", "Quinnipiac", "Radford",
+            "Rhode Island", "Rice", "Richmond", "Rider", "Robert Morris", "Rutgers", "Sacramento State",
+            "Sacred Heart", "Saint Francis", "Saint Joseph's", "Saint Louis", "Saint Mary's", "Saint Peter's",
+            "Sam Houston", "Samford", "San Diego", "San Diego State", "San Francisco", "San Jose State",
+            "Santa Clara", "Seattle", "Seton Hall", "Siena", "SIU Edwardsville", "South Alabama",
+            "South Carolina", "South Carolina State", "South Carolina Upstate", "South Dakota", "South Dakota State",
+            "South Florida", "Southeast Missouri State", "Southeastern Louisiana", "Southern", "Southern Illinois",
+            "Southern Indiana", "Southern Miss", "Southern Utah", "St. Bonaventure", "St. Francis Brooklyn",
+            "St. John's", "St. Thomas", "Stanford", "Stephen F. Austin", "Stetson", "Stonehill", "Stony Brook",
+            "Syracuse", "Tarleton State", "TCU", "Temple", "Tennessee", "Tennessee Martin", "Tennessee State",
+            "Tennessee Tech", "Texas", "Texas A&M", "Texas A&M-Corpus Christi", "Texas Southern", "Texas State",
+            "Texas Tech", "The Citadel", "Toledo", "Towson", "Troy", "Tulane", "Tulsa", "UAB", "UC Davis",
+            "UC Irvine", "UC Riverside", "UC San Diego", "UC Santa Barbara", "UCF", "UCLA", "UConn",
+            "UIC", "UMass Lowell", "UMBC", "UMKC", "UNC Asheville", "UNC Greensboro", "UNC Wilmington",
+            "UNLV", "USC", "USC Upstate", "UT Arlington", "UT Martin", "UT Rio Grande Valley", "UTEP",
+            "UTSA", "Utah", "Utah State", "Utah Tech", "Utah Valley", "Valparaiso", "Vanderbilt",
+            "VCU", "Vermont", "Villanova", "Virginia", "Virginia Tech", "VMI", "Wagner", "Wake Forest",
+            "Washington", "Washington State", "Weber State", "West Virginia", "Western Carolina",
+            "Western Illinois", "Western Kentucky", "Western Michigan", "Wichita State", "William & Mary",
+            "Winthrop", "Wisconsin", "Wofford", "Wright State", "Wyoming", "Xavier", "Yale", "Youngstown State"
         ];
+
+        // Tax and benefits calculation data
+        const stateData = {
+            "California": { taxRate: 0.133, col: 1.51 },
+            "New York": { taxRate: 0.109, col: 1.49 },
+            "Hawaii": { taxRate: 0.110, col: 1.88 },
+            "New Jersey": { taxRate: 0.108, col: 1.23 },
+            "Oregon": { taxRate: 0.099, col: 1.13 },
+            "Minnesota": { taxRate: 0.098, col: 1.03 },
+            "District of Columbia": { taxRate: 0.095, col: 1.52 },
+            "Iowa": { taxRate: 0.085, col: 0.91 },
+            "Wisconsin": { taxRate: 0.076, col: 0.96 },
+            "Maine": { taxRate: 0.075, col: 1.02 },
+            "Vermont": { taxRate: 0.088, col: 1.09 },
+            "Idaho": { taxRate: 0.060, col: 0.92 },
+            "South Carolina": { taxRate: 0.070, col: 0.88 },
+            "Connecticut": { taxRate: 0.070, col: 1.16 },
+            "Montana": { taxRate: 0.069, col: 0.94 },
+            "Nebraska": { taxRate: 0.068, col: 0.91 },
+            "Kansas": { taxRate: 0.057, col: 0.87 },
+            "Delaware": { taxRate: 0.066, col: 1.02 },
+            "Rhode Island": { taxRate: 0.060, col: 1.09 },
+            "Illinois": { taxRate: 0.050, col: 0.95 },
+            "West Virginia": { taxRate: 0.065, col: 0.79 },
+            "Missouri": { taxRate: 0.054, col: 0.85 },
+            "Georgia": { taxRate: 0.058, col: 0.89 },
+            "Oklahoma": { taxRate: 0.050, col: 0.84 },
+            "Arkansas": { taxRate: 0.059, col: 0.79 },
+            "Virginia": { taxRate: 0.058, col: 1.01 },
+            "Utah": { taxRate: 0.050, col: 0.97 },
+            "Kentucky": { taxRate: 0.050, col: 0.86 },
+            "Louisiana": { taxRate: 0.060, col: 0.87 },
+            "New Mexico": { taxRate: 0.059, col: 0.88 },
+            "Alabama": { taxRate: 0.050, col: 0.82 },
+            "Mississippi": { taxRate: 0.050, col: 0.78 },
+            "Michigan": { taxRate: 0.043, col: 0.89 },
+            "Ohio": { taxRate: 0.047, col: 0.90 },
+            "Colorado": { taxRate: 0.045, col: 1.06 },
+            "Arizona": { taxRate: 0.045, col: 0.97 },
+            "Indiana": { taxRate: 0.032, col: 0.87 },
+            "North Carolina": { taxRate: 0.050, col: 0.90 },
+            "Pennsylvania": { taxRate: 0.031, col: 0.96 },
+            "Massachusetts": { taxRate: 0.050, col: 1.32 },
+            "Maryland": { taxRate: 0.058, col: 1.29 },
+            "North Dakota": { taxRate: 0.029, col: 0.94 },
+            "Tennessee": { taxRate: 0.010, col: 0.89 },
+            "New Hampshire": { taxRate: 0.050, col: 1.11 },
+            "Nevada": { taxRate: 0.000, col: 1.00 },
+            "Texas": { taxRate: 0.000, col: 0.91 },
+            "Florida": { taxRate: 0.000, col: 0.99 },
+            "South Dakota": { taxRate: 0.000, col: 0.91 },
+            "Wyoming": { taxRate: 0.000, col: 0.91 },
+            "Washington": { taxRate: 0.000, col: 1.15 },
+            "Alaska": { taxRate: 0.000, col: 1.27 }
+        };
+
+        // Map schools to their states
+        const schoolToState = {
+            "Alabama": "Alabama", "Alabama A&M": "Alabama", "Alabama State": "Alabama", "Auburn": "Auburn",
+            "Jacksonville State": "Alabama", "Samford": "Alabama", "South Alabama": "Alabama", "Troy": "Alabama",
+            "UAB": "Alabama", "Alaska": "Alaska", "Arizona": "Arizona", "Arizona State": "Arizona",
+            "Grand Canyon": "Arizona", "Northern Arizona": "Arizona", "Arkansas": "Arkansas",
+            "Arkansas-Pine Bluff": "Arkansas", "Arkansas State": "Arkansas", "Central Arkansas": "Arkansas",
+            "Little Rock": "Arkansas", "Abilene Christian": "Texas", "Air Force": "Colorado",
+            "Akron": "Ohio", "Albany": "New York", "Alcorn State": "Mississippi", "American": "District of Columbia",
+            "Appalachian State": "North Carolina", "Austin Peay": "Tennessee", "Ball State": "Indiana",
+            "Baylor": "Texas", "Bellarmine": "Kentucky", "Belmont": "Tennessee", "Bethune-Cookman": "Florida",
+            "Binghamton": "New York", "Boise State": "Idaho", "Boston College": "Massachusetts",
+            "Boston University": "Massachusetts", "Bowling Green": "Ohio", "Bradley": "Illinois", "Brown": "Rhode Island",
+            "Bryant": "Rhode Island", "Bucknell": "Pennsylvania", "Buffalo": "New York", "Butler": "Indiana",
+            "BYU": "Utah", "Cal Poly": "California", "Cal State Bakersfield": "California",
+            "Cal State Fullerton": "California", "Cal State Northridge": "California", "California": "California",
+            "California Baptist": "California", "Campbell": "North Carolina", "Canisius": "New York",
+            "Central Connecticut": "Connecticut", "Central Michigan": "Michigan", "Charleston Southern": "South Carolina",
+            "Charlotte": "North Carolina", "Chattanooga": "Tennessee", "Chicago State": "Illinois",
+            "Cincinnati": "Ohio", "Citadel": "South Carolina", "Clemson": "South Carolina", "Cleveland State": "Ohio",
+            "Coastal Carolina": "South Carolina", "Colgate": "New York", "College of Charleston": "South Carolina",
+            "Colorado": "Colorado", "Colorado State": "Colorado", "Columbia": "New York", "Connecticut": "Connecticut",
+            "Coppin State": "Maryland", "Cornell": "New York", "Creighton": "Nebraska", "Dartmouth": "New Hampshire",
+            "Davidson": "North Carolina", "Dayton": "Ohio", "Delaware": "Delaware", "Delaware State": "Delaware",
+            "Denver": "Colorado", "DePaul": "Illinois", "Detroit Mercy": "Michigan", "Drake": "Iowa",
+            "Drexel": "Pennsylvania", "Duke": "North Carolina", "Duquesne": "Pennsylvania",
+            "East Carolina": "North Carolina", "East Tennessee State": "Tennessee", "Eastern Illinois": "Illinois",
+            "Eastern Kentucky": "Kentucky", "Eastern Michigan": "Michigan", "Eastern Washington": "Washington",
+            "Elon": "North Carolina", "Evansville": "Indiana", "Fairfield": "Connecticut",
+            "Fairleigh Dickinson": "New Jersey", "FGCU": "Florida", "FIU": "Florida", "Florida": "Florida",
+            "Florida A&M": "Florida", "Florida Atlantic": "Florida", "Florida Gulf Coast": "Florida",
+            "Florida State": "Florida", "Fordham": "New York", "Fresno State": "California", "Furman": "South Carolina",
+            "Gardner-Webb": "North Carolina", "George Mason": "Virginia", "George Washington": "District of Columbia",
+            "Georgetown": "District of Columbia", "Georgia": "Georgia", "Georgia Southern": "Georgia",
+            "Georgia State": "Georgia", "Georgia Tech": "Georgia", "Gonzaga": "Washington", "Grambling": "Louisiana",
+            "Green Bay": "Wisconsin", "Hampton": "Virginia", "Hartford": "Connecticut", "Harvard": "Massachusetts",
+            "Hawaii": "Hawaii", "High Point": "North Carolina", "Hofstra": "New York", "Holy Cross": "Massachusetts",
+            "Houston": "Texas", "Houston Christian": "Texas", "Howard": "District of Columbia", "Idaho": "Idaho",
+            "Idaho State": "Idaho", "Illinois": "Illinois", "Illinois State": "Illinois", "Incarnate Word": "Texas",
+            "Indiana": "Indiana", "Indiana State": "Indiana", "Iona": "New York", "Iowa": "Iowa",
+            "Iowa State": "Iowa", "IUPUI": "Indiana", "Jackson State": "Mississippi", "Jacksonville": "Florida",
+            "James Madison": "Virginia", "Kansas": "Kansas", "Kansas City": "Missouri", "Kansas State": "Kansas",
+            "Kennesaw State": "Georgia", "Kent State": "Ohio", "Kentucky": "Kentucky", "La Salle": "Pennsylvania",
+            "Lafayette": "Pennsylvania", "Lamar": "Texas", "Le Moyne": "New York", "Lehigh": "Pennsylvania",
+            "Liberty": "Virginia", "Lindenwood": "Missouri", "Lipscomb": "Tennessee", "LIU": "New York",
+            "Louisiana": "Louisiana", "Louisiana Monroe": "Louisiana", "Louisiana Tech": "Louisiana",
+            "Louisville": "Kentucky", "Loyola Chicago": "Illinois", "Loyola Marymount": "California",
+            "Loyola Maryland": "Maryland", "LSU": "Louisiana", "Maine": "Maine", "Manhattan": "New York",
+            "Marist": "New York", "Marquette": "Wisconsin", "Marshall": "West Virginia", "Maryland": "Maryland",
+            "Massachusetts": "Massachusetts", "McNeese": "Louisiana", "Memphis": "Tennessee", "Mercer": "Georgia",
+            "Merrimack": "Massachusetts", "Miami": "Florida", "Miami Ohio": "Ohio", "Michigan": "Michigan",
+            "Michigan State": "Michigan", "Middle Tennessee": "Tennessee", "Minnesota": "Minnesota",
+            "Mississippi State": "Mississippi", "Mississippi Valley State": "Mississippi", "Missouri": "Missouri",
+            "Missouri State": "Missouri", "Monmouth": "New Jersey", "Montana": "Montana", "Montana State": "Montana",
+            "Morehead State": "Kentucky", "Morgan State": "Maryland", "Mount St. Mary's": "Maryland",
+            "Murray State": "Kentucky", "Navy": "Maryland", "Nebraska": "Nebraska", "Nevada": "Nevada",
+            "New Hampshire": "New Hampshire", "New Mexico": "New Mexico", "New Mexico State": "New Mexico",
+            "New Orleans": "Louisiana", "Niagara": "New York", "Nicholls": "Louisiana", "NJIT": "New Jersey",
+            "Norfolk State": "Virginia", "North Alabama": "Alabama", "North Carolina": "North Carolina",
+            "North Carolina A&T": "North Carolina", "North Carolina Central": "North Carolina",
+            "North Carolina State": "North Carolina", "North Dakota": "North Dakota", "North Dakota State": "North Dakota",
+            "North Florida": "Florida", "North Texas": "Texas", "Northeastern": "Massachusetts",
+            "Northern Arizona": "Arizona", "Northern Colorado": "Colorado", "Northern Illinois": "Illinois",
+            "Northern Iowa": "Iowa", "Northern Kentucky": "Kentucky", "Northwestern": "Illinois",
+            "Northwestern State": "Louisiana", "Notre Dame": "Indiana", "Oakland": "Michigan", "Ohio": "Ohio",
+            "Ohio State": "Ohio", "Oklahoma": "Oklahoma", "Oklahoma State": "Oklahoma", "Old Dominion": "Virginia",
+            "Ole Miss": "Mississippi", "Omaha": "Nebraska", "Oral Roberts": "Oklahoma", "Oregon": "Oregon",
+            "Oregon State": "Oregon", "Pacific": "California", "Penn": "Pennsylvania", "Penn State": "Pennsylvania",
+            "Pepperdine": "California", "Pittsburgh": "Pennsylvania", "Portland": "Oregon", "Portland State": "Oregon",
+            "Prairie View A&M": "Texas", "Presbyterian": "South Carolina", "Princeton": "New Jersey",
+            "Providence": "Rhode Island", "Purdue": "Indiana", "Purdue Fort Wayne": "Indiana", "Queens": "North Carolina",
+            "Quinnipiac": "Connecticut", "Radford": "Virginia", "Rhode Island": "Rhode Island", "Rice": "Texas",
+            "Richmond": "Virginia", "Rider": "New Jersey", "Robert Morris": "Pennsylvania", "Rutgers": "New Jersey",
+            "Sacramento State": "California", "Sacred Heart": "Connecticut", "Saint Francis": "Pennsylvania",
+            "Saint Joseph's": "Pennsylvania", "Saint Louis": "Missouri", "Saint Mary's": "California",
+            "Saint Peter's": "New Jersey", "Sam Houston": "Texas", "San Diego": "California",
+            "San Diego State": "California", "San Francisco": "California", "San Jose State": "California",
+            "Santa Clara": "California", "Seattle": "Washington", "Seton Hall": "New Jersey", "Siena": "New York",
+            "SIU Edwardsville": "Illinois", "South Carolina": "South Carolina", "South Carolina State": "South Carolina",
+            "South Carolina Upstate": "South Carolina", "South Dakota": "South Dakota", "South Dakota State": "South Dakota",
+            "South Florida": "Florida", "Southeast Missouri State": "Missouri", "Southeastern Louisiana": "Louisiana",
+            "Southern": "Louisiana", "Southern Illinois": "Illinois", "Southern Indiana": "Indiana",
+            "Southern Miss": "Mississippi", "Southern Utah": "Utah", "St. Bonaventure": "New York",
+            "St. Francis Brooklyn": "New York", "St. John's": "New York", "St. Thomas": "Minnesota",
+            "Stanford": "California", "Stephen F. Austin": "Texas", "Stetson": "Florida", "Stonehill": "Massachusetts",
+            "Stony Brook": "New York", "Syracuse": "New York", "Tarleton State": "Texas", "TCU": "Texas",
+            "Temple": "Pennsylvania", "Tennessee": "Tennessee", "Tennessee Martin": "Tennessee",
+            "Tennessee State": "Tennessee", "Tennessee Tech": "Tennessee", "Texas": "Texas", "Texas A&M": "Texas",
+            "Texas A&M-Corpus Christi": "Texas", "Texas Southern": "Texas", "Texas State": "Texas",
+            "Texas Tech": "Texas", "The Citadel": "South Carolina", "Toledo": "Ohio", "Towson": "Maryland",
+            "Tulane": "Louisiana", "Tulsa": "Oklahoma", "UC Davis": "California", "UC Irvine": "California",
+            "UC Riverside": "California", "UC San Diego": "California", "UC Santa Barbara": "California",
+            "UCF": "Florida", "UCLA": "California", "UConn": "Connecticut", "UIC": "Illinois",
+            "UMass Lowell": "Massachusetts", "UMBC": "Maryland", "UMKC": "Missouri", "UNC Asheville": "North Carolina",
+            "UNC Greensboro": "North Carolina", "UNC Wilmington": "North Carolina", "UNLV": "Nevada",
+            "USC": "California", "USC Upstate": "South Carolina", "UT Arlington": "Texas", "UT Martin": "Tennessee",
+            "UT Rio Grande Valley": "Texas", "UTEP": "Texas", "UTSA": "Texas", "Utah": "Utah",
+            "Utah State": "Utah", "Utah Tech": "Utah", "Utah Valley": "Utah", "Valparaiso": "Indiana",
+            "Vanderbilt": "Tennessee", "VCU": "Virginia", "Vermont": "Vermont", "Villanova": "Pennsylvania",
+            "Virginia": "Virginia", "Virginia Tech": "Virginia", "VMI": "Virginia", "Wagner": "New York",
+            "Wake Forest": "North Carolina", "Washington": "Washington", "Washington State": "Washington",
+            "Weber State": "Utah", "West Virginia": "West Virginia", "Western Carolina": "North Carolina",
+            "Western Illinois": "Illinois", "Western Kentucky": "Kentucky", "Western Michigan": "Michigan",
+            "Wichita State": "Kansas", "William & Mary": "Virginia", "Winthrop": "South Carolina",
+            "Wisconsin": "Wisconsin", "Wofford": "South Carolina", "Wright State": "Ohio", "Wyoming": "Wyoming",
+            "Xavier": "Ohio", "Yale": "Connecticut", "Youngstown State": "Ohio"
+        };
+
+        // Standard benefits package (typical NCAA D1)
+        const standardBenefits = {
+            healthInsurance: 12000,     // Annual health insurance value
+            retirement401k: 0.06,       // 6% employer match
+            lifeInsurance: 2000,        // Annual life insurance value
+            disabilityInsurance: 1500,  // Annual disability insurance
+            tuitionRemission: 15000     // Estimated value for family
+        };
 
         // Initialize the tool
         function initializeTool() {
@@ -410,6 +626,58 @@
             });
         }
 
+        // Calculate comprehensive compensation breakdown
+        function calculateCompensation(school, grossSalary) {
+            const state = schoolToState[school] || "Texas"; // Default to Texas if not found
+            const stateTax = stateData[state] || { taxRate: 0, col: 1.0 };
+            
+            // Federal tax (simplified progressive calculation for high earners)
+            const federalTax = grossSalary * 0.37; // Top bracket
+            
+            // State tax
+            const stateTaxAmount = grossSalary * stateTax.taxRate;
+            
+            // FICA (Social Security + Medicare, capped for SS)
+            const socialSecurityCap = 160200;
+            const socialSecurityTax = Math.min(grossSalary, socialSecurityCap) * 0.062;
+            const medicareTax = grossSalary * 0.0145;
+            const ficaTotal = socialSecurityTax + medicareTax;
+            
+            // Total taxes
+            const totalTaxes = federalTax + stateTaxAmount + ficaTotal;
+            
+            // Retirement contribution (6% employer match)
+            const retirementContribution = grossSalary * standardBenefits.retirement401k;
+            
+            // Total benefits value
+            const totalBenefits = standardBenefits.healthInsurance + 
+                                 standardBenefits.lifeInsurance + 
+                                 standardBenefits.disabilityInsurance + 
+                                 standardBenefits.tuitionRemission +
+                                 retirementContribution;
+            
+            // Take home (after taxes)
+            const takeHome = grossSalary - totalTaxes;
+            
+            // COL adjusted take home
+            const colAdjustedTakeHome = takeHome / stateTax.col;
+            
+            return {
+                grossSalary,
+                federalTax,
+                stateTax: stateTaxAmount,
+                ficaTotal,
+                totalTaxes,
+                retirementContribution,
+                totalBenefits,
+                takeHome,
+                colAdjustedTakeHome,
+                state,
+                colIndex: stateTax.col,
+                stateTaxRate: stateTax.taxRate
+            };
+        }
+
         // Compare schools
         function compareSchools() {
             const school1 = document.getElementById('school1').value;
@@ -427,33 +695,92 @@
                 return;
             }
 
-            displayComparison(school1, salary1, school2, salary2);
+            const comp1 = calculateCompensation(school1, salary1);
+            const comp2 = calculateCompensation(school2, salary2);
+
+            displayComparison(school1, comp1, school2, comp2);
         }
 
         // Display comparison results
-        function displayComparison(school1, salary1, school2, salary2) {
+        function displayComparison(school1, comp1, school2, comp2) {
             const comparisonGrid = document.getElementById('comparisonGrid');
             
             comparisonGrid.innerHTML = `
                 <div class="school-card">
-                    <h3>${school1}</h3>
+                    <h3>${school1} (${comp1.state})</h3>
                     <div class="info-row">
-                        <span class="info-label">Annual Salary:</span>
-                        <span class="info-value salary-value">$${salary1.toLocaleString()}</span>
+                        <span class="info-label">Gross Salary:</span>
+                        <span class="info-value salary-value">$${comp1.grossSalary.toLocaleString()}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Federal Tax:</span>
+                        <span class="info-value">-$${comp1.federalTax.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">State Tax (${(comp1.stateTaxRate * 100).toFixed(1)}%):</span>
+                        <span class="info-value">-$${comp1.stateTax.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">FICA:</span>
+                        <span class="info-value">-$${comp1.ficaTotal.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Retirement (6%):</span>
+                        <span class="info-value">+$${comp1.retirementContribution.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Total Benefits:</span>
+                        <span class="info-value">+$${comp1.totalBenefits.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Take Home:</span>
+                        <span class="info-value salary-value">$${comp1.takeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">COL Adjusted (${comp1.colIndex.toFixed(2)}x):</span>
+                        <span class="info-value salary-value">$${comp1.colAdjustedTakeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
                     </div>
                 </div>
 
                 <div class="school-card">
-                    <h3>${school2}</h3>
+                    <h3>${school2} (${comp2.state})</h3>
                     <div class="info-row">
-                        <span class="info-label">Annual Salary:</span>
-                        <span class="info-value salary-value">$${salary2.toLocaleString()}</span>
+                        <span class="info-label">Gross Salary:</span>
+                        <span class="info-value salary-value">$${comp2.grossSalary.toLocaleString()}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Federal Tax:</span>
+                        <span class="info-value">-$${comp2.federalTax.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">State Tax (${(comp2.stateTaxRate * 100).toFixed(1)}%):</span>
+                        <span class="info-value">-$${comp2.stateTax.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">FICA:</span>
+                        <span class="info-value">-$${comp2.ficaTotal.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Retirement (6%):</span>
+                        <span class="info-value">+$${comp2.retirementContribution.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Total Benefits:</span>
+                        <span class="info-value">+$${comp2.totalBenefits.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Take Home:</span>
+                        <span class="info-value salary-value">$${comp2.takeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">COL Adjusted (${comp2.colIndex.toFixed(2)}x):</span>
+                        <span class="info-value salary-value">$${comp2.colAdjustedTakeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
                     </div>
                 </div>
             `;
 
-            displayChart(school1, salary1, school2, salary2);
-            displayAnalysis(school1, salary1, school2, salary2);
+            displayChart(school1, comp1, school2, comp2);
+            displayAnalysis(school1, comp1, school2, comp2);
 
             const resultsPanel = document.getElementById('resultsPanel');
             resultsPanel.classList.add('active');
@@ -461,65 +788,88 @@
         }
 
         // Display bar chart
-        function displayChart(school1, salary1, school2, salary2) {
+        function displayChart(school1, comp1, school2, comp2) {
             const barChart = document.getElementById('barChart');
-            const maxSalary = Math.max(salary1, salary2);
-            const height1 = (salary1 / maxSalary) * 250;
-            const height2 = (salary2 / maxSalary) * 250;
+            const maxValue = Math.max(comp1.colAdjustedTakeHome, comp2.colAdjustedTakeHome);
+            const height1 = (comp1.colAdjustedTakeHome / maxValue) * 250;
+            const height2 = (comp2.colAdjustedTakeHome / maxValue) * 250;
 
             barChart.innerHTML = `
                 <div class="bar" style="height: ${height1}px;">
-                    <div style="margin-top: auto;">$${(salary1 / 1000000).toFixed(1)}M</div>
-                    <div class="bar-label">${school1}</div>
+                    <div style="margin-top: auto;">$${(comp1.colAdjustedTakeHome / 1000000).toFixed(2)}M</div>
+                    <div class="bar-label">${school1} (COL Adj.)</div>
                 </div>
                 <div class="bar" style="height: ${height2}px;">
-                    <div style="margin-top: auto;">$${(salary2 / 1000000).toFixed(1)}M</div>
-                    <div class="bar-label">${school2}</div>
+                    <div style="margin-top: auto;">$${(comp2.colAdjustedTakeHome / 1000000).toFixed(2)}M</div>
+                    <div class="bar-label">${school2} (COL Adj.)</div>
                 </div>
             `;
         }
 
         // Display analysis
-        function displayAnalysis(school1, salary1, school2, salary2) {
+        function displayAnalysis(school1, comp1, school2, comp2) {
             const analysisContent = document.getElementById('analysisContent');
-            const difference = Math.abs(salary1 - salary2);
-            const percentDiff = ((difference / Math.min(salary1, salary2)) * 100).toFixed(1);
-            const higherSchool = salary1 > salary2 ? school1 : school2;
-            const lowerSchool = salary1 < salary2 ? school1 : school2;
-            const higherSalary = Math.max(salary1, salary2);
-            const lowerSalary = Math.min(salary1, salary2);
+            
+            const grossDiff = Math.abs(comp1.grossSalary - comp2.grossSalary);
+            const takeHomeDiff = Math.abs(comp1.takeHome - comp2.takeHome);
+            const colAdjDiff = Math.abs(comp1.colAdjustedTakeHome - comp2.colAdjustedTakeHome);
+            
+            const betterGross = comp1.grossSalary > comp2.grossSalary ? school1 : school2;
+            const betterTakeHome = comp1.takeHome > comp2.takeHome ? school1 : school2;
+            const betterCOLAdj = comp1.colAdjustedTakeHome > comp2.colAdjustedTakeHome ? school1 : school2;
 
             analysisContent.innerHTML = `
                 <div class="stat-card">
-                    <h4>Salary Difference</h4>
+                    <h4>Gross Salary Comparison</h4>
                     <p>
-                        ${higherSchool} pays 
-                        <span class="difference-positive">$${difference.toLocaleString()}</span> 
-                        more than ${lowerSchool}.
+                        ${betterGross} offers <span class="difference-positive">$${grossDiff.toLocaleString(undefined, {maximumFractionDigits: 0})}</span> 
+                        more in gross salary (${((grossDiff / Math.min(comp1.grossSalary, comp2.grossSalary)) * 100).toFixed(1)}% difference).
                     </p>
                 </div>
 
                 <div class="stat-card">
-                    <h4>Percentage Difference</h4>
+                    <h4>Tax Impact</h4>
                     <p>
-                        This represents a <span class="difference-positive">${percentDiff}%</span> 
-                        difference in annual salary between the two schools.
+                        ${school1} pays <strong>$${comp1.totalTaxes.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong> in total taxes, 
+                        while ${school2} pays <strong>$${comp2.totalTaxes.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong>.
+                        Tax difference: <span class="${comp1.totalTaxes < comp2.totalTaxes ? 'difference-positive' : 'difference-negative'}">
+                        $${Math.abs(comp1.totalTaxes - comp2.totalTaxes).toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
                     </p>
                 </div>
 
                 <div class="stat-card">
-                    <h4>Salary Comparison</h4>
+                    <h4>Take Home Comparison</h4>
                     <p>
-                        ${higherSchool} pays <strong>$${higherSalary.toLocaleString()}</strong> while 
-                        ${lowerSchool} pays <strong>$${lowerSalary.toLocaleString()}</strong> annually.
+                        After taxes, ${betterTakeHome} provides <span class="difference-positive">$${takeHomeDiff.toLocaleString(undefined, {maximumFractionDigits: 0})}</span> 
+                        more in take-home pay.
                     </p>
                 </div>
 
                 <div class="stat-card">
-                    <h4>Combined Total</h4>
+                    <h4>Cost of Living Adjusted Value</h4>
                     <p>
-                        Together, these two positions represent a combined annual compensation of 
-                        <span style="color: #667eea; font-weight: 700;">$${(salary1 + salary2).toLocaleString()}</span>.
+                        When adjusted for cost of living, ${betterCOLAdj} offers 
+                        <span class="difference-positive">$${colAdjDiff.toLocaleString(undefined, {maximumFractionDigits: 0})}</span> 
+                        more in real purchasing power. This is the most accurate comparison of actual value.
+                    </p>
+                </div>
+
+                <div class="stat-card">
+                    <h4>Benefits Package</h4>
+                    <p>
+                        Total benefits value including retirement, health insurance, and other perks: 
+                        ${school1}: <strong>$${comp1.totalBenefits.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong> | 
+                        ${school2}: <strong>$${comp2.totalBenefits.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong>
+                    </p>
+                </div>
+
+                <div class="stat-card">
+                    <h4>Bottom Line</h4>
+                    <p>
+                        ${betterCOLAdj} provides better value when considering salary, taxes, benefits, and cost of living. 
+                        COL-adjusted take-home: ${betterCOLAdj === school1 ? 
+                        `<strong>$${comp1.colAdjustedTakeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong>` : 
+                        `<strong>$${comp2.colAdjustedTakeHome.toLocaleString(undefined, {maximumFractionDigits: 0})}</strong>`}
                     </p>
                 </div>
             `;
