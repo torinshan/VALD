@@ -1,231 +1,222 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VALD - NCAA Compensation Tools</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .container {
-            max-width: 900px;
-            width: 100%;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            padding: 50px;
-            text-align: center;
-        }
-
-        h1 {
-            color: #333;
-            font-size: 3em;
-            margin-bottom: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .subtitle {
-            color: #666;
-            font-size: 1.3em;
-            margin-bottom: 40px;
-        }
-
-        .description {
-            color: #555;
-            font-size: 1.1em;
-            margin-bottom: 40px;
-            line-height: 1.6;
-        }
-
-        .tools-section {
-            margin-top: 50px;
-        }
-
-        .tools-section h2 {
-            color: #333;
-            font-size: 1.8em;
-            margin-bottom: 30px;
-        }
-
-        .dropdown {
-            position: relative;
-            display: inline-block;
-            width: 100%;
-            max-width: 500px;
-            margin-bottom: 20px;
-        }
-
-        .dropdown-button {
-            width: 100%;
-            padding: 20px 30px;
-            font-size: 1.2em;
-            font-weight: 600;
-            color: white;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-        }
-
-        .dropdown-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
-        }
-
-        .dropdown-content {
-            display: none;
-            position: absolute;
-            background-color: white;
-            min-width: 100%;
-            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-            z-index: 1;
-            border-radius: 10px;
-            margin-top: 10px;
-            overflow: hidden;
-        }
-
-        .dropdown-content a {
-            color: #333;
-            padding: 18px 20px;
-            text-decoration: none;
-            display: block;
-            text-align: left;
-            font-size: 1.1em;
-            transition: background-color 0.2s;
-            border-bottom: 1px solid #f0f0f0;
-        }
-
-        .dropdown-content a:last-child {
-            border-bottom: none;
-        }
-
-        .dropdown-content a:hover {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }
-
-        .dropdown-content a .tool-name {
-            font-weight: 600;
-            display: block;
-            margin-bottom: 5px;
-        }
-
-        .dropdown-content a .tool-desc {
-            font-size: 0.9em;
-            opacity: 0.8;
-        }
-
-        .dropdown.active .dropdown-content {
-            display: block;
-        }
-
-        .dropdown-button::after {
-            content: '▼';
-            margin-left: 10px;
-            font-size: 0.8em;
-        }
-
-        .dropdown.active .dropdown-button::after {
-            content: '▲';
-        }
-
-        .footer {
-            margin-top: 50px;
-            color: #888;
-            font-size: 0.9em;
-        }
-
-        @media (max-width: 768px) {
-            .container {
-                padding: 30px 20px;
-            }
-
-            h1 {
-                font-size: 2em;
-            }
-
-            .subtitle {
-                font-size: 1.1em;
-            }
-
-            .description {
-                font-size: 1em;
-            }
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NCAA D1 Compensation Tools</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: linear-gradient(135deg, #0f172a 0%, #1a1f35 50%, #0f172a 100%);
+      color: #f1f5f9;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    
+    .header-bar {
+      background: rgba(30, 41, 59, 0.95);
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+    
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    
+    .header-title h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #22c55e, #3b82f6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    
+    .header-title .icon {
+      font-size: 1.8rem;
+    }
+    
+    .tool-selector {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 1;
+      max-width: 600px;
+    }
+    
+    .tool-selector label {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #94a3b8;
+      white-space: nowrap;
+    }
+    
+    .tool-selector select {
+      flex: 1;
+      padding: 10px 16px;
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-size: 0.95rem;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      outline: none;
+      transition: all 0.2s;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      padding-right: 36px;
+    }
+    
+    .tool-selector select:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+    }
+    
+    .tool-selector select:hover {
+      border-color: rgba(255,255,255,0.3);
+    }
+    
+    .tool-selector select option {
+      background: #1e293b;
+      color: #f1f5f9;
+      padding: 8px;
+    }
+    
+    .iframe-container {
+      width: 100%;
+      height: calc(100vh - 69px);
+      border: none;
+      display: block;
+    }
+    
+    .iframe-container iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+    
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: calc(100vh - 69px);
+      font-size: 1.2rem;
+      color: #94a3b8;
+    }
+    
+    .loading.hidden {
+      display: none;
+    }
+    
+    @media (max-width: 768px) {
+      .header-bar {
+        flex-direction: column;
+        align-items: stretch;
+        padding: 12px 16px;
+        gap: 12px;
+      }
+      
+      .header-title h1 {
+        font-size: 1.2rem;
+      }
+      
+      .tool-selector {
+        max-width: 100%;
+      }
+      
+      .tool-selector label {
+        display: none;
+      }
+    }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🏈 VALD</h1>
-        <p class="subtitle">NCAA Division 1 Compensation Analysis Tools</p>
-        <p class="description">
-            Welcome to the VALD NCAA compensation tools. Access comprehensive salary comparison and analysis tools 
-            for NCAA Division 1 athletic programs. Compare salaries, analyze benefits packages, and make informed 
-            decisions with real institutional data.
-        </p>
-
-        <div class="tools-section">
-            <h2>Select a Tool</h2>
-            <div class="dropdown" id="toolsDropdown">
-                <button class="dropdown-button" onclick="toggleDropdown()">
-                    Choose a Compensation Tool
-                </button>
-                <div class="dropdown-content">
-                    <a href="ncaa_d1_total_compensation.html">
-                        <span class="tool-name">📊 NCAA D1 Total Compensation</span>
-                        <span class="tool-desc">View and search sortable salary table for 20 NCAA schools</span>
-                    </a>
-                    <a href="salary_comparison_tool.html">
-                        <span class="tool-name">💰 Basic Salary Comparison Tool</span>
-                        <span class="tool-desc">Simple side-by-side salary comparison with manual input</span>
-                    </a>
-                    <a href="2_school_side_by_side_compare_total_value.html">
-                        <span class="tool-name">🎯 Advanced Side-by-Side Comparison</span>
-                        <span class="tool-desc">Comprehensive analysis with all 364 D1 schools, taxes, benefits, and COL adjustments</span>
-                    </a>
-                </div>
-            </div>
-        </div>
-
-        <div class="footer">
-            <p>Data Source: NCAA Public Financial Records | Updated 2024</p>
-        </div>
+  <div class="header-bar">
+    <div class="header-title">
+      <span class="icon">🏈</span>
+      <h1>NCAA D1 Compensation Tools</h1>
     </div>
-
-    <script>
-        function toggleDropdown() {
-            const dropdown = document.getElementById('toolsDropdown');
-            dropdown.classList.toggle('active');
-        }
-
-        // Close dropdown when clicking outside
-        window.onclick = function(event) {
-            if (!event.target.matches('.dropdown-button')) {
-                const dropdown = document.getElementById('toolsDropdown');
-                if (dropdown.classList.contains('active')) {
-                    dropdown.classList.remove('active');
-                }
-            }
-        }
-    </script>
+    
+    <div class="tool-selector">
+      <label for="toolSelect">Select Tool:</label>
+      <select id="toolSelect">
+        <option value="2_School_Taxes_COL_Comparssion_Tool.html">🏫 School Comparison Tool (Tax & COL)</option>
+        <option value="NCAA_D1_Total_Compensation_V4B_Single_School.html">🎓 Single School Analysis</option>
+        <option value="2_School_Benefits_Total_Comp_Compare_Tool.html">📊 Benefits & Total Compensation (Full Dashboard)</option>
+        <option value="2_school_side_by_side_compare_total_value.html">💰 Side-by-Side Salary Comparison (Two Different Salaries)</option>
+      </select>
+    </div>
+  </div>
+  
+  <div class="loading" id="loading">Loading tool...</div>
+  
+  <div class="iframe-container" id="iframeContainer"></div>
+  
+  <script>
+    const toolSelect = document.getElementById('toolSelect');
+    const iframeContainer = document.getElementById('iframeContainer');
+    const loading = document.getElementById('loading');
+    
+    function loadTool(toolUrl) {
+      // Show loading
+      loading.classList.remove('hidden');
+      
+      // Remove existing iframe if any
+      iframeContainer.innerHTML = '';
+      
+      // Create new iframe
+      const iframe = document.createElement('iframe');
+      iframe.src = toolUrl;
+      iframe.title = 'NCAA D1 Compensation Tool';
+      
+      // Hide loading when iframe loads
+      iframe.onload = function() {
+        loading.classList.add('hidden');
+      };
+      
+      iframeContainer.appendChild(iframe);
+      
+      // Store selection in localStorage
+      try {
+        localStorage.setItem('selectedTool', toolUrl);
+      } catch (e) {
+        // localStorage might not be available
+      }
+    }
+    
+    // Handle dropdown change
+    toolSelect.addEventListener('change', function() {
+      loadTool(this.value);
+    });
+    
+    // Load previously selected tool or default to first option
+    let initialTool = toolSelect.value;
+    try {
+      const savedTool = localStorage.getItem('selectedTool');
+      if (savedTool) {
+        toolSelect.value = savedTool;
+        initialTool = savedTool;
+      }
+    } catch (e) {
+      // localStorage might not be available
+    }
+    
+    // Load initial tool
+    loadTool(initialTool);
+  </script>
 </body>
 </html>
