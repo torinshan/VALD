@@ -72,20 +72,39 @@
             font-weight: 500;
         }
 
-        select {
+        select, input[type="number"] {
             width: 100%;
             padding: 12px;
             font-size: 16px;
             border: 2px solid #d0d0d0;
             border-radius: 8px;
             background: white;
-            cursor: pointer;
             outline: none;
             transition: border-color 0.3s;
         }
 
-        select:focus {
+        select {
+            cursor: pointer;
+        }
+
+        select:focus, input[type="number"]:focus {
             border-color: #667eea;
+        }
+
+        input[type="number"] {
+            -moz-appearance: textfield;
+        }
+
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+        .input-hint {
+            font-size: 0.85em;
+            color: #888;
+            margin-top: 5px;
         }
 
         .compare-button {
@@ -109,6 +128,12 @@
 
         .compare-button:active {
             transform: translateY(0);
+        }
+
+        .compare-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
         }
 
         .results-panel {
@@ -281,7 +306,7 @@
 <body>
     <div class="container">
         <h1>NCAA Salary Comparison Tool</h1>
-        <p class="subtitle">Compare Coach Salaries Between Two Schools</p>
+        <p class="subtitle">Compare Annual Salaries Between Two Schools</p>
 
         <div class="selection-panel">
             <div class="school-selector">
@@ -293,10 +318,9 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="position1">Select Position:</label>
-                    <select id="position1">
-                        <option value="">-- Select Position --</option>
-                    </select>
+                    <label for="salary1">Annual Salary ($):</label>
+                    <input type="number" id="salary1" placeholder="Enter annual salary" min="0" step="1000">
+                    <div class="input-hint">Enter the annual compensation amount</div>
                 </div>
             </div>
 
@@ -309,10 +333,9 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="position2">Select Position:</label>
-                    <select id="position2">
-                        <option value="">-- Select Position --</option>
-                    </select>
+                    <label for="salary2">Annual Salary ($):</label>
+                    <input type="number" id="salary2" placeholder="Enter annual salary" min="0" step="1000">
+                    <div class="input-hint">Enter the annual compensation amount</div>
                 </div>
             </div>
         </div>
@@ -342,33 +365,26 @@
         </div>
 
         <div class="footer">
-            <p>Data Source: NCAA Public Financial Records | Updated 2024</p>
+            <p>Salary Comparison Tool | Updated 2024</p>
         </div>
     </div>
 
     <script>
-        // Sample data for NCAA D1 total compensation
-        const compensationData = [
-            { school: "Alabama", coach: "Nick Saban", position: "Head Football Coach", salary: 11700000 },
-            { school: "Georgia", coach: "Kirby Smart", position: "Head Football Coach", salary: 11250000 },
-            { school: "Texas A&M", coach: "Jimbo Fisher", position: "Head Football Coach", salary: 9000000 },
-            { school: "Clemson", coach: "Dabo Swinney", position: "Head Football Coach", salary: 8500000 },
-            { school: "Ohio State", coach: "Ryan Day", position: "Head Football Coach", salary: 7600000 },
-            { school: "LSU", coach: "Brian Kelly", position: "Head Football Coach", salary: 9500000 },
-            { school: "Michigan", coach: "Jim Harbaugh", position: "Head Football Coach", salary: 7500000 },
-            { school: "USC", coach: "Lincoln Riley", position: "Head Football Coach", salary: 10000000 },
-            { school: "Oregon", coach: "Dan Lanning", position: "Head Football Coach", salary: 6000000 },
-            { school: "Penn State", coach: "James Franklin", position: "Head Football Coach", salary: 7000000 },
-            { school: "Florida", coach: "Billy Napier", position: "Head Football Coach", salary: 7000000 },
-            { school: "Notre Dame", coach: "Marcus Freeman", position: "Head Football Coach", salary: 6500000 },
-            { school: "Tennessee", coach: "Josh Heupel", position: "Head Football Coach", salary: 5000000 },
-            { school: "Oklahoma", coach: "Brent Venables", position: "Head Football Coach", salary: 7000000 },
-            { school: "Texas", coach: "Steve Sarkisian", position: "Head Football Coach", salary: 5200000 },
-            { school: "Auburn", coach: "Hugh Freeze", position: "Head Football Coach", salary: 6500000 },
-            { school: "Kentucky", coach: "John Calipari", position: "Head Basketball Coach", salary: 8600000 },
-            { school: "Duke", coach: "Jon Scheyer", position: "Head Basketball Coach", salary: 5000000 },
-            { school: "Kansas", coach: "Bill Self", position: "Head Basketball Coach", salary: 7500000 },
-            { school: "North Carolina", coach: "Hubert Davis", position: "Head Basketball Coach", salary: 4000000 }
+        // List of NCAA Division 1 schools
+        const schools = [
+            "Alabama", "Arizona", "Arizona State", "Arkansas", "Auburn",
+            "Baylor", "Boston College", "BYU", "California", "Clemson",
+            "Colorado", "Duke", "Florida", "Florida State", "Georgia",
+            "Georgia Tech", "Illinois", "Indiana", "Iowa", "Iowa State",
+            "Kansas", "Kansas State", "Kentucky", "Louisville", "LSU",
+            "Maryland", "Miami", "Michigan", "Michigan State", "Minnesota",
+            "Mississippi State", "Missouri", "Nebraska", "North Carolina",
+            "NC State", "Northwestern", "Notre Dame", "Ohio State", "Oklahoma",
+            "Oklahoma State", "Ole Miss", "Oregon", "Oregon State", "Penn State",
+            "Purdue", "Rutgers", "South Carolina", "Stanford", "Syracuse",
+            "TCU", "Tennessee", "Texas", "Texas A&M", "Texas Tech", "UCLA",
+            "USC", "Utah", "Vanderbilt", "Virginia", "Virginia Tech",
+            "Washington", "Washington State", "West Virginia", "Wisconsin"
         ];
 
         // Initialize the tool
@@ -378,142 +394,108 @@
 
         // Populate school dropdowns
         function populateSchoolDropdowns() {
-            const schools = [...new Set(compensationData.map(d => d.school))].sort();
             const school1Select = document.getElementById('school1');
             const school2Select = document.getElementById('school2');
 
             schools.forEach(school => {
-                school1Select.innerHTML += `<option value="${school}">${school}</option>`;
-                school2Select.innerHTML += `<option value="${school}">${school}</option>`;
+                const option1 = document.createElement('option');
+                option1.value = school;
+                option1.textContent = school;
+                school1Select.appendChild(option1);
+
+                const option2 = document.createElement('option');
+                option2.value = school;
+                option2.textContent = school;
+                school2Select.appendChild(option2);
             });
-
-            // Add event listeners for school changes
-            school1Select.addEventListener('change', () => updatePositionDropdown('school1', 'position1'));
-            school2Select.addEventListener('change', () => updatePositionDropdown('school2', 'position2'));
-        }
-
-        // Update position dropdown based on selected school
-        function updatePositionDropdown(schoolSelectId, positionSelectId) {
-            const schoolSelect = document.getElementById(schoolSelectId);
-            const positionSelect = document.getElementById(positionSelectId);
-            const selectedSchool = schoolSelect.value;
-
-            // Clear current options
-            positionSelect.innerHTML = '<option value="">-- Select Position --</option>';
-
-            if (selectedSchool) {
-                const positions = compensationData
-                    .filter(d => d.school === selectedSchool)
-                    .map(d => d.position);
-
-                positions.forEach(position => {
-                    positionSelect.innerHTML += `<option value="${position}">${position}</option>`;
-                });
-            }
         }
 
         // Compare schools
         function compareSchools() {
             const school1 = document.getElementById('school1').value;
-            const position1 = document.getElementById('position1').value;
+            const salary1 = parseFloat(document.getElementById('salary1').value);
             const school2 = document.getElementById('school2').value;
-            const position2 = document.getElementById('position2').value;
+            const salary2 = parseFloat(document.getElementById('salary2').value);
 
-            if (!school1 || !position1 || !school2 || !position2) {
-                alert('Please select both schools and positions to compare.');
+            if (!school1 || !school2) {
+                alert('Please select both schools.');
                 return;
             }
 
-            const data1 = compensationData.find(d => d.school === school1 && d.position === position1);
-            const data2 = compensationData.find(d => d.school === school2 && d.position === position2);
-
-            if (!data1 || !data2) {
-                alert('Data not found for selected schools/positions.');
+            if (!salary1 || !salary2 || salary1 <= 0 || salary2 <= 0) {
+                alert('Please enter valid salary amounts for both schools.');
                 return;
             }
 
-            displayComparison(data1, data2);
+            displayComparison(school1, salary1, school2, salary2);
         }
 
         // Display comparison results
-        function displayComparison(data1, data2) {
+        function displayComparison(school1, salary1, school2, salary2) {
             const comparisonGrid = document.getElementById('comparisonGrid');
             
             comparisonGrid.innerHTML = `
                 <div class="school-card">
-                    <h3>${data1.school}</h3>
+                    <h3>${school1}</h3>
                     <div class="info-row">
-                        <span class="info-label">Coach:</span>
-                        <span class="info-value">${data1.coach}</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Position:</span>
-                        <span class="info-value">${data1.position}</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Total Compensation:</span>
-                        <span class="info-value salary-value">$${data1.salary.toLocaleString()}</span>
+                        <span class="info-label">Annual Salary:</span>
+                        <span class="info-value salary-value">$${salary1.toLocaleString()}</span>
                     </div>
                 </div>
 
                 <div class="school-card">
-                    <h3>${data2.school}</h3>
+                    <h3>${school2}</h3>
                     <div class="info-row">
-                        <span class="info-label">Coach:</span>
-                        <span class="info-value">${data2.coach}</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Position:</span>
-                        <span class="info-value">${data2.position}</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Total Compensation:</span>
-                        <span class="info-value salary-value">$${data2.salary.toLocaleString()}</span>
+                        <span class="info-label">Annual Salary:</span>
+                        <span class="info-value salary-value">$${salary2.toLocaleString()}</span>
                     </div>
                 </div>
             `;
 
-            displayChart(data1, data2);
-            displayAnalysis(data1, data2);
+            displayChart(school1, salary1, school2, salary2);
+            displayAnalysis(school1, salary1, school2, salary2);
 
-            document.getElementById('resultsPanel').classList.add('active');
-            document.getElementById('resultsPanel').scrollIntoView({ behavior: 'smooth' });
+            const resultsPanel = document.getElementById('resultsPanel');
+            resultsPanel.classList.add('active');
+            resultsPanel.scrollIntoView({ behavior: 'smooth' });
         }
 
         // Display bar chart
-        function displayChart(data1, data2) {
+        function displayChart(school1, salary1, school2, salary2) {
             const barChart = document.getElementById('barChart');
-            const maxSalary = Math.max(data1.salary, data2.salary);
-            const height1 = (data1.salary / maxSalary) * 250;
-            const height2 = (data2.salary / maxSalary) * 250;
+            const maxSalary = Math.max(salary1, salary2);
+            const height1 = (salary1 / maxSalary) * 250;
+            const height2 = (salary2 / maxSalary) * 250;
 
             barChart.innerHTML = `
                 <div class="bar" style="height: ${height1}px;">
-                    <div style="margin-top: auto;">$${(data1.salary / 1000000).toFixed(1)}M</div>
-                    <div class="bar-label">${data1.school}</div>
+                    <div style="margin-top: auto;">$${(salary1 / 1000000).toFixed(1)}M</div>
+                    <div class="bar-label">${school1}</div>
                 </div>
                 <div class="bar" style="height: ${height2}px;">
-                    <div style="margin-top: auto;">$${(data2.salary / 1000000).toFixed(1)}M</div>
-                    <div class="bar-label">${data2.school}</div>
+                    <div style="margin-top: auto;">$${(salary2 / 1000000).toFixed(1)}M</div>
+                    <div class="bar-label">${school2}</div>
                 </div>
             `;
         }
 
         // Display analysis
-        function displayAnalysis(data1, data2) {
+        function displayAnalysis(school1, salary1, school2, salary2) {
             const analysisContent = document.getElementById('analysisContent');
-            const difference = Math.abs(data1.salary - data2.salary);
-            const percentDiff = ((difference / Math.min(data1.salary, data2.salary)) * 100).toFixed(1);
-            const higherPaid = data1.salary > data2.salary ? data1 : data2;
-            const lowerPaid = data1.salary < data2.salary ? data1 : data2;
+            const difference = Math.abs(salary1 - salary2);
+            const percentDiff = ((difference / Math.min(salary1, salary2)) * 100).toFixed(1);
+            const higherSchool = salary1 > salary2 ? school1 : school2;
+            const lowerSchool = salary1 < salary2 ? school1 : school2;
+            const higherSalary = Math.max(salary1, salary2);
+            const lowerSalary = Math.min(salary1, salary2);
 
             analysisContent.innerHTML = `
                 <div class="stat-card">
                     <h4>Salary Difference</h4>
                     <p>
-                        ${higherPaid.school}'s ${higherPaid.coach} earns 
+                        ${higherSchool} pays 
                         <span class="difference-positive">$${difference.toLocaleString()}</span> 
-                        more than ${lowerPaid.school}'s ${lowerPaid.coach}.
+                        more than ${lowerSchool}.
                     </p>
                 </div>
 
@@ -521,15 +503,15 @@
                     <h4>Percentage Difference</h4>
                     <p>
                         This represents a <span class="difference-positive">${percentDiff}%</span> 
-                        difference in total compensation between the two schools.
+                        difference in annual salary between the two schools.
                     </p>
                 </div>
 
                 <div class="stat-card">
-                    <h4>Ranking Comparison</h4>
+                    <h4>Salary Comparison</h4>
                     <p>
-                        Among all NCAA Division 1 programs in our dataset, 
-                        ${higherPaid.school} ranks higher in compensation for this position.
+                        ${higherSchool} pays <strong>$${higherSalary.toLocaleString()}</strong> while 
+                        ${lowerSchool} pays <strong>$${lowerSalary.toLocaleString()}</strong> annually.
                     </p>
                 </div>
 
@@ -537,7 +519,7 @@
                     <h4>Combined Total</h4>
                     <p>
                         Together, these two positions represent a combined annual compensation of 
-                        <span style="color: #667eea; font-weight: 700;">$${(data1.salary + data2.salary).toLocaleString()}</span>.
+                        <span style="color: #667eea; font-weight: 700;">$${(salary1 + salary2).toLocaleString()}</span>.
                     </p>
                 </div>
             `;
@@ -547,8 +529,8 @@
         function resetComparison() {
             document.getElementById('school1').selectedIndex = 0;
             document.getElementById('school2').selectedIndex = 0;
-            document.getElementById('position1').innerHTML = '<option value="">-- Select Position --</option>';
-            document.getElementById('position2').innerHTML = '<option value="">-- Select Position --</option>';
+            document.getElementById('salary1').value = '';
+            document.getElementById('salary2').value = '';
             document.getElementById('resultsPanel').classList.remove('active');
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }

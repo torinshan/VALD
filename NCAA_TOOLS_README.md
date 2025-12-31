@@ -21,16 +21,16 @@ Open `ncaa_d1_total_compensation.html` in any modern web browser.
 
 ### 2. NCAA Salary Comparison Tool (`salary_comparison_tool.html`)
 
-An interactive tool to compare coach salaries between two different schools.
+An interactive tool to compare annual salaries between two different schools.
 
 **Features:**
 - Side-by-side school selection with dropdown menus
-- Dynamic position selection based on chosen school
-- Visual comparison with bar charts
+- Manual salary input fields for each school
+- Visual comparison with proportional bar charts
 - Detailed salary analysis including:
   - Absolute salary difference
   - Percentage difference
-  - Ranking comparison
+  - Side-by-side comparison
   - Combined total compensation
 - Beautiful gradient design with responsive layout
 - Reset functionality to start a new comparison
@@ -38,15 +38,15 @@ An interactive tool to compare coach salaries between two different schools.
 **Usage:**
 1. Open `salary_comparison_tool.html` in any modern web browser
 2. Select School 1 from the first dropdown
-3. Choose a position for School 1
+3. Enter the annual salary amount for School 1
 4. Select School 2 from the second dropdown
-5. Choose a position for School 2
+5. Enter the annual salary amount for School 2
 6. Click "Compare Salaries" to see the results
 7. Use "Reset Comparison" to start over
 
 **Example Comparison:**
-- Compare Alabama's Head Football Coach (Nick Saban - $11,700,000) with Georgia's Head Football Coach (Kirby Smart - $11,250,000)
-- The tool shows Alabama pays $450,000 (4.0%) more
+- Compare Alabama ($8,500,000) with Georgia ($9,200,000)
+- The tool shows Georgia pays $700,000 (8.2%) more
 
 ---
 
@@ -55,8 +55,10 @@ An interactive tool to compare coach salaries between two different schools.
 All data is sourced from NCAA Public Financial Records (Updated 2024).
 
 The dataset includes:
-- **Football Programs:** Alabama, Auburn, Clemson, Florida, Georgia, LSU, Michigan, Notre Dame, Ohio State, Oklahoma, Oregon, Penn State, Tennessee, Texas, Texas A&M, USC
-- **Basketball Programs:** Duke, Kansas, Kentucky, North Carolina
+- **Football Programs:** 60+ NCAA Division 1 schools including Alabama, Auburn, Clemson, Florida, Georgia, LSU, Michigan, Notre Dame, Ohio State, Oklahoma, Oregon, Penn State, Tennessee, Texas, Texas A&M, USC, and many more
+- **Basketball Programs:** Duke, Kansas, Kentucky, North Carolina, and others
+
+**Note:** The comparison tool allows users to enter custom salary amounts for any school in the database.
 
 ---
 
