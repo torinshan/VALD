@@ -1,8 +1,9 @@
 name: Workload & Model Pipeline (Every 15 min)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  # TEMPORARILY DISABLED: Related to VALD API issues (2026-01-05)
+  # schedule:
+  #   - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       skip_training:

@@ -2,9 +2,10 @@ name: Tertiary FD Defense (15m PT)
 
 on:
   workflow_dispatch:
-  schedule:
-    # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
-    - cron: "11,26,41,56 * * * *"
+  # TEMPORARILY DISABLED: Related to VALD API issues (2026-01-05)
+  # schedule:
+  #   # Runs at :11/:26/:41/:56 each hour (UTC). We'll gate to LA hours below.
+  #   - cron: "11,26,41,56 * * * *"
 
 # Needed for Workload Identity Federation and repo access
 permissions:
