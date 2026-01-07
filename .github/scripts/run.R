@@ -469,8 +469,8 @@ con <- DBI::dbConnect(
 )
 ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
-  bq_dataset_create(ds, location = location)
-  cat("Created BigQuery dataset:", dataset, "in", location, "\n")
+  bq_dataset_create(ds, location = location, default_table_expiration_ms = NULL)
+  cat("Created BigQuery dataset:", dataset, "in", location, "with no table expiration\n")
 }
 
 # ---------- Logging ----------

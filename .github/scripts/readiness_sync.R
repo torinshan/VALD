@@ -265,7 +265,7 @@ copy_table_bq <- function() {
     # Ensure destination dataset exists
     dest_ds <- bq_dataset(DEST_PROJECT, DEST_DATASET)
     if (!bq_dataset_exists(dest_ds)) {
-      bq_dataset_create(dest_ds, location = LOCATION)
+      bq_dataset_create(dest_ds, location = LOCATION, default_table_expiration_ms = NULL)
       log_msg(glue("Created destination dataset: {DEST_DATASET}"))
     }
     
