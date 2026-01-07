@@ -328,7 +328,7 @@ safe_select_for_join <- function(df, columns, join_key, description = "select") 
       "not found, cannot perform join"
     ), "WARN")
     # Return empty dataframe with expected structure (just the join key)
-    return(tibble::tibble(!!join_key := character(0)))
+    return(tibble(!!join_key := character(0)))
   }
   
   # Select available columns
