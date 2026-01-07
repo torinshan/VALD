@@ -278,38 +278,89 @@ remove_checkpoint <- function(description) {
 }
 
 # ---------- VALD API Rate Limiting ----------
-# Track last API call time and enforce rate limiting (10 calls per second)
+# Adaptive rate limiting that responds to API rate limit errors
+# - Starts at optimal 10 calls per second (0.1 second spacing)
+# - If rate limit error detected: cooldown 1 second, restart at 2 calls/sec
+# - Ramps up by 1 call/sec every second if no errors (2→3→4...→10)
+# - Maintains 10 calls/sec when optimal
 # Using an environment to encapsulate state and avoid global mutable list issues
 api_rate_limiter <- new.env(parent = emptyenv())
 api_rate_limiter$last_call_time <- Sys.time()
-api_rate_limiter$calls_this_second <- 0
+api_rate_limiter$current_calls_per_second <- 10  # Start at optimal
 api_rate_limiter$max_calls_per_second <- 10
+api_rate_limiter$min_calls_per_second <- 2
+api_rate_limiter$last_ramp_time <- Sys.time()
 
-# Rate limit API calls to avoid hitting API limits
+# Calculate seconds per call based on current rate
+get_seconds_per_call <- function() {
+  1.0 / api_rate_limiter$current_calls_per_second
+}
+
+# Handle rate limit error - trigger cooldown and reset to minimum rate
+handle_rate_limit_error <- function() {
+  create_log_entry(paste(
+    "Rate limit error detected - entering cooldown.",
+    "Resetting from", api_rate_limiter$current_calls_per_second, 
+    "to", api_rate_limiter$min_calls_per_second, "calls/sec"
+  ), "WARN")
+  
+  # Cooldown for 1 second
+  Sys.sleep(1.0)
+  
+  # Reset to minimum rate
+  api_rate_limiter$current_calls_per_second <- api_rate_limiter$min_calls_per_second
+  api_rate_limiter$last_ramp_time <- Sys.time()
+  
+  create_log_entry(paste(
+    "Cooldown complete - restarting at", api_rate_limiter$min_calls_per_second, "calls/sec"
+  ), "INFO")
+}
+
+# Attempt to ramp up rate if we've been successful for a full second
+try_ramp_up_rate <- function() {
+  # Only ramp up if not already at max
+  if (api_rate_limiter$current_calls_per_second >= api_rate_limiter$max_calls_per_second) {
+    return()
+  }
+  
+  # Check if a second has passed since last ramp
+  time_since_ramp <- as.numeric(difftime(Sys.time(), api_rate_limiter$last_ramp_time, units = "secs"))
+  
+  if (time_since_ramp >= 1.0) {
+    old_rate <- api_rate_limiter$current_calls_per_second
+    api_rate_limiter$current_calls_per_second <- min(
+      api_rate_limiter$current_calls_per_second + 1,
+      api_rate_limiter$max_calls_per_second
+    )
+    api_rate_limiter$last_ramp_time <- Sys.time()
+    
+    if (old_rate != api_rate_limiter$current_calls_per_second) {
+      create_log_entry(paste(
+        "Ramping up rate:", old_rate, "->", api_rate_limiter$current_calls_per_second, "calls/sec"
+      ), "INFO")
+    }
+  }
+}
+
+# Rate limit API calls with adaptive rate control
+# Enforces even spacing based on current rate (e.g., 0.1 seconds at 10 calls/sec)
 rate_limit_api_call <- function() {
+  # Try to ramp up if appropriate
+  try_ramp_up_rate()
+  
   current_time <- Sys.time()
   time_since_last <- as.numeric(difftime(current_time, api_rate_limiter$last_call_time, units = "secs"))
   
-  # Reset counter if we've moved to a new second
-  if (time_since_last >= 1.0) {
-    api_rate_limiter$calls_this_second <- 0
-    api_rate_limiter$last_call_time <- current_time
-    time_since_last <- 0  # Reset since we're in a new second
+  seconds_per_call <- get_seconds_per_call()
+  
+  # If not enough time has passed since last call, wait
+  if (time_since_last < seconds_per_call) {
+    wait_time <- seconds_per_call - time_since_last
+    Sys.sleep(wait_time)
   }
   
-  # If we've hit the limit for this second, wait until the next second
-  if (api_rate_limiter$calls_this_second >= api_rate_limiter$max_calls_per_second) {
-    wait_time <- 1.0 - time_since_last
-    if (wait_time > 0) {
-      Sys.sleep(wait_time)
-      # After sleeping, we're definitely in a new second
-      api_rate_limiter$calls_this_second <- 0
-      api_rate_limiter$last_call_time <- Sys.time()
-    }
-  }
-  
-  # Increment call counter
-  api_rate_limiter$calls_this_second <- api_rate_limiter$calls_this_second + 1
+  # Update last call time
+  api_rate_limiter$last_call_time <- Sys.time()
 }
 
 # ---------- VALD API Pagination Safety ----------
@@ -359,11 +410,14 @@ detect_stuck_pagination <- function(description, current_cursor = NULL, max_same
   return(FALSE)
 }
 
-# Wrapper for VALD API calls with timeout, pagination protection, checkpointing, and rate limiting
+# Wrapper for VALD API calls with pagination protection, checkpointing, and rate limiting
+# Note: timeout_seconds is retained for backwards compatibility but is not enforced
+# as a hard timeout. The API will run as long as it continues to respond.
+# The underlying HTTP client will timeout if the API stops responding.
 safe_vald_fetch <- function(fetch_function, description = "VALD API", 
                            timeout_seconds = 600, max_same_cursor = 3, 
                            enable_checkpointing = TRUE, checkpoint_interval = 100, ...) {
-  create_log_entry(paste("Starting", description, "fetch with", timeout_seconds, "second timeout"))
+  create_log_entry(paste("Starting", description, "fetch (no timeout - will run while API responds)"))
   
   # Check for existing checkpoint
   checkpoint <- NULL
@@ -387,14 +441,11 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   }
   
   result <- NULL
-  timed_out <- FALSE
-  circuit_breaker_tripped <- FALSE
   
   # Wrap the fetch function to monitor pagination and apply rate limiting
-  monitored_fetch <- function(...) {
+  # Includes retry logic for rate limit errors
+  monitored_fetch <- function(retry_count = 0, max_retries = 3, ...) {
     start_time <- Sys.time()
-    last_log_time <- start_time
-    items_processed <- 0
     
     tryCatch({
       # Apply rate limiting before the API call
@@ -402,17 +453,39 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       
       result <- fetch_function(...)
       
-      # Check if we spent too long (potential stuck pagination)
+      # Log completion time for informational purposes
       elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-      if (elapsed > timeout_seconds * 0.8) {
-        create_log_entry(paste(
-          "WARNING:", description, "took", round(elapsed, 1),
-          "seconds - approaching timeout"
-        ), "WARN")
-      }
+      create_log_entry(paste(
+        description, "completed in", round(elapsed, 1), "seconds"
+      ), "INFO")
       
       return(result)
     }, error = function(e) {
+      # Check if error message indicates rate limiting
+      # Pattern matches: "rate limit", "rate-limit", "ratelimit", HTTP 429, "too many requests"
+      if (grepl("rate[\\s\\-]?limit|429|too[\\s\\-]?many[\\s\\-]?requests", e$message, ignore.case = TRUE)) {
+        create_log_entry(paste(
+          "Rate limit error detected in", description, ":", e$message
+        ), "ERROR")
+        
+        # Check if we've exceeded max retries
+        if (retry_count >= max_retries) {
+          create_log_entry(paste(
+            "Maximum retry attempts (", max_retries, ") reached for", description
+          ), "ERROR")
+          stop(e)
+        }
+        
+        # Trigger rate limit handler
+        handle_rate_limit_error()
+        
+        # Retry the call after cooldown and rate adjustment
+        create_log_entry(paste(
+          "Retrying", description, "after rate limit cooldown (attempt", retry_count + 1, "of", max_retries, ")"
+        ), "INFO")
+        return(monitored_fetch(retry_count = retry_count + 1, max_retries = max_retries, ...))
+      }
+      
       # Check if error message indicates pagination issues or timeout
       if (grepl("pagination|cursor|timeout", e$message, ignore.case = TRUE)) {
         create_log_entry(paste(
@@ -429,15 +502,13 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
     })
   }
   
+  # Execute the fetch without artificial timeout - let it run while API responds
   tryCatch({
-    result <- withTimeout({
-      monitored_fetch(...)
-    }, timeout = timeout_seconds, onTimeout = "error")
-  }, TimeoutException = function(e) {
-    timed_out <<- TRUE
-    create_log_entry(paste(description, "fetch TIMEOUT after", timeout_seconds, "seconds"), "ERROR")
+    result <- monitored_fetch(...)
+  }, error = function(e) {
+    create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
     
-    # If we have partial results via checkpoint, use them
+    # If we have partial results via checkpoint, try to use them
     if (enable_checkpointing && !is.null(checkpoint) && is.list(checkpoint)) {
       # Safely get count of processed items and result
       item_count <- if (!is.null(checkpoint$processed_items)) {
@@ -448,49 +519,10 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       
       if (!is.null(checkpoint$result)) {
         create_log_entry(paste(
-          "Timeout occurred but checkpoint exists with",
-          item_count, "items - using partial results"
+          "Error occurred but checkpoint exists with",
+          item_count, "items - attempting to use partial results"
         ), "WARN")
         result <<- checkpoint$result
-      } else {
-        create_log_entry(paste(
-          "Timeout occurred with checkpoint but no result field - complete failure"
-        ), "ERROR")
-      }
-    } else {
-      create_log_entry("No checkpoint available - this is a complete failure", "ERROR")
-    }
-    
-    # Log pagination state if available
-    if (exists(description, envir = as.environment(pagination_state))) {
-      state <- pagination_state[[description]]
-      create_log_entry(paste(
-        "Pagination state at timeout - Last cursor:",
-        substr(state$last_cursor, 1, 50),
-        "- Total pages:", state$total_pages,
-        "- Same cursor count:", state$same_count
-      ), "ERROR")
-    }
-  }, error = function(e) {
-    if (!timed_out) {
-      create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
-      
-      # If we have partial results via checkpoint, try to use them
-      if (enable_checkpointing && !is.null(checkpoint) && is.list(checkpoint)) {
-        # Safely get count of processed items and result
-        item_count <- if (!is.null(checkpoint$processed_items)) {
-          length(checkpoint$processed_items)
-        } else {
-          "unknown"
-        }
-        
-        if (!is.null(checkpoint$result)) {
-          create_log_entry(paste(
-            "Error occurred but checkpoint exists with",
-            item_count, "items - attempting to use partial results"
-          ), "WARN")
-          result <<- checkpoint$result
-        }
       }
     }
   })
