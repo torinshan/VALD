@@ -113,7 +113,7 @@ jobs:
       run: 'bq mk --dataset --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset
         exists or creation failed"
 
-        bq update --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset
+        bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset
         update failed"
 
         '
