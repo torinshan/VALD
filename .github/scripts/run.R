@@ -188,7 +188,8 @@ upload_schema_mismatches <- function() {
   tryCatch({
     mismatch_tbl <- bq_table(ds, "vald_schema_mismatches")
     if (!bq_table_exists(mismatch_tbl)) {
-      bq_table_create(mismatch_tbl, fields = as_bq_fields(schema_mismatches))
+      bq_table_create(mismatch_tbl, fields = as_bq_fields(schema_mismatches), expiration_time = NULL)
+      create_log_entry("Created vald_schema_mismatches table with no expiration")
     }
     bq_table_upload(mismatch_tbl, schema_mismatches, write_disposition = "WRITE_APPEND")
     create_log_entry(paste("Logged", nrow(schema_mismatches), "schema mismatches"))
@@ -277,6 +278,71 @@ remove_checkpoint <- function(description) {
   return(TRUE)
 }
 
+# ---------- Safe Join Helpers for Resilient Data Merging ----------
+# These functions ensure joins work gracefully even when BigQuery tables are missing,
+# empty, or have unexpected schemas. This prevents pipeline failures due to data issues.
+
+# Safe left join that checks if join column exists in both dataframes
+# If join column missing from right dataframe, returns left dataframe unchanged
+safe_left_join <- function(left_df, right_df, by, description = "join") {
+  # Check if right_df is empty
+  if (is.null(right_df) || nrow(right_df) == 0) {
+    create_log_entry(paste("Safe join:", description, "- right dataframe is empty, returning left unchanged"), "WARN")
+    return(left_df)
+  }
+  
+  # Check if join columns exist in both dataframes
+  missing_cols <- setdiff(by, names(right_df))
+  if (length(missing_cols) > 0) {
+    create_log_entry(paste(
+      "Safe join:", description, "- join column(s)", 
+      paste(missing_cols, collapse = ", "), 
+      "missing from right dataframe, returning left unchanged"
+    ), "WARN")
+    return(left_df)
+  }
+  
+  # Perform the join
+  tryCatch({
+    result <- left_df %>% left_join(right_df, by = by)
+    create_log_entry(paste("Safe join:", description, "- successfully joined", nrow(result), "rows"))
+    return(result)
+  }, error = function(e) {
+    create_log_entry(paste("Safe join:", description, "- join failed:", e$message, "- returning left unchanged"), "ERROR")
+    return(left_df)
+  })
+}
+
+# Safe select that only selects columns that exist, including the join key
+# Returns dataframe with available columns, or empty dataframe if join key missing
+safe_select_for_join <- function(df, columns, join_key, description = "select") {
+  if (is.null(df) || nrow(df) == 0) {
+    create_log_entry(paste("Safe select:", description, "- dataframe is empty"), "WARN")
+    return(df)
+  }
+  
+  # Join key must exist, otherwise return empty dataframe
+  if (!(join_key %in% names(df))) {
+    create_log_entry(paste(
+      "Safe select:", description, "- join key", join_key, 
+      "not found, cannot perform join"
+    ), "WARN")
+    # Return empty dataframe with expected structure (just the join key)
+    return(tibble(!!join_key := character(0)))
+  }
+  
+  # Select available columns
+  available_cols <- intersect(columns, names(df))
+  if (length(available_cols) == 0) {
+    create_log_entry(paste("Safe select:", description, "- no requested columns found, returning only join key"), "WARN")
+    return(df %>% select(all_of(join_key)))
+  }
+  
+  # Ensure join key is included
+  cols_to_select <- union(join_key, available_cols)
+  return(df %>% select(all_of(cols_to_select)))
+}
+
 # ---------- VALD API Rate Limiting ----------
 # Adaptive rate limiting that responds to API rate limit errors
 # - Starts at optimal 10 calls per second (0.1 second spacing)
@@ -362,6 +428,46 @@ rate_limit_api_call <- function() {
   # Update last call time
   api_rate_limiter$last_call_time <- Sys.time()
 }
+
+# ---------- Global HTTP Wrapper for Rate Limiting ----------
+# Wrap httr functions to apply rate limiting to ALL HTTP calls,
+# including those made internally by valdr package
+# Only apply rate limiting to VALD API calls (not BigQuery or other services)
+
+# Store original functions
+original_httr_GET <- httr::GET
+original_httr_POST <- httr::POST
+
+# Helper to check if URL is a VALD API call
+is_vald_api_url <- function(url) {
+  if (is.null(url) || !is.character(url)) return(FALSE)
+  # Match VALD API endpoints
+  grepl("hub\\.vald(performance)?\\.com|vald.*\\.com/api|api.*vald", url, ignore.case = TRUE)
+}
+
+# Create wrapped versions that apply rate limiting only to VALD API calls
+httr_GET_wrapped <- function(url = NULL, ...) {
+  # Only rate limit if this is a VALD API call
+  if (is_vald_api_url(url)) {
+    rate_limit_api_call()
+  }
+  original_httr_GET(url = url, ...)
+}
+
+httr_POST_wrapped <- function(url = NULL, ...) {
+  # Only rate limit if this is a VALD API call  
+  if (is_vald_api_url(url)) {
+    rate_limit_api_call()
+  }
+  original_httr_POST(url = url, ...)
+}
+
+# Override httr functions in the global environment
+# This ensures ALL VALD API HTTP calls (including from valdr) are rate-limited
+assignInNamespace("GET", httr_GET_wrapped, ns = "httr")
+assignInNamespace("POST", httr_POST_wrapped, ns = "httr")
+
+create_log_entry("Global HTTP rate limiting installed - all VALD API calls will be rate-limited at 10 calls/sec")
 
 # ---------- VALD API Pagination Safety ----------
 # Track pagination state to detect stuck loops
@@ -710,7 +816,10 @@ upload_logs_to_bigquery <- function() {
   if (nrow(log_entries)==0) return(invisible(TRUE))
   tryCatch({
     log_tbl <- bq_table(ds, "vald_processing_log")
-    if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
+    if (!bq_table_exists(log_tbl)) {
+      bq_table_create(log_tbl, fields = as_bq_fields(log_entries), expiration_time = NULL)
+      create_log_entry("Created vald_processing_log table with no expiration")
+    }
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
   }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
@@ -821,16 +930,18 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   if (length(cl) == 0) cl <- NULL
 
   # NOTE: some bigrquery versions expect `clustering_fields` (not `clustering`).
+  # IMPORTANT: Set expiration_time to NULL to ensure tables persist indefinitely
   bq_table_create(
     tbl,
     fields = as_bq_fields(data),
     time_partitioning = tp,
-    clustering_fields = cl
+    clustering_fields = cl,
+    expiration_time = NULL  # Explicitly set no expiration
   )
 
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
   cluster_info <- if (is.null(cl)) "none" else paste(cl, collapse = ",")
-  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info))
+  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info, "expiration: none"))
   invisible(TRUE)
 }
 
@@ -1234,15 +1345,23 @@ if (nrow(Vald_roster_backfill) > 0) {
         select(test_ID, vald_id) %>% distinct()
       if (nrow(missing_info) > 0) {
         create_log_entry(paste("Found", nrow(missing_info), "records in", table_name, "missing team"))
-        roster_updates <- missing_info %>%
-          left_join(Vald_roster_backfill %>% select(vald_id, team), by = "vald_id") %>%
+        roster_updates <- safe_left_join(
+          missing_info,
+          safe_select_for_join(Vald_roster_backfill, c("vald_id", "team"), "vald_id", "Vald_roster_backfill team"),
+          by = "vald_id",
+          description = "backfill missing team data"
+        ) %>%
           filter(!is.na(team))
         if (nrow(roster_updates) > 0) {
           create_log_entry(paste("Found team data for", nrow(roster_updates), "records in", table_name))
           records_to_update <- existing_data %>%
             filter(test_ID %in% roster_updates$test_ID) %>%
             select(-team) %>%
-            left_join(Vald_roster_backfill %>% select(vald_id, team), by = "vald_id") %>%
+            safe_left_join(
+              safe_select_for_join(Vald_roster_backfill, c("vald_id", "team"), "vald_id", "Vald_roster_backfill team update"),
+              by = "vald_id",
+              description = "update existing records with team"
+            ) %>%
             select(-any_of("position"))
           if (nrow(records_to_update) > 0) {
             create_log_entry(paste("Updating", nrow(records_to_update), "records in", table_name))
@@ -1371,15 +1490,29 @@ mergable_trials <- trials_wider %>%
             athleteid = first(athleteid), .groups="drop") %>%
   mutate(vald_id = as.character(athleteid)) %>% select(-athleteid)
 
-mergable_roster <- roster %>% 
-  left_join(
-    Vald_roster %>% select(any_of(c("vald_id", "position", "sport", "team"))), 
-    by = "vald_id"
+mergable_roster <- if ("vald_id" %in% names(Vald_roster) && nrow(Vald_roster) > 0) {
+  safe_left_join(
+    roster,
+    safe_select_for_join(Vald_roster, c("vald_id", "position", "sport", "team"), "vald_id", "Vald_roster metadata"),
+    by = "vald_id",
+    description = "roster + Vald_roster metadata"
   )
+} else {
+  create_log_entry("vald_id not found in Vald_roster or roster is empty - using roster without additional metadata", "WARN")
+  roster
+}
 
 forcedecks_raw <- mergable_trials %>%
-  left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
-  left_join(mergable_roster, by="vald_id") %>%
+  safe_left_join(
+    tests_processed %>% select(test_ID, test_type), 
+    by = "test_ID",
+    description = "mergable_trials + test metadata"
+  ) %>%
+  safe_left_join(
+    mergable_roster, 
+    by = "vald_id",
+    description = "forcedecks + roster metadata"
+  ) %>%
   mutate(date = as.Date(date), time = hms::as_hms(time), test_ID = as.character(test_ID))
 
 clean_column_names <- function(df) {
@@ -1614,9 +1747,18 @@ if (any(new_test_types %in% c("RSAIP","RSHIP","RSKIP"))) {
   create_log_entry("Processing RSI")
   rsi_new <- trials_wider %>%
     mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
-    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    safe_left_join(
+      tests_processed %>% select(test_ID, test_type), 
+      by = "test_ID",
+      description = "RSI trials + test metadata"
+    ) %>%
     filter(test_type %in% c("RSAIP","RSHIP","RSKIP")) %>%
-    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    select(-testid, -athleteid) %>% 
+    safe_left_join(
+      mergable_roster, 
+      by = "vald_id",
+      description = "RSI + roster metadata"
+    ) %>%
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
       "triallimb","test_ID","test_type","vald_id","full_name","position","team","date","time","body_weight_lbs",
@@ -1645,9 +1787,18 @@ if (any(new_test_types %in% c("CMRJ","SLCMRJ"))) {
   create_log_entry("Processing Rebound")
   rebound_new <- trials_wider %>%
     mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
-    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    safe_left_join(
+      tests_processed %>% select(test_ID, test_type), 
+      by = "test_ID",
+      description = "Rebound trials + test metadata"
+    ) %>%
     filter(test_type %in% c("CMRJ","SLCMRJ")) %>%
-    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    select(-testid, -athleteid) %>% 
+    safe_left_join(
+      mergable_roster, 
+      by = "vald_id",
+      description = "Rebound + roster metadata"
+    ) %>%
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
       "triallimb","test_ID","test_type","vald_id","full_name","position","team","date","time","body_weight_lbs",
@@ -1684,9 +1835,18 @@ if ("SLJ" %in% new_test_types) {
   create_log_entry("Processing SLJ")
   slj_new <- trials_wider %>%
     mutate(test_ID = as.character(testid), vald_id = athleteid) %>%
-    left_join(tests_processed %>% select(test_ID, test_type), by="test_ID") %>%
+    safe_left_join(
+      tests_processed %>% select(test_ID, test_type), 
+      by = "test_ID",
+      description = "SLJ trials + test metadata"
+    ) %>%
     filter(test_type == "SLJ") %>%
-    select(-testid, -athleteid) %>% left_join(mergable_roster, by="vald_id") %>%
+    select(-testid, -athleteid) %>% 
+    safe_left_join(
+      mergable_roster, 
+      by = "vald_id",
+      description = "SLJ + roster metadata"
+    ) %>%
     mutate(date=as.Date(date), time=hms::as_hms(time)) %>%
     select(any_of(c(
       "triallimb","test_ID","vald_id","full_name","position","team","date","time","body_weight_lbs",
@@ -1807,7 +1967,11 @@ if (nrow(nord_tests) > 0) {
                      "modifiedDateUtc","testDateUtc","athleteId","testId",
                      "leftTorque","rightTorque","leftMaxForce","rightMaxForce",
                      "leftRepetitions","rightRepetitions","testTypeName"))) %>%
-    left_join(mergable_roster, by="vald_id") %>%
+    safe_left_join(
+      mergable_roster, 
+      by = "vald_id",
+      description = "Nordbord + roster metadata"
+    ) %>%
     attach_bw()
 
   if ("body_weight_lbs" %in% names(nb)) {
