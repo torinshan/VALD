@@ -200,6 +200,14 @@ upload_schema_mismatches <- function() {
 }
 
 # ---------- VALD API Checkpointing ----------
+# NOTE: This checkpointing mechanism provides infrastructure for resumable API fetches.
+# Since valdr package functions (get_forcedecks_data, get_nordbord_data) handle pagination
+# internally and return complete results, this checkpoint mechanism serves as:
+# 1. A framework for future implementations that may support partial result checkpointing
+# 2. Error recovery when partial results are available before timeout
+# 3. A fallback mechanism that can be enhanced when valdr supports pagination control
+#
+# The primary benefits come from rate limiting and the backstop start date logic.
 # Global checkpoint directory
 CHECKPOINT_DIR <- "/tmp/vald_checkpoints"
 
