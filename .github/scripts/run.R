@@ -1663,9 +1663,19 @@ if (any(new_test_types %in% c("CMJ","LCMJ","SJ","ABCMJ"))) {
                  percent_rank(relative_peak_eccentric_force) * 100 +
                  percent_rank(bodymass_relative_takeoff_power) * 100 +
                  percent_rank(rsi_modified_imp_mom) * 100,
-               performance_score = percent_rank(calc_performance_score) * 100) %>%
-        group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
-        ungroup() %>% select(-calc_performance_score)
+               performance_score = percent_rank(calc_performance_score) * 100)
+      
+      # Only calculate team_performance_score if team column exists
+      if ("team" %in% names(fd)) {
+        fd <- fd %>%
+          group_by(team) %>% 
+          mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+          ungroup()
+      } else {
+        create_log_entry("team column not found - skipping team_performance_score calculation for CMJ", "WARN")
+      }
+      
+      fd <- fd %>% select(-calc_performance_score)
     }
 
     temp_cols_to_remove <- c(
@@ -1896,9 +1906,19 @@ if ("IMTP" %in% new_test_types) {
       mutate(calc_performance_score = percent_rank(peak_vertical_force) * 200 +
                (100 - percent_rank(start_to_peak_force) * 100) +
                percent_rank(rfd_at_100ms) * 100,
-             performance_score = percent_rank(calc_performance_score) * 100) %>%
-      group_by(team) %>% mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
-      ungroup() %>% select(-calc_performance_score)
+             performance_score = percent_rank(calc_performance_score) * 100)
+    
+    # Only calculate team_performance_score if team column exists
+    if ("team" %in% names(imtp_new)) {
+      imtp_new <- imtp_new %>%
+        group_by(team) %>% 
+        mutate(team_performance_score = percent_rank(calc_performance_score) * 100) %>%
+        ungroup()
+    } else {
+      create_log_entry("team column not found - skipping team_performance_score calculation for IMTP", "WARN")
+    }
+    
+    imtp_new <- imtp_new %>% select(-calc_performance_score)
   }
   bq_upsert(imtp_new, "vald_fd_imtp", key="test_ID", mode="MERGE",
             partition_field="date", cluster_fields=c("team","vald_id"))
