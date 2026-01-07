@@ -290,7 +290,6 @@ api_rate_limiter$current_calls_per_second <- 10  # Start at optimal
 api_rate_limiter$max_calls_per_second <- 10
 api_rate_limiter$min_calls_per_second <- 2
 api_rate_limiter$last_ramp_time <- Sys.time()
-api_rate_limiter$in_cooldown <- FALSE
 
 # Calculate seconds per call based on current rate
 get_seconds_per_call <- function() {
@@ -311,7 +310,6 @@ handle_rate_limit_error <- function() {
   # Reset to minimum rate
   api_rate_limiter$current_calls_per_second <- api_rate_limiter$min_calls_per_second
   api_rate_limiter$last_ramp_time <- Sys.time()
-  api_rate_limiter$in_cooldown <- FALSE
   
   create_log_entry(paste(
     "Cooldown complete - restarting at", api_rate_limiter$min_calls_per_second, "calls/sec"
@@ -445,7 +443,8 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   result <- NULL
   
   # Wrap the fetch function to monitor pagination and apply rate limiting
-  monitored_fetch <- function(...) {
+  # Includes retry logic for rate limit errors
+  monitored_fetch <- function(retry_count = 0, max_retries = 3, ...) {
     start_time <- Sys.time()
     
     tryCatch({
@@ -463,17 +462,28 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       return(result)
     }, error = function(e) {
       # Check if error message indicates rate limiting
-      if (grepl("rate.?limit|429|too.?many.?requests", e$message, ignore.case = TRUE)) {
+      # Pattern matches: "rate limit", "rate-limit", "ratelimit", HTTP 429, "too many requests"
+      if (grepl("rate[\\s\\-]?limit|429|too[\\s\\-]?many[\\s\\-]?requests", e$message, ignore.case = TRUE)) {
         create_log_entry(paste(
           "Rate limit error detected in", description, ":", e$message
         ), "ERROR")
+        
+        # Check if we've exceeded max retries
+        if (retry_count >= max_retries) {
+          create_log_entry(paste(
+            "Maximum retry attempts (", max_retries, ") reached for", description
+          ), "ERROR")
+          stop(e)
+        }
         
         # Trigger rate limit handler
         handle_rate_limit_error()
         
         # Retry the call after cooldown and rate adjustment
-        create_log_entry(paste("Retrying", description, "after rate limit cooldown"), "INFO")
-        return(fetch_function(...))
+        create_log_entry(paste(
+          "Retrying", description, "after rate limit cooldown (attempt", retry_count + 1, "of", max_retries, ")"
+        ), "INFO")
+        return(monitored_fetch(retry_count = retry_count + 1, max_retries = max_retries, ...))
       }
       
       # Check if error message indicates pagination issues or timeout
