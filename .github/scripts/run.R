@@ -165,6 +165,35 @@ apply_final_and_clean <- function(df) {
 # Global variable to store access token for REST API calls
 GLOBAL_ACCESS_TOKEN <- NULL
 
+# ---------- Logging ----------
+# NOTE: Logging functions must be defined early as they are used throughout the script,
+# including in the rate limiting setup below
+log_entries <- tibble(
+  timestamp = as.POSIXct(character(0)), level = character(0), message = character(0),
+  run_id = character(0), repository = character(0)
+)
+create_log_entry <- function(message, level="INFO") {
+  ts <- Sys.time()
+  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
+  log_entries <<- bind_rows(log_entries, tibble(
+    timestamp = ts, level = level, message = message,
+    run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
+  ))
+}
+upload_logs_to_bigquery <- function() {
+  if (nrow(log_entries)==0) return(invisible(TRUE))
+  tryCatch({
+    log_tbl <- bq_table(ds, "vald_processing_log")
+    if (!bq_table_exists(log_tbl)) {
+      bq_table_create(log_tbl, fields = as_bq_fields(log_entries), expiration_time = NULL)
+      create_log_entry("Created vald_processing_log table with no expiration")
+    }
+    bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
+    TRUE
+  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
+}
+
 # ---------- Schema Mismatch Tracking ----------
 schema_mismatches <- tibble(
   table_name = character(0),
@@ -796,33 +825,6 @@ ds <- bq_dataset(project, dataset)
 if (!bq_dataset_exists(ds)) {
   bq_dataset_create(ds, location = location, default_table_expiration_ms = NULL)
   cat("Created BigQuery dataset:", dataset, "in", location, "with no table expiration\n")
-}
-
-# ---------- Logging ----------
-log_entries <- tibble(
-  timestamp = as.POSIXct(character(0)), level = character(0), message = character(0),
-  run_id = character(0), repository = character(0)
-)
-create_log_entry <- function(message, level="INFO") {
-  ts <- Sys.time()
-  cat(sprintf("[%s] [%s] %s\n", format(ts, "%Y-%m-%d %H:%M:%S", tz="UTC"), level, message))
-  log_entries <<- bind_rows(log_entries, tibble(
-    timestamp = ts, level = level, message = message,
-    run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
-    repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
-  ))
-}
-upload_logs_to_bigquery <- function() {
-  if (nrow(log_entries)==0) return(invisible(TRUE))
-  tryCatch({
-    log_tbl <- bq_table(ds, "vald_processing_log")
-    if (!bq_table_exists(log_tbl)) {
-      bq_table_create(log_tbl, fields = as_bq_fields(log_entries), expiration_time = NULL)
-      create_log_entry("Created vald_processing_log table with no expiration")
-    }
-    bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
-    TRUE
-  }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
 }
 
 script_start_time <- Sys.time()
