@@ -150,7 +150,8 @@ Best approach: Combine batching and parallelization:
 ```r
 get_forcedecks_data_hybrid <- function(start_date = NULL, 
                                         batch_size = 100, 
-                                        n_workers = 4) {
+                                        n_workers = 4,
+                                        rate_limit_delay = 0.25) {
   # Get list of all tests
   tests <- fetch_all_tests(start_date)
   test_ids <- tests$testId
@@ -166,11 +167,15 @@ get_forcedecks_data_hybrid <- function(start_date = NULL,
   on.exit(future::plan(old_plan), add = TRUE)
   future::plan(multisession, workers = n_workers)
   
-  # Fetch batches in parallel
+  # Fetch batches in parallel with rate limiting
   all_trials <- furrr::future_map(
     batches,
     function(batch_ids) {
       tryCatch({
+        # Rate limiting: Add delay to avoid overwhelming API
+        # Each worker will delay independently
+        Sys.sleep(rate_limit_delay)
+        
         # If batch API exists, use it
         if (exists("fetch_trials_batch")) {
           fetch_trials_batch(batch_ids)
@@ -196,7 +201,12 @@ get_forcedecks_data_hybrid <- function(start_date = NULL,
 }
 ```
 
-**Performance**: 50 batches / 4 workers = 12.5 API calls per worker at ~1 sec each = 13 seconds (400x faster!)
+**Performance**: 50 batches / 4 workers = 12.5 API calls per worker at ~1 sec each + 0.25s rate limit delay = ~16 seconds (350x faster!)
+
+**Rate Limiting Note**: The `rate_limit_delay` parameter (default 0.25 seconds) adds a small delay between requests to avoid hitting API rate limits. With 4 workers making parallel requests, this ensures we don't overwhelm the VALD API. Adjust this value based on your API's rate limits:
+- If you get rate limit errors (HTTP 429), increase the delay (e.g., 0.5 or 1.0 seconds)
+- If the API has no rate limits, you can reduce or remove the delay (set to 0)
+- For unknown rate limits, start conservative (0.5s) and decrease if needed
 
 ## Solution 4: Smart Incremental Sync
 
@@ -313,7 +323,11 @@ gh run watch
 
 ## Common Pitfalls
 
-1. **Rate Limiting**: VALD API might have rate limits. Add `Sys.sleep()` between batches if needed.
+1. **Rate Limiting**: VALD API might have rate limits, especially when using parallel processing. 
+   - **For Hybrid Approach**: With 4 workers making parallel requests, you could hit rate limits. Always include a `rate_limit_delay` (e.g., 0.25-0.5 seconds) between requests.
+   - **For Batch Approach**: Add `Sys.sleep(0.5)` between batches to be safe.
+   - **Symptoms**: HTTP 429 errors, "Too Many Requests" messages, or temporary connection failures.
+   - **Solution**: Increase the delay between requests, reduce the number of workers, or implement exponential backoff retry logic.
 
 2. **Memory Issues**: Large batches might cause memory problems. Start with smaller batch sizes (50-100).
 
