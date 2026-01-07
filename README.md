@@ -31,7 +31,7 @@ The system helps athletic trainers and coaches:
 
 ## Technology Stack
 
-- **Language**: R (primary), Python (scikit-learn integration)
+- **Language**: R (primary), Python (via reticulate for sklearn integration)
 - **Cloud Platform**: Google Cloud Platform (BigQuery)
 - **CI/CD**: GitHub Actions workflows
 - **Key R Libraries**:
@@ -73,7 +73,7 @@ The main orchestration pipeline that runs on-demand or scheduled intervals:
 
 ### Input Files
 - **Clean_Activities_GPS.xlsx**: GPS workload metrics (distance, velocity, acceleration)
-- **Sac State Roster - Summer 2025.xlsx**: Athlete roster with name mapping
+- **Sac State Roster - [Season].xlsx**: Athlete roster with name mapping (season-specific)
 - **vald_roster.csv**: VALD system athlete identifiers
 
 ### BigQuery Tables
@@ -86,7 +86,7 @@ The main orchestration pipeline that runs on-demand or scheduled intervals:
 ## How It Works
 
 1. **Data Collection**: Athletes complete force plate testing (CMJ) and wear GPS units during training
-2. **Ingestion**: Automated workflows upload data to BigQuery every 15 minutes (when enabled)
+2. **Ingestion**: Automated workflows upload data to BigQuery (on-demand via workflow_dispatch or scheduled when enabled)
 3. **Data Matching**: System joins workload and readiness data by athlete and date using roster mapping
 4. **Model Training**: Individual models learn the relationship between prior workload and subsequent readiness metrics
 5. **Prediction**: Models predict expected readiness for upcoming sessions
