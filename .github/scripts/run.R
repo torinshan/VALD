@@ -199,6 +199,97 @@ upload_schema_mismatches <- function() {
   })
 }
 
+# ---------- VALD API Checkpointing ----------
+# Global checkpoint directory
+CHECKPOINT_DIR <- "/tmp/vald_checkpoints"
+
+# Initialize checkpoint directory
+init_checkpoint_dir <- function() {
+  if (!dir.exists(CHECKPOINT_DIR)) {
+    dir.create(CHECKPOINT_DIR, recursive = TRUE)
+    create_log_entry(paste("Created checkpoint directory:", CHECKPOINT_DIR))
+  }
+}
+
+# Save checkpoint for resumable API fetches
+save_checkpoint <- function(description, data) {
+  init_checkpoint_dir()
+  checkpoint_file <- file.path(CHECKPOINT_DIR, paste0(gsub("[^a-zA-Z0-9]", "_", description), ".rds"))
+  tryCatch({
+    saveRDS(data, checkpoint_file)
+    create_log_entry(paste("Saved checkpoint for", description, "- Items:", length(data$processed_items)))
+    return(TRUE)
+  }, error = function(e) {
+    create_log_entry(paste("Failed to save checkpoint for", description, ":", e$message), "WARN")
+    return(FALSE)
+  })
+}
+
+# Load checkpoint if it exists
+load_checkpoint <- function(description) {
+  checkpoint_file <- file.path(CHECKPOINT_DIR, paste0(gsub("[^a-zA-Z0-9]", "_", description), ".rds"))
+  if (file.exists(checkpoint_file)) {
+    tryCatch({
+      data <- readRDS(checkpoint_file)
+      create_log_entry(paste("Loaded checkpoint for", description, "- Resuming from", length(data$processed_items), "items"))
+      return(data)
+    }, error = function(e) {
+      create_log_entry(paste("Failed to load checkpoint for", description, ":", e$message), "WARN")
+      return(NULL)
+    })
+  }
+  return(NULL)
+}
+
+# Clean up checkpoint after successful completion
+remove_checkpoint <- function(description) {
+  checkpoint_file <- file.path(CHECKPOINT_DIR, paste0(gsub("[^a-zA-Z0-9]", "_", description), ".rds"))
+  if (file.exists(checkpoint_file)) {
+    tryCatch({
+      file.remove(checkpoint_file)
+      create_log_entry(paste("Removed checkpoint for", description))
+      return(TRUE)
+    }, error = function(e) {
+      create_log_entry(paste("Failed to remove checkpoint for", description, ":", e$message), "WARN")
+      return(FALSE)
+    })
+  }
+  return(TRUE)
+}
+
+# ---------- VALD API Rate Limiting ----------
+# Track last API call time and enforce rate limiting (10 calls per second)
+api_rate_limiter <- list(
+  last_call_time = Sys.time(),
+  calls_this_second = 0,
+  max_calls_per_second = 10
+)
+
+# Rate limit API calls to avoid hitting API limits
+rate_limit_api_call <- function() {
+  current_time <- Sys.time()
+  time_since_last <- as.numeric(difftime(current_time, api_rate_limiter$last_call_time, units = "secs"))
+  
+  # Reset counter if we've moved to a new second
+  if (time_since_last >= 1.0) {
+    api_rate_limiter$calls_this_second <<- 0
+    api_rate_limiter$last_call_time <<- current_time
+  }
+  
+  # If we've hit the limit for this second, wait until the next second
+  if (api_rate_limiter$calls_this_second >= api_rate_limiter$max_calls_per_second) {
+    wait_time <- 1.0 - time_since_last
+    if (wait_time > 0) {
+      Sys.sleep(wait_time)
+      api_rate_limiter$calls_this_second <<- 0
+      api_rate_limiter$last_call_time <<- Sys.time()
+    }
+  }
+  
+  # Increment call counter
+  api_rate_limiter$calls_this_second <<- api_rate_limiter$calls_this_second + 1
+}
+
 # ---------- VALD API Pagination Safety ----------
 # Track pagination state to detect stuck loops
 pagination_state <- list()
@@ -246,10 +337,21 @@ detect_stuck_pagination <- function(description, current_cursor = NULL, max_same
   return(FALSE)
 }
 
-# Wrapper for VALD API calls with timeout and pagination protection
+# Wrapper for VALD API calls with timeout, pagination protection, checkpointing, and rate limiting
 safe_vald_fetch <- function(fetch_function, description = "VALD API", 
-                           timeout_seconds = 600, max_same_cursor = 3, ...) {
+                           timeout_seconds = 600, max_same_cursor = 3, 
+                           enable_checkpointing = TRUE, checkpoint_interval = 100, ...) {
   create_log_entry(paste("Starting", description, "fetch with", timeout_seconds, "second timeout"))
+  
+  # Check for existing checkpoint
+  checkpoint <- NULL
+  if (enable_checkpointing) {
+    checkpoint <- load_checkpoint(description)
+    if (!is.null(checkpoint)) {
+      create_log_entry(paste("Resuming", description, "from checkpoint with", 
+                             length(checkpoint$processed_items), "items already fetched"))
+    }
+  }
   
   # Reset pagination state for this fetch
   if (exists(description, envir = as.environment(pagination_state))) {
@@ -260,12 +362,16 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   timed_out <- FALSE
   circuit_breaker_tripped <- FALSE
   
-  # Wrap the fetch function to monitor pagination
+  # Wrap the fetch function to monitor pagination and apply rate limiting
   monitored_fetch <- function(...) {
     start_time <- Sys.time()
     last_log_time <- start_time
+    items_processed <- 0
     
     tryCatch({
+      # Apply rate limiting before the API call
+      rate_limit_api_call()
+      
       result <- fetch_function(...)
       
       # Check if we spent too long (potential stuck pagination)
@@ -279,11 +385,17 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       
       return(result)
     }, error = function(e) {
-      # Check if error message indicates pagination issues
+      # Check if error message indicates pagination issues or timeout
       if (grepl("pagination|cursor|timeout", e$message, ignore.case = TRUE)) {
         create_log_entry(paste(
-          "Pagination error detected in", description, ":", e$message
+          "Pagination/timeout error detected in", description, ":", e$message
         ), "ERROR")
+        
+        # If we have a checkpoint and enable_checkpointing, save what we have so far
+        if (enable_checkpointing && !is.null(checkpoint)) {
+          create_log_entry(paste("Attempting to save progress before error for", description), "WARN")
+          save_checkpoint(description, checkpoint)
+        }
       }
       stop(e)
     })
@@ -296,7 +408,17 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   }, TimeoutException = function(e) {
     timed_out <<- TRUE
     create_log_entry(paste(description, "fetch TIMEOUT after", timeout_seconds, "seconds"), "ERROR")
-    create_log_entry("This indicates a VALD API pagination bug or network issue", "ERROR")
+    
+    # If we have partial results via checkpoint, use them
+    if (enable_checkpointing && !is.null(checkpoint)) {
+      create_log_entry(paste(
+        "Timeout occurred but checkpoint exists with",
+        length(checkpoint$processed_items), "items - using partial results"
+      ), "WARN")
+      result <<- checkpoint$result
+    } else {
+      create_log_entry("No checkpoint available - this is a complete failure", "ERROR")
+    }
     
     # Log pagination state if available
     if (exists(description, envir = as.environment(pagination_state))) {
@@ -311,11 +433,21 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   }, error = function(e) {
     if (!timed_out) {
       create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
+      
+      # If we have partial results via checkpoint, try to use them
+      if (enable_checkpointing && !is.null(checkpoint)) {
+        create_log_entry(paste(
+          "Error occurred but checkpoint exists with",
+          length(checkpoint$processed_items), "items - attempting to use partial results"
+        ), "WARN")
+        result <<- checkpoint$result
+      }
     }
   })
   
-  if (timed_out || is.null(result)) {
-    create_log_entry("=== VALD API FETCH FAILED ===", "ERROR")
+  # If we still have no result after checkpoint recovery attempts, fail
+  if (is.null(result)) {
+    create_log_entry("=== VALD API FETCH FAILED - No results available ===", "ERROR")
     upload_logs_to_bigquery()
     upload_schema_mismatches()
     quit(status = 1)
@@ -328,6 +460,11 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       description, "completed successfully -",
       "Total pages:", state$total_pages
     ))
+  }
+  
+  # Clean up checkpoint on successful completion
+  if (enable_checkpointing) {
+    remove_checkpoint(description)
   }
   
   result
@@ -834,6 +971,9 @@ count_tests_current <- nrow(tests_tbl)
 latest_nord_date_current <- if (nrow(nordbord_tbl)>0) max(nordbord_tbl$date, na.rm=TRUE) else as.Date("1900-01-01")
 count_nord_tests_current <- nrow(nordbord_tbl)
 
+# Backstop date for when BigQuery data is missing or no tests found
+BACKSTOP_START_DATE <- as.Date("2024-01-01")
+
 create_log_entry(paste("Current ForceDecks state - Latest date:", latest_date_current, "Test count:", count_tests_current))
 create_log_entry(paste("Current Nordbord state - Latest date:", latest_nord_date_current, "Test count:", count_nord_tests_current))
 
@@ -897,6 +1037,7 @@ all_tests_probe <- safe_vald_fetch(
   description = "ForceDecks tests probe",
   timeout_seconds = 600,
   max_same_cursor = 3,
+  enable_checkpointing = FALSE,  # No checkpoint needed for quick probe
   start_date = NULL
 )
 
@@ -931,7 +1072,8 @@ nordbord_probe <- safe_vald_fetch(
   },
   description = "Nordbord tests probe",
   timeout_seconds = 300,
-  max_same_cursor = 3
+  max_same_cursor = 3,
+  enable_checkpointing = FALSE  # No checkpoint needed for quick probe
 )
 
 if (nrow(nordbord_probe) > 0) {
@@ -1047,19 +1189,35 @@ if (nrow(Vald_roster_backfill) > 0) {
 }
 
 # ---------- Overlap start date (earliest date across both sources - 1 day), then fetch ----------
+# Apply backstop date when BigQuery data is missing or no tests found
 overlap_days <- 1L
-start_dt <- min(latest_date_current, latest_nord_date_current) - lubridate::days(overlap_days)
+calculated_start_dt <- min(latest_date_current, latest_nord_date_current) - lubridate::days(overlap_days)
+
+# If calculated start date is before 2000 (indicating missing data), use backstop date
+if (calculated_start_dt < as.Date("2000-01-01") || count_tests_current == 0) {
+  start_dt <- BACKSTOP_START_DATE
+  create_log_entry(paste(
+    "No existing data found in BigQuery (calculated start:", calculated_start_dt, 
+    ") - using backstop date:", start_dt
+  ), "INFO")
+} else {
+  start_dt <- calculated_start_dt
+  create_log_entry(paste("Using calculated overlap start:", start_dt))
+}
+
 set_start_date(sprintf("%sT00:00:00Z", start_dt))
-create_log_entry(paste("Running with overlap start:", start_dt, "T00:00:00Z"))
+create_log_entry(paste("Running with start date:", start_dt, "T00:00:00Z"))
 
 create_log_entry("Fetching ForceDecks data from VALD API...")
 
-# Use safe fetch with timeout protection and circuit breaker
+# Use safe fetch with timeout protection, checkpointing, and rate limiting
 injest_fd <- safe_vald_fetch(
   fetch_function = get_forcedecks_data,
   description = "ForceDecks full data",
   timeout_seconds = 900,
-  max_same_cursor = 3
+  max_same_cursor = 3,
+  enable_checkpointing = TRUE,
+  checkpoint_interval = 100
 )
 
 profiles <- as.data.table(injest_fd$profiles)
@@ -1504,12 +1662,14 @@ if ("IMTP" %in% new_test_types) {
 # Nordbord: MERGE
 create_log_entry("Fetching Nordbord data from VALD API...")
 
-# Use safe fetch with timeout protection and circuit breaker
+# Use safe fetch with timeout protection, checkpointing, and rate limiting
 injest_nord <- safe_vald_fetch(
   fetch_function = get_nordbord_data,
   description = "Nordbord data",
   timeout_seconds = 300,
-  max_same_cursor = 3
+  max_same_cursor = 3,
+  enable_checkpointing = TRUE,
+  checkpoint_interval = 100
 )
 
 nord_tests <- injest_nord$tests
