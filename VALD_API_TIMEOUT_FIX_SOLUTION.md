@@ -251,9 +251,16 @@ After investigation, the `valdr` package is an **external dependency** installed
 ### Phase 1: IMMEDIATE ACTION REQUIRED
 
 **Contact valdr Package Maintainers:**
-1. Report the pagination performance issue to valdr maintainers
-2. Provide them with this analysis and logs
-3. Request implementation of batch/parallel fetching for `get_forcedecks_data()`
+1. Locate the valdr package repository:
+   ```r
+   # In R, check package description
+   packageDescription("valdr")
+   # Look for URL or BugReports fields
+   ```
+   Typically found on CRAN (https://cran.r-project.org/package=valdr) or GitHub
+2. Report the pagination performance issue to valdr maintainers
+3. Provide them with this analysis and logs
+4. Request implementation of batch/parallel fetching for `get_forcedecks_data()`
 
 **Alternative: Fork and Fix valdr:**
 1. Fork the valdr package repository

@@ -20,8 +20,8 @@
 
 1. **Fork the valdr package**:
    ```bash
-   # Find the valdr source repository
-   # Fork it to your GitHub account (e.g., torinshan/valdr)
+   # Find the valdr source repository (check CRAN or GitHub)
+   # Fork it to your GitHub account (e.g., your-username/valdr)
    ```
 
 2. **Implement the fix** in your fork:
@@ -31,7 +31,7 @@
 
 3. **Update this repository** to use your fork:
    - Edit `.github/workflows/run-every-15m.yml`
-   - Change `valdr` to `torinshan/valdr` in the dependencies
+   - Change `valdr` to `your-username/valdr` in the dependencies (e.g., `torinshan/valdr`)
 
 ### Option C: Switch to Alternative API Client (If Available)
 

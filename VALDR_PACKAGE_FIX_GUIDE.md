@@ -141,7 +141,7 @@ get_forcedecks_data_parallel <- function(start_date = NULL, n_workers = 4) {
 }
 ```
 
-**Performance**: 5,000 tests / 4 workers = 1,250 seconds (25 minutes) - still might timeout!
+**Performance**: With 4 workers processing in parallel, approximately 1,250 test fetches per worker at ~1 sec each = ~1,250 seconds (21 minutes total) - still might timeout!
 
 ## Solution 3: Hybrid - Batch + Parallel
 
@@ -176,8 +176,8 @@ get_forcedecks_data_hybrid <- function(start_date = NULL,
           fetch_trials_batch(batch_ids)
         } else {
           # Otherwise, fetch sequentially within this batch
-          lapply(batch_ids, fetch_trials_for_test) %>% 
-            do.call(rbind, .)
+          batch_trials <- lapply(batch_ids, fetch_trials_for_test)
+          do.call(rbind, batch_trials)
         }
       }, error = function(e) {
         warning(sprintf("Batch failed: %s", e$message))
