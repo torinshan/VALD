@@ -1134,7 +1134,7 @@ use_ml_credentials()
 
 tryCatch({
   ds <- bq_dataset(project, dataset)
-  if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
+  if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location, default_table_expiration_ms = NULL)
   
   # Registry Models
   # Stores metadata for each model (one row per model_id)

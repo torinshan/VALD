@@ -59,7 +59,7 @@ upload_logs_to_bigquery <- function() {
   
   tryCatch({
     ds <- bq_dataset(project, dataset)
-    if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location)
+    if (!bq_dataset_exists(ds)) bq_dataset_create(ds, location = location, default_table_expiration_ms = NULL)
     log_tbl <- bq_table(ds, "workload_ingest_log")
     if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
@@ -91,7 +91,7 @@ tryCatch({
     credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
   ))
   ds <- bq_dataset(project, dataset)
-  if (!bq_dataset_exists(ds)) { bq_dataset_create(ds, location = location); create_log_entry(glue("Created dataset {dataset}")) }
+  if (!bq_dataset_exists(ds)) { bq_dataset_create(ds, location = location, default_table_expiration_ms = NULL); create_log_entry(glue("Created dataset {dataset}")) }
 }, error = function(e) {
   create_log_entry(paste("BigQuery auth failed:", e$message), "ERROR")
   upload_logs_to_bigquery(); quit(status=1)
