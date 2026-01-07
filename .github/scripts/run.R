@@ -428,6 +428,46 @@ rate_limit_api_call <- function() {
   api_rate_limiter$last_call_time <- Sys.time()
 }
 
+# ---------- Global HTTP Wrapper for Rate Limiting ----------
+# Wrap httr functions to apply rate limiting to ALL HTTP calls,
+# including those made internally by valdr package
+# Only apply rate limiting to VALD API calls (not BigQuery or other services)
+
+# Store original functions
+original_httr_GET <- httr::GET
+original_httr_POST <- httr::POST
+
+# Helper to check if URL is a VALD API call
+is_vald_api_url <- function(url) {
+  if (is.null(url) || !is.character(url)) return(FALSE)
+  # Match VALD API endpoints
+  grepl("hub\\.vald(performance)?\\.com|vald.*\\.com/api|api.*vald", url, ignore.case = TRUE)
+}
+
+# Create wrapped versions that apply rate limiting only to VALD API calls
+httr_GET_wrapped <- function(url = NULL, ...) {
+  # Only rate limit if this is a VALD API call
+  if (is_vald_api_url(url)) {
+    rate_limit_api_call()
+  }
+  original_httr_GET(url = url, ...)
+}
+
+httr_POST_wrapped <- function(url = NULL, ...) {
+  # Only rate limit if this is a VALD API call  
+  if (is_vald_api_url(url)) {
+    rate_limit_api_call()
+  }
+  original_httr_POST(url = url, ...)
+}
+
+# Override httr functions in the global environment
+# This ensures ALL VALD API HTTP calls (including from valdr) are rate-limited
+assignInNamespace("GET", httr_GET_wrapped, ns = "httr")
+assignInNamespace("POST", httr_POST_wrapped, ns = "httr")
+
+create_log_entry("Global HTTP rate limiting installed - all VALD API calls will be rate-limited at 10 calls/sec")
+
 # ---------- VALD API Pagination Safety ----------
 # Track pagination state to detect stuck loops
 pagination_state <- list()
