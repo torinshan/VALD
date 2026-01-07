@@ -188,7 +188,8 @@ upload_schema_mismatches <- function() {
   tryCatch({
     mismatch_tbl <- bq_table(ds, "vald_schema_mismatches")
     if (!bq_table_exists(mismatch_tbl)) {
-      bq_table_create(mismatch_tbl, fields = as_bq_fields(schema_mismatches))
+      bq_table_create(mismatch_tbl, fields = as_bq_fields(schema_mismatches), expiration_time = NULL)
+      create_log_entry("Created vald_schema_mismatches table with no expiration")
     }
     bq_table_upload(mismatch_tbl, schema_mismatches, write_disposition = "WRITE_APPEND")
     create_log_entry(paste("Logged", nrow(schema_mismatches), "schema mismatches"))
@@ -815,7 +816,10 @@ upload_logs_to_bigquery <- function() {
   if (nrow(log_entries)==0) return(invisible(TRUE))
   tryCatch({
     log_tbl <- bq_table(ds, "vald_processing_log")
-    if (!bq_table_exists(log_tbl)) bq_table_create(log_tbl, fields = as_bq_fields(log_entries))
+    if (!bq_table_exists(log_tbl)) {
+      bq_table_create(log_tbl, fields = as_bq_fields(log_entries), expiration_time = NULL)
+      create_log_entry("Created vald_processing_log table with no expiration")
+    }
     bq_table_upload(log_tbl, log_entries, write_disposition = "WRITE_APPEND")
     TRUE
   }, error=function(e){ cat("Log upload failed:", e$message, "\n"); FALSE })
@@ -926,16 +930,18 @@ ensure_table <- function(tbl, data, partition_field="date", cluster_fields=chara
   if (length(cl) == 0) cl <- NULL
 
   # NOTE: some bigrquery versions expect `clustering_fields` (not `clustering`).
+  # IMPORTANT: Set expiration_time to NULL to ensure tables persist indefinitely
   bq_table_create(
     tbl,
     fields = as_bq_fields(data),
     time_partitioning = tp,
-    clustering_fields = cl
+    clustering_fields = cl,
+    expiration_time = NULL  # Explicitly set no expiration
   )
 
   partition_info <- ifelse(is.null(partition_field), "none", partition_field)
   cluster_info <- if (is.null(cl)) "none" else paste(cl, collapse = ",")
-  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info))
+  create_log_entry(paste("Created table", tbl$table, "- partition:", partition_info, "cluster:", cluster_info, "expiration: none"))
   invisible(TRUE)
 }
 
