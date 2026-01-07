@@ -225,7 +225,13 @@ save_checkpoint <- function(description, data) {
   checkpoint_file <- file.path(CHECKPOINT_DIR, paste0(gsub("[^a-zA-Z0-9]", "_", description), ".rds"))
   tryCatch({
     saveRDS(data, checkpoint_file)
-    create_log_entry(paste("Saved checkpoint for", description, "- Items:", length(data$processed_items)))
+    # Safely get count of processed items
+    item_count <- if (is.list(data) && !is.null(data$processed_items)) {
+      length(data$processed_items)
+    } else {
+      "unknown"
+    }
+    create_log_entry(paste("Saved checkpoint for", description, "- Items:", item_count))
     return(TRUE)
   }, error = function(e) {
     create_log_entry(paste("Failed to save checkpoint for", description, ":", e$message), "WARN")
@@ -239,7 +245,13 @@ load_checkpoint <- function(description) {
   if (file.exists(checkpoint_file)) {
     tryCatch({
       data <- readRDS(checkpoint_file)
-      create_log_entry(paste("Loaded checkpoint for", description, "- Resuming from", length(data$processed_items), "items"))
+      # Safely get count of processed items
+      item_count <- if (is.list(data) && !is.null(data$processed_items)) {
+        length(data$processed_items)
+      } else {
+        "unknown"
+      }
+      create_log_entry(paste("Loaded checkpoint for", description, "- Resuming from", item_count, "items"))
       return(data)
     }, error = function(e) {
       create_log_entry(paste("Failed to load checkpoint for", description, ":", e$message), "WARN")
@@ -267,11 +279,11 @@ remove_checkpoint <- function(description) {
 
 # ---------- VALD API Rate Limiting ----------
 # Track last API call time and enforce rate limiting (10 calls per second)
-api_rate_limiter <- list(
-  last_call_time = Sys.time(),
-  calls_this_second = 0,
-  max_calls_per_second = 10
-)
+# Using an environment to encapsulate state and avoid global mutable list issues
+api_rate_limiter <- new.env(parent = emptyenv())
+api_rate_limiter$last_call_time <- Sys.time()
+api_rate_limiter$calls_this_second <- 0
+api_rate_limiter$max_calls_per_second <- 10
 
 # Rate limit API calls to avoid hitting API limits
 rate_limit_api_call <- function() {
@@ -280,8 +292,9 @@ rate_limit_api_call <- function() {
   
   # Reset counter if we've moved to a new second
   if (time_since_last >= 1.0) {
-    api_rate_limiter$calls_this_second <<- 0
-    api_rate_limiter$last_call_time <<- current_time
+    api_rate_limiter$calls_this_second <- 0
+    api_rate_limiter$last_call_time <- current_time
+    time_since_last <- 0  # Reset since we're in a new second
   }
   
   # If we've hit the limit for this second, wait until the next second
@@ -289,13 +302,14 @@ rate_limit_api_call <- function() {
     wait_time <- 1.0 - time_since_last
     if (wait_time > 0) {
       Sys.sleep(wait_time)
-      api_rate_limiter$calls_this_second <<- 0
-      api_rate_limiter$last_call_time <<- Sys.time()
+      # After sleeping, we're definitely in a new second
+      api_rate_limiter$calls_this_second <- 0
+      api_rate_limiter$last_call_time <- Sys.time()
     }
   }
   
   # Increment call counter
-  api_rate_limiter$calls_this_second <<- api_rate_limiter$calls_this_second + 1
+  api_rate_limiter$calls_this_second <- api_rate_limiter$calls_this_second + 1
 }
 
 # ---------- VALD API Pagination Safety ----------
@@ -356,8 +370,14 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
   if (enable_checkpointing) {
     checkpoint <- load_checkpoint(description)
     if (!is.null(checkpoint)) {
+      # Safely get count of processed items
+      item_count <- if (is.list(checkpoint) && !is.null(checkpoint$processed_items)) {
+        length(checkpoint$processed_items)
+      } else {
+        "unknown"
+      }
       create_log_entry(paste("Resuming", description, "from checkpoint with", 
-                             length(checkpoint$processed_items), "items already fetched"))
+                             item_count, "items already fetched"))
     }
   }
   
@@ -418,12 +438,25 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
     create_log_entry(paste(description, "fetch TIMEOUT after", timeout_seconds, "seconds"), "ERROR")
     
     # If we have partial results via checkpoint, use them
-    if (enable_checkpointing && !is.null(checkpoint)) {
-      create_log_entry(paste(
-        "Timeout occurred but checkpoint exists with",
-        length(checkpoint$processed_items), "items - using partial results"
-      ), "WARN")
-      result <<- checkpoint$result
+    if (enable_checkpointing && !is.null(checkpoint) && is.list(checkpoint)) {
+      # Safely get count of processed items and result
+      item_count <- if (!is.null(checkpoint$processed_items)) {
+        length(checkpoint$processed_items)
+      } else {
+        "unknown"
+      }
+      
+      if (!is.null(checkpoint$result)) {
+        create_log_entry(paste(
+          "Timeout occurred but checkpoint exists with",
+          item_count, "items - using partial results"
+        ), "WARN")
+        result <<- checkpoint$result
+      } else {
+        create_log_entry(paste(
+          "Timeout occurred with checkpoint but no result field - complete failure"
+        ), "ERROR")
+      }
     } else {
       create_log_entry("No checkpoint available - this is a complete failure", "ERROR")
     }
@@ -443,12 +476,21 @@ safe_vald_fetch <- function(fetch_function, description = "VALD API",
       create_log_entry(paste(description, "fetch ERROR:", e$message), "ERROR")
       
       # If we have partial results via checkpoint, try to use them
-      if (enable_checkpointing && !is.null(checkpoint)) {
-        create_log_entry(paste(
-          "Error occurred but checkpoint exists with",
-          length(checkpoint$processed_items), "items - attempting to use partial results"
-        ), "WARN")
-        result <<- checkpoint$result
+      if (enable_checkpointing && !is.null(checkpoint) && is.list(checkpoint)) {
+        # Safely get count of processed items and result
+        item_count <- if (!is.null(checkpoint$processed_items)) {
+          length(checkpoint$processed_items)
+        } else {
+          "unknown"
+        }
+        
+        if (!is.null(checkpoint$result)) {
+          create_log_entry(paste(
+            "Error occurred but checkpoint exists with",
+            item_count, "items - attempting to use partial results"
+          ), "WARN")
+          result <<- checkpoint$result
+        }
       }
     }
   })
@@ -981,6 +1023,8 @@ count_nord_tests_current <- nrow(nordbord_tbl)
 
 # Backstop date for when BigQuery data is missing or no tests found
 BACKSTOP_START_DATE <- as.Date("2024-01-01")
+# Threshold date to detect missing data (dates before this indicate no real data)
+MISSING_DATA_THRESHOLD_DATE <- as.Date("2000-01-01")
 
 create_log_entry(paste("Current ForceDecks state - Latest date:", latest_date_current, "Test count:", count_tests_current))
 create_log_entry(paste("Current Nordbord state - Latest date:", latest_nord_date_current, "Test count:", count_nord_tests_current))
@@ -1201,8 +1245,8 @@ if (nrow(Vald_roster_backfill) > 0) {
 overlap_days <- 1L
 calculated_start_dt <- min(latest_date_current, latest_nord_date_current) - lubridate::days(overlap_days)
 
-# If calculated start date is before 2000 (indicating missing data), use backstop date
-if (calculated_start_dt < as.Date("2000-01-01") || count_tests_current == 0) {
+# If calculated start date is before threshold (indicating missing data), use backstop date
+if (calculated_start_dt < MISSING_DATA_THRESHOLD_DATE || count_tests_current == 0) {
   start_dt <- BACKSTOP_START_DATE
   create_log_entry(paste(
     "No existing data found in BigQuery (calculated start:", calculated_start_dt, 
