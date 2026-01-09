@@ -482,27 +482,39 @@ PARALLEL_CONFIG <- list(
 # ============================================================================
 # VALD API Credentials (Environment Variables)
 # ============================================================================
+cat("=== CONFIGURING VALD API ===\n")
 client_id     <- Sys.getenv("VALD_CLIENT_ID", "")
 client_secret <- Sys.getenv("VALD_CLIENT_SECRET", "")
 tenant_id     <- Sys.getenv("VALD_TENANT_ID", "")
 region        <- Sys.getenv("VALD_REGION", "use")
 
-# Validate credentials
+# Validate credentials are present
 if (nchar(client_id) == 0 || nchar(client_secret) == 0 || nchar(tenant_id) == 0) {
   cat("FATAL: Missing VALD API credentials in environment variables\n")
   cat("Required: VALD_CLIENT_ID, VALD_CLIENT_SECRET, VALD_TENANT_ID\n")
   quit(status = 1)
 }
 
+# Set credentials using valdr package
 tryCatch({
-  set_credentials(client_id, client_secret, tenant_id, region)
-  set_start_date(paste0(CONFIG$start_date, "T00:00:00Z"))
-  execution_status$credentials_valid <<- TRUE
+  valdr::set_credentials(client_id, client_secret, tenant_id, region)
   cat("VALD API credentials configured successfully\n")
 }, error = function(e) {
-  cat("FATAL: Failed to set VALD credentials:", e$message, "\n")
+  cat("FATAL: Failed to set VALD credentials:", conditionMessage(e), "\n")
   quit(status = 1)
 })
+
+# Set start date for API queries
+tryCatch({
+  valdr::set_start_date(paste0(CONFIG$start_date, "T00:00:00Z"))
+  cat("VALD API start date set to:", CONFIG$start_date, "\n")
+}, error = function(e) {
+  cat("FATAL: Failed to set start date:", conditionMessage(e), "\n")
+  quit(status = 1)
+})
+
+# Mark credentials as valid
+execution_status$credentials_valid <- TRUE
 
 # ============================================================================
 # Path Configuration (Environment-Aware)
