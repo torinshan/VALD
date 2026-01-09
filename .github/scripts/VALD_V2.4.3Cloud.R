@@ -548,30 +548,26 @@ if (!LOCAL_MODE) {
     options(bigrquery.use_bqstorage = FALSE)
     Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
     
-    # Get service account key from environment
-    sa_key_json <- Sys.getenv("GCP_SA_KEY", "")
+    # Use Workload Identity Federation (WIF) via gcloud
+    access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
+    GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
     
-    if (nchar(sa_key_json) == 0) {
-      stop("GCP_SA_KEY environment variable not set")
-    }
-    
-    # Write SA key to temp file
-    sa_key_path <- tempfile(fileext = ".json")
-    writeLines(sa_key_json, sa_key_path)
-    
-    # Authenticate with service account
-    bigrquery::bq_auth(path = sa_key_path)
-    cat("BigQuery authentication successful (service account)\n")
-    
-    # Clean up key file immediately
-    unlink(sa_key_path)
-    
-    # Verify authentication by checking dataset exists
-    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
-    if (!bigrquery::bq_dataset_exists(ds)) {
-      cat("WARNING: Dataset", CONFIG$bq_dataset, "does not exist - will create tables as needed\n")
+    if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
+      cat("Access token obtained from gcloud (WIF)\n")
+      token <- gargle::gargle2.0_token(
+        scope = 'https://www.googleapis.com/auth/bigquery',
+        client = gargle::gargle_client(),
+        credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+      )
+      bigrquery::bq_auth(token = token)
+      cat("BigQuery authentication successful\n")
+      
+      # Verify authentication by checking dataset exists
+      ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+      invisible(bigrquery::bq_dataset_exists(ds))
+      cat("Authentication test passed (dataset visible via REST)\n")
     } else {
-      cat("Dataset", CONFIG$bq_dataset, "accessible\n")
+      stop("Could not obtain access token from gcloud")
     }
     
     execution_status$bq_authenticated <<- TRUE
