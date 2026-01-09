@@ -136,7 +136,7 @@ jobs:
         if [ $UPDATE_EXIT_CODE -eq 0 ]; then
           echo "✅ Dataset properties updated"
         else
-          echo "ℹ️  Dataset update failed (non-fatal)"
+          echo "ℹ️  Dataset update failed (non-fatal): $UPDATE_OUTPUT"
         fi
         
         set -e  # Re-enable exit on error
