@@ -116,14 +116,22 @@ jobs:
       if: always()
       run: |
         # Create dataset if it doesn't exist (ignore "already exists" error)
-        if ! bq mk --dataset --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>&1 | grep -q "Already Exists"; then
-          echo "Dataset created or already exists"
+        set +e  # Don't exit on error
+        BQ_OUTPUT=$(bq mk --dataset --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>&1)
+        BQ_EXIT_CODE=$?
+        
+        if [ $BQ_EXIT_CODE -eq 0 ]; then
+          echo "✅ Dataset created successfully"
+        elif echo "$BQ_OUTPUT" | grep -qi "already exists"; then
+          echo "✅ Dataset already exists (this is OK)"
         else
-          echo "Dataset already exists (this is OK)"
+          echo "⚠️  Dataset creation failed (non-fatal): $BQ_OUTPUT"
         fi
-
-        # Update dataset properties (ignore errors if dataset doesn't exist yet)
-        bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset update not needed or failed (non-fatal)"
+        
+        # Update dataset properties (ignore errors)
+        bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>/dev/null && echo "✅ Dataset properties updated" || echo "ℹ️  Dataset update skipped (non-fatal)"
+        
+        set -e  # Re-enable exit on error
     - name: Check processing logs (tail)
       id: tail_logs
       if: always()
