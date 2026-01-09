@@ -153,24 +153,26 @@ jobs:
           cat /tmp/log_tail.txt >> "$GITHUB_OUTPUT"
           echo 'EOF' >> "$GITHUB_OUTPUT"
 
-      # Email only if the job failed
-      - name: Email on failure
-        if: failure() && steps.gate.outputs.ok == 'true'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "VALD Saturday Makeup FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
-          to: ${{ secrets.ALERT_EMAIL_TO }}
-          from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
-          content_type: text/html
-          body: |
-            <p><strong>Status:</strong> Saturday Makeup Failed</p>
-            <p><strong>Repo:</strong> ${{ github.repository }}<br/>
-               <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
-               <strong>Commit:</strong> ${{ github.sha }}<br/>
-               <strong>Actor:</strong> ${{ github.actor }}</p>
-            <p><strong>Makeup log (last 50 rows):</strong></p>
-            <pre>${{ steps.tail_logs.outputs.last }}</pre>
+      # Email notifications removed: No SMTP credentials configured in repository secrets
+      # To enable email notifications, add these secrets: SMTP_HOST, SMTP_PORT, SMTP_USERNAME, 
+      # SMTP_PASSWORD, ALERT_EMAIL_TO, ALERT_EMAIL_FROM and uncomment below
+      # - name: Email on failure
+      #   if: failure() && steps.gate.outputs.ok == 'true'
+      #   uses: dawidd6/action-send-mail@v3
+      #   with:
+      #     server_address: ${{ secrets.SMTP_HOST }}
+      #     server_port: ${{ secrets.SMTP_PORT }}
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     subject: "VALD Saturday Makeup FAILED — run #${{ github.run_number }} on ${{ github.ref_name }}"
+      #     to: ${{ secrets.ALERT_EMAIL_TO }}
+      #     from: VALD Bot <${{ secrets.ALERT_EMAIL_FROM }}>
+      #     content_type: text/html
+      #     body: |
+      #       <p><strong>Status:</strong> Saturday Makeup Failed</p>
+      #       <p><strong>Repo:</strong> ${{ github.repository }}<br/>
+      #          <strong>Run:</strong> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a><br/>
+      #          <strong>Commit:</strong> ${{ github.sha }}<br/>
+      #          <strong>Actor:</strong> ${{ github.actor }}</p>
+      #       <p><strong>Makeup log (last 50 rows):</strong></p>
+      #       <pre>${{ steps.tail_logs.outputs.last }}</pre>
