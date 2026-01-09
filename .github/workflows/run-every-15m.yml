@@ -77,7 +77,7 @@ jobs:
           data.table
           hms
           lubridate
-          httr
+          httr2
           jsonlite
           xml2
           curl
@@ -87,7 +87,11 @@ jobs:
           lifecycle
           glue
           slider
-          R.utils'
+          R.utils
+          logger
+          readxl
+          furrr
+          future'
         cache: true
     - name: System libs
       run: "sudo apt-get update\nsudo apt-get install -y \\\n  libcurl4-openssl-dev\
@@ -95,7 +99,7 @@ jobs:
         \ \\\n  libtiff5-dev libjpeg-dev zlib1g-dev \\\n  libharfbuzz-dev libfribidi-dev\
         \ \\\n  libsecret-1-dev libsecret-1-0\n"
     - name: Verify script exists
-      run: test -f .github/scripts/run.R
+      run: test -f .github/scripts/VALD_V2.4.3Cloud.R
     - name: Run R pipeline
       env:
         VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
@@ -105,7 +109,7 @@ jobs:
         KEYRING_BACKEND: env
       run: 'set -e
 
-        Rscript .github/scripts/run.R
+        Rscript .github/scripts/VALD_V2.4.3Cloud.R
 
         '
     - name: Ensure BigQuery dataset exists

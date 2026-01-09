@@ -541,45 +541,85 @@ if (!dir.exists(LOCAL_PATHS$log_dir)) dir.create(LOCAL_PATHS$log_dir, recursive 
 GLOBAL_ACCESS_TOKEN <- NULL
 
 if (!LOCAL_MODE) {
+  auth_success <- FALSE
+  
+  # Try Method 1: Workload Identity Federation (WIF) via gcloud
   tryCatch({
     cat("=== Authenticating to BigQuery ===\n")
+    cat("Attempting authentication via WIF (gcloud)...\n")
     
     # Disable Storage API to avoid permission issues
     options(bigrquery.use_bqstorage = FALSE)
     Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
     
-    # Get service account key from environment
-    sa_key_json <- Sys.getenv("GCP_SA_KEY", "")
+    # Use Workload Identity Federation (WIF) via gcloud
+    access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
+    GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
     
-    if (nchar(sa_key_json) == 0) {
-      stop("GCP_SA_KEY environment variable not set")
+    if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
+      cat("Access token obtained from gcloud (WIF)\n")
+      token <- gargle::gargle2.0_token(
+        scope = 'https://www.googleapis.com/auth/bigquery',
+        client = gargle::gargle_client(),
+        credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+      )
+      bigrquery::bq_auth(token = token)
+      cat("BigQuery authentication successful via WIF\n")
+      
+      # Verify authentication by checking dataset exists
+      ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+      invisible(bigrquery::bq_dataset_exists(ds))
+      cat("Authentication test passed (dataset visible via REST)\n")
+      
+      auth_success <- TRUE
     }
-    
-    # Write SA key to temp file
-    sa_key_path <- tempfile(fileext = ".json")
-    writeLines(sa_key_json, sa_key_path)
-    
-    # Authenticate with service account
-    bigrquery::bq_auth(path = sa_key_path)
-    cat("BigQuery authentication successful (service account)\n")
-    
-    # Clean up key file immediately
-    unlink(sa_key_path)
-    
-    # Verify authentication by checking dataset exists
-    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
-    if (!bigrquery::bq_dataset_exists(ds)) {
-      cat("WARNING: Dataset", CONFIG$bq_dataset, "does not exist - will create tables as needed\n")
-    } else {
-      cat("Dataset", CONFIG$bq_dataset, "accessible\n")
-    }
-    
-    execution_status$bq_authenticated <<- TRUE
-    
   }, error = function(e) {
-    cat("FATAL: BigQuery authentication failed:", e$message, "\n")
-    quit(status = 1)
+    cat("WIF authentication failed:", e$message, "\n")
   })
+  
+  # Try Method 2: Service Account JSON (fallback)
+  if (!auth_success) {
+    tryCatch({
+      cat("Attempting fallback authentication via service account JSON...\n")
+      
+      # Get service account key from environment
+      sa_key_json <- Sys.getenv("GCP_SA_KEY", "")
+      
+      if (nchar(sa_key_json) > 0) {
+        # Write SA key to temp file
+        sa_key_path <- tempfile(fileext = ".json")
+        writeLines(sa_key_json, sa_key_path)
+        
+        # Authenticate with service account
+        bigrquery::bq_auth(path = sa_key_path)
+        cat("BigQuery authentication successful via service account JSON\n")
+        
+        # Clean up key file immediately
+        unlink(sa_key_path)
+        
+        # Verify authentication by checking dataset exists
+        ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+        invisible(bigrquery::bq_dataset_exists(ds))
+        cat("Authentication test passed (dataset visible via REST)\n")
+        
+        auth_success <- TRUE
+      } else {
+        cat("GCP_SA_KEY environment variable not set, skipping service account JSON fallback\n")
+      }
+    }, error = function(e) {
+      cat("Service account JSON authentication failed:", e$message, "\n")
+    })
+  }
+  
+  # Check if any authentication method succeeded
+  if (!auth_success) {
+    cat("FATAL: All authentication methods failed\n")
+    cat("Tried: 1) WIF (gcloud), 2) Service Account JSON (GCP_SA_KEY)\n")
+    quit(status = 1)
+  }
+  
+  execution_status$bq_authenticated <<- TRUE
+  
 } else {
   cat("Local mode: BigQuery authentication skipped\n")
   execution_status$bq_authenticated <<- TRUE
