@@ -2391,9 +2391,13 @@ determine_run_status <- function() {
   
   # Extract API metrics
   if (nrow(fd_probe) > 0) {
-    # Check if recordedDateUtc column exists
+    # Check if required columns exist
     if (!"recordedDateUtc" %in% names(fd_probe)) {
       log_error("Missing 'recordedDateUtc' column in ForceDecks probe data. Available columns: {paste(names(fd_probe), collapse = ', ')}")
+      api_latest_date <- BACKSTOP_DATE
+      api_test_count <- 0
+    } else if (!"testId" %in% names(fd_probe)) {
+      log_error("Missing 'testId' column in ForceDecks probe data. Available columns: {paste(names(fd_probe), collapse = ', ')}")
       api_latest_date <- BACKSTOP_DATE
       api_test_count <- 0
     } else {
@@ -2408,9 +2412,13 @@ determine_run_status <- function() {
   }
   
   if (nrow(nord_probe) > 0) {
-    # Check if recordedDateUtc column exists
+    # Check if required columns exist
     if (!"recordedDateUtc" %in% names(nord_probe)) {
       log_error("Missing 'recordedDateUtc' column in NordBord probe data. Available columns: {paste(names(nord_probe), collapse = ', ')}")
+      nord_api_latest_date <- BACKSTOP_DATE
+      nord_api_test_count <- 0
+    } else if (!"testId" %in% names(nord_probe)) {
+      log_error("Missing 'testId' column in NordBord probe data. Available columns: {paste(names(nord_probe), collapse = ', ')}")
       nord_api_latest_date <- BACKSTOP_DATE
       nord_api_test_count <- 0
     } else {
