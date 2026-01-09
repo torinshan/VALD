@@ -33,6 +33,51 @@
 # ============================================================================
 
 # ============================================================================
+# CRITICAL: Define execution_status FIRST (before any code that could fail)
+# ============================================================================
+.GlobalEnv$execution_status <- list(
+  packages_loaded = FALSE,
+  credentials_valid = FALSE,
+  bq_authenticated = FALSE,
+  roster_loaded = FALSE,
+  fd_fetched = FALSE,
+  fd_cmj_processed = FALSE,
+  fd_dj_processed = FALSE,
+  fd_rsi_processed = FALSE,
+  fd_rebound_processed = FALSE,
+  fd_slj_processed = FALSE,
+  fd_imtp_processed = FALSE,
+  nord_fetched = FALSE,
+  nord_processed = FALSE,
+  refs_updated = FALSE
+)
+
+.GlobalEnv$execution_errors <- list()
+
+# Safe update functions
+update_status <- function(field, value) {
+  .GlobalEnv$execution_status[[field]] <- value
+}
+
+record_error <- function(component, error_msg) {
+  .GlobalEnv$execution_errors[[component]] <- error_msg
+  if (exists("log_error", mode = "function")) {
+    tryCatch(log_error(paste0(component, " FAILED: ", error_msg)), error = function(e) NULL)
+  }
+  cat(sprintf("[ERROR] %s FAILED: %s\n", component, error_msg))
+}
+
+determine_exit_code <- function() {
+  status <- .GlobalEnv$execution_status
+  any_fd_success <- any(status$fd_cmj_processed, status$fd_dj_processed,
+    status$fd_rsi_processed, status$fd_rebound_processed,
+    status$fd_slj_processed, status$fd_imtp_processed)
+  any_nord_success <- status$nord_processed
+  if (!any_fd_success && !any_nord_success) return(1)
+  return(0)
+}
+
+# ============================================================================
 # Package Loading (Fatal on Failure)
 # ============================================================================
 tryCatch({
@@ -49,6 +94,7 @@ tryCatch({
     library(readxl)
     library(furrr); library(future)
   })
+  update_status("packages_loaded", TRUE)
 }, error = function(e) {
   cat("FATAL: Package loading failed:", e$message, "\n")
   quit(status = 1)
@@ -63,53 +109,6 @@ if (LOCAL_MODE) {
   cat("=== RUNNING IN LOCAL MODE ===\n")
 } else {
   cat("=== RUNNING IN CLOUD MODE (GitHub Actions) ===\n")
-}
-
-# ============================================================================
-# Execution Status Tracking
-# ============================================================================
-execution_status <- list(
-  packages_loaded = TRUE,
-  credentials_valid = FALSE,
-  bq_authenticated = FALSE,
-  roster_loaded = FALSE,
-  fd_fetched = FALSE,
-  fd_cmj_processed = FALSE,
-  fd_dj_processed = FALSE,
-  fd_rsi_processed = FALSE,
-  fd_rebound_processed = FALSE,
-  fd_slj_processed = FALSE,
-  fd_imtp_processed = FALSE,
-  nord_fetched = FALSE,
-  nord_processed = FALSE,
-  refs_updated = FALSE
-)
-
-execution_errors <- list()
-
-record_error <- function(component, error_msg) {
-  execution_errors[[component]] <<- error_msg
-  log_error("{component} FAILED: {error_msg}")
-}
-
-determine_exit_code <- function() {
-  # Check if at least one data table was successfully processed
-  any_fd_success <- any(
-    execution_status$fd_cmj_processed,
-    execution_status$fd_dj_processed,
-    execution_status$fd_rsi_processed,
-    execution_status$fd_rebound_processed,
-    execution_status$fd_slj_processed,
-    execution_status$fd_imtp_processed
-  )
-  
-  any_nord_success <- execution_status$nord_processed
-  
-  if (!any_fd_success && !any_nord_success) {
-    return(1)  # Total failure
-  }
-  
-  return(0)  # At least partial success
 }
 
 # ============================================================================
@@ -514,7 +513,7 @@ tryCatch({
 })
 
 # Mark credentials as valid
-execution_status$credentials_valid <- TRUE
+update_status("credentials_valid", TRUE)
 
 # ============================================================================
 # Path Configuration (Environment-Aware)
@@ -630,11 +629,11 @@ if (!LOCAL_MODE) {
     quit(status = 1)
   }
   
-  execution_status$bq_authenticated <<- TRUE
+  update_status("bq_authenticated", TRUE)
   
 } else {
   cat("Local mode: BigQuery authentication skipped\n")
-  execution_status$bq_authenticated <<- TRUE
+  update_status("bq_authenticated", TRUE)
 }
 
 # ============================================================================
@@ -703,11 +702,12 @@ log_check_summary <- function(table_name, current_rows, current_date, api_rows, 
 
 finalize_logging <- function() {
   log_info("=== LOGGING FINALIZED ===")
-  log_info("Run type: {LOG_RUN_TYPE}")
-  log_info("Log file: {LOG_FILENAME}")
-  log_info("Errors recorded: {length(execution_errors)}")
-  if (length(execution_errors) > 0) {
-    log_info("Failed components: {paste(names(execution_errors), collapse = ', ')}")
+  log_info(paste("Run type:", LOG_RUN_TYPE))
+  log_info(paste("Log file:", LOG_FILENAME))
+  errors <- .GlobalEnv$execution_errors
+  log_info(paste("Errors recorded:", length(errors)))
+  if (length(errors) > 0) {
+    log_info(paste("Failed components:", paste(names(errors), collapse = ', ')))
   }
 }
 
@@ -2526,7 +2526,7 @@ Vald_roster <- tryCatch({
     if ("Group 1" %in% names(roster)) data.table::setnames(roster, "Group 1", "position")
     if ("category_1" %in% names(roster)) data.table::setnames(roster, "category_1", "team")
     if ("group_1" %in% names(roster)) data.table::setnames(roster, "group_1", "position")
-    execution_status$roster_loaded <<- TRUE
+    update_status("roster_loaded", TRUE)
   }
   
   roster
@@ -2555,7 +2555,7 @@ if (fd_changed) {
     if (tests_count == 0 || trials_count == 0) {
       log_warn("No ForceDecks data returned from API (tests: {tests_count}, trials: {trials_count})")
     } else {
-      execution_status$fd_fetched <<- TRUE
+      update_status("fd_fetched", TRUE)
       
       profiles    <- fd_data$profiles
       definitions <- fd_data$result_definitions
@@ -3024,7 +3024,7 @@ if (fd_changed) {
           
           bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
-          execution_status$fd_cmj_processed <<- TRUE
+          update_status("fd_cmj_processed", TRUE)
           log_and_store("Exported {nrow(cmj_export)} CMJ records with {ncol(cmj_export)} columns (MERGE mode)")
         }
       } else {
@@ -3044,7 +3044,7 @@ if (fd_changed) {
           dj_export <- process_dj(dj_all)
           bq_upsert(dj_export, "vald_fd_dj", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          execution_status$fd_dj_processed <<- TRUE
+          update_status("fd_dj_processed", TRUE)
           log_and_store("Exported {nrow(dj_export)} DJ records with {ncol(dj_export)} columns")
         }, error = function(e) {
           record_error("DJ_Processing", e$message)
@@ -3061,7 +3061,7 @@ if (fd_changed) {
           rsi_export <- process_rsi(rsi_all)
           bq_upsert(rsi_export, "vald_fd_rsi", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          execution_status$fd_rsi_processed <<- TRUE
+          update_status("fd_rsi_processed", TRUE)
           log_and_store("Exported {nrow(rsi_export)} RSI records with {ncol(rsi_export)} columns")
         }, error = function(e) {
           record_error("RSI_Processing", e$message)
@@ -3077,7 +3077,7 @@ if (fd_changed) {
           rebound_all <- standardize_data_types(rebound_all)
           bq_upsert(rebound_all, "vald_fd_rebound", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          execution_status$fd_rebound_processed <<- TRUE
+          update_status("fd_rebound_processed", TRUE)
           log_and_store("Exported {nrow(rebound_all)} Rebound records")
         }, error = function(e) {
           record_error("Rebound_Processing", e$message)
@@ -3094,7 +3094,7 @@ if (fd_changed) {
           slj_export <- process_sl_jumps(slj_all)
           bq_upsert(slj_export, "vald_fd_sl_jumps", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          execution_status$fd_slj_processed <<- TRUE
+          update_status("fd_slj_processed", TRUE)
           log_and_store("Exported {nrow(slj_export)} SLJ records with {ncol(slj_export)} columns")
         }, error = function(e) {
           record_error("SLJ_Processing", e$message)
@@ -3111,7 +3111,7 @@ if (fd_changed) {
           imtp_export <- process_imtp(imtp_all)
           bq_upsert(imtp_export, "vald_fd_imtp", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          execution_status$fd_imtp_processed <<- TRUE
+          update_status("fd_imtp_processed", TRUE)
           log_and_store("Exported {nrow(imtp_export)} IMTP records with {ncol(imtp_export)} columns")
         }, error = function(e) {
           record_error("IMTP_Processing", e$message)
@@ -3140,7 +3140,7 @@ if (fd_changed) {
           tests_df <- tests_df[!is.na(test_ID)]
           if (nrow(tests_df) > 0) {
             bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
-            execution_status$refs_updated <<- TRUE
+            update_status("refs_updated", TRUE)
             log_and_store("Updated tests: {nrow(tests_df)} tests")
           }
         }, error = function(e) {
@@ -3178,7 +3178,7 @@ if (nord_changed) {
       log_warn("No Nordbord tests returned")
     } else {
       nord_raw <- nord_data$tests
-      execution_status$nord_fetched <<- TRUE
+      update_status("nord_fetched", TRUE)
       log_and_store("Fetched {nrow(nord_raw)} Nordbord tests")
       
       # Process with V2.4.2 unilateral detection
@@ -3186,7 +3186,7 @@ if (nord_changed) {
       
       bq_upsert(nord_export, "vald_nord_all", key = "test_ID", mode = "MERGE",
                 partition_field = "date", cluster_fields = c("vald_id"))
-      execution_status$nord_processed <<- TRUE
+      update_status("nord_processed", TRUE)
       log_and_store("Exported {nrow(nord_export)} Nordbord records with {ncol(nord_export)} columns")
     }
     
@@ -3209,14 +3209,16 @@ log_and_store("Total execution time: {execution_time} minutes")
 
 # Execution summary
 log_and_store("=== EXECUTION SUMMARY ===")
-log_and_store("FD CMJ: {if(execution_status$fd_cmj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD DJ: {if(execution_status$fd_dj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD RSI: {if(execution_status$fd_rsi_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD Rebound: {if(execution_status$fd_rebound_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD SLJ: {if(execution_status$fd_slj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD IMTP: {if(execution_status$fd_imtp_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("NordBord: {if(execution_status$nord_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("Errors: {length(execution_errors)}")
+status <- .GlobalEnv$execution_status
+log_and_store("FD CMJ: {if(status$fd_cmj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("FD DJ: {if(status$fd_dj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("FD RSI: {if(status$fd_rsi_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("FD Rebound: {if(status$fd_rebound_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("FD SLJ: {if(status$fd_slj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("FD IMTP: {if(status$fd_imtp_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("NordBord: {if(status$nord_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+errors <- .GlobalEnv$execution_errors
+log_and_store("Errors: {length(errors)}")
 
 log_and_store("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
 
