@@ -121,7 +121,7 @@ jobs:
         else
           echo "Dataset already exists (this is OK)"
         fi
-        
+
         # Update dataset properties (ignore errors if dataset doesn't exist yet)
         bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" || echo "Dataset update not needed or failed (non-fatal)"
     - name: Check processing logs (tail)
