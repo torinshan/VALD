@@ -115,7 +115,7 @@ jobs:
     - name: Ensure BigQuery dataset exists
       if: always()
       run: |
-        set +e  # Don't exit on error
+        set +e  # Temporarily disable exit-on-error for BigQuery operations
         
         # Create dataset if it doesn't exist (ignore "already exists" error)
         BQ_OUTPUT=$(bq mk --dataset --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>&1)
@@ -151,7 +151,11 @@ jobs:
         \ found for this run.\"\necho 'last<<EOF' >> \"$GITHUB_OUTPUT\"\ncat /tmp/log_tail.txt\
         \ >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"\n"
     # Email notifications removed: No SMTP credentials configured in repository secrets
-    # To enable email notifications, add SMTP_USERNAME, SMTP_PASSWORD, and ALERT_EMAIL_TO secrets and uncomment below
+    # To enable email notifications, add these secrets and uncomment below:
+    #   - SMTP_USERNAME: Gmail address
+    #   - SMTP_PASSWORD: Gmail App Password  
+    #   - ALERT_EMAIL_TO: Recipient email addresses (comma-separated)
+    # Note: For non-Gmail SMTP, you may also need to add SMTP_HOST and SMTP_PORT secrets
     # - name: Send failure notification
     #   if: failure()
     #   uses: dawidd6/action-send-mail@v3
