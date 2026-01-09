@@ -115,8 +115,9 @@ jobs:
     - name: Ensure BigQuery dataset exists
       if: always()
       run: |
-        # Create dataset if it doesn't exist (ignore "already exists" error)
         set +e  # Don't exit on error
+        
+        # Create dataset if it doesn't exist (ignore "already exists" error)
         BQ_OUTPUT=$(bq mk --dataset --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>&1)
         BQ_EXIT_CODE=$?
         
@@ -129,7 +130,14 @@ jobs:
         fi
         
         # Update dataset properties (ignore errors)
-        bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>/dev/null && echo "✅ Dataset properties updated" || echo "ℹ️  Dataset update skipped (non-fatal)"
+        UPDATE_OUTPUT=$(bq update --location=US --default_table_expiration 0 "${GCP_PROJECT}:${BQ_DATASET}" 2>&1)
+        UPDATE_EXIT_CODE=$?
+        
+        if [ $UPDATE_EXIT_CODE -eq 0 ]; then
+          echo "✅ Dataset properties updated"
+        else
+          echo "ℹ️  Dataset update skipped (non-fatal)"
+        fi
         
         set -e  # Re-enable exit on error
     - name: Check processing logs (tail)
