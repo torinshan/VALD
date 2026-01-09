@@ -2391,20 +2391,34 @@ determine_run_status <- function() {
   
   # Extract API metrics
   if (nrow(fd_probe) > 0) {
-    fd_probe[, date := as.Date(recordedDateUtc)]
-    fd_probe[, test_ID := testId]
-    api_latest_date <- max(fd_probe$date, na.rm = TRUE)
-    api_test_count <- data.table::uniqueN(fd_probe$test_ID)
+    # Check if recordedDateUtc column exists
+    if (!"recordedDateUtc" %in% names(fd_probe)) {
+      log_error("Missing 'recordedDateUtc' column in ForceDecks probe data. Available columns: {paste(names(fd_probe), collapse = ', ')}")
+      api_latest_date <- BACKSTOP_DATE
+      api_test_count <- 0
+    } else {
+      fd_probe[, date := as.Date(recordedDateUtc)]
+      fd_probe[, test_ID := testId]
+      api_latest_date <- max(fd_probe$date, na.rm = TRUE)
+      api_test_count <- data.table::uniqueN(fd_probe$test_ID)
+    }
   } else {
     api_latest_date <- BACKSTOP_DATE
     api_test_count <- 0
   }
   
   if (nrow(nord_probe) > 0) {
-    nord_probe[, date := as.Date(recordedDateUtc)]
-    nord_probe[, test_ID := testId]
-    nord_api_latest_date <- max(nord_probe$date, na.rm = TRUE)
-    nord_api_test_count <- data.table::uniqueN(nord_probe$test_ID)
+    # Check if recordedDateUtc column exists
+    if (!"recordedDateUtc" %in% names(nord_probe)) {
+      log_error("Missing 'recordedDateUtc' column in NordBord probe data. Available columns: {paste(names(nord_probe), collapse = ', ')}")
+      nord_api_latest_date <- BACKSTOP_DATE
+      nord_api_test_count <- 0
+    } else {
+      nord_probe[, date := as.Date(recordedDateUtc)]
+      nord_probe[, test_ID := testId]
+      nord_api_latest_date <- max(nord_probe$date, na.rm = TRUE)
+      nord_api_test_count <- data.table::uniqueN(nord_probe$test_ID)
+    }
   } else {
     nord_api_latest_date <- BACKSTOP_DATE
     nord_api_test_count <- 0
