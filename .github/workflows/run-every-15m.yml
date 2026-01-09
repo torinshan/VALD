@@ -136,7 +136,7 @@ jobs:
         if [ $UPDATE_EXIT_CODE -eq 0 ]; then
           echo "✅ Dataset properties updated"
         else
-          echo "ℹ️  Dataset update skipped (non-fatal)"
+          echo "ℹ️  Dataset update failed (non-fatal)"
         fi
         
         set -e  # Re-enable exit on error
@@ -151,7 +151,7 @@ jobs:
         \ found for this run.\"\necho 'last<<EOF' >> \"$GITHUB_OUTPUT\"\ncat /tmp/log_tail.txt\
         \ >> \"$GITHUB_OUTPUT\"\necho 'EOF' >> \"$GITHUB_OUTPUT\"\n"
     # Email notifications removed: No SMTP credentials configured in repository secrets
-    # To enable email notifications, add SMTP_USERNAME and SMTP_PASSWORD secrets and uncomment below
+    # To enable email notifications, add SMTP_USERNAME, SMTP_PASSWORD, and ALERT_EMAIL_TO secrets and uncomment below
     # - name: Send failure notification
     #   if: failure()
     #   uses: dawidd6/action-send-mail@v3
@@ -161,7 +161,7 @@ jobs:
     #     username: ${{ secrets.SMTP_USERNAME }}
     #     password: ${{ secrets.SMTP_PASSWORD }}
     #     subject: "VALD q15 FAILED – run #${{ github.run_number }} on ${{ github.ref_name }}"
-    #     to: "torinshan@gmail.com, torin.shanahan@csus.edu"
+    #     to: ${{ secrets.ALERT_EMAIL_TO }}
     #     from: "VALD Bot <vald-bot@example.com>"
     #     html_body: |
     #       <p><strong>Status:</strong> Failed</p>
