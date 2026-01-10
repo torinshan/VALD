@@ -3188,8 +3188,6 @@ if (fd_changed) {
           record_error("RefTables_TestsOnly", e$message)
         })
       }
-        })
-      }
     }
     
     log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
