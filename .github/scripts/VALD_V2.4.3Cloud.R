@@ -166,6 +166,10 @@ CONFIG <- list(
   max_same_cursor = 3,
   max_retries = 3,
   
+  # Sequential Processing Configuration
+  batch_size = 250L,            # Batch size for sequential trial fetching
+  time_buffer_seconds = 60L,    # Reserve time for final processing
+  
   # BigQuery Configuration (from environment)
   gcp_project = Sys.getenv("GCP_PROJECT", "sac-vald-hub"),
   bq_dataset = Sys.getenv("BQ_DATASET", "analytics"),
@@ -1148,6 +1152,62 @@ evaluate_fetch_result <- function(fetch_data) {
 }
 
 # ============================================================================
+# Sequential Processing Helpers
+# ============================================================================
+
+#' Split data into batches for sequential processing
+split_into_batches <- function(dt, batch_size) {
+  n <- nrow(dt)
+  n_batches <- ceiling(n / batch_size)
+  
+  lapply(seq_len(n_batches), function(i) {
+    start_idx <- ((i - 1) * batch_size) + 1
+    end_idx <- min(i * batch_size, n)
+    dt[start_idx:end_idx, ]
+  })
+}
+
+#' Calculate elapsed time since start
+elapsed_since <- function(start_time) {
+  as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+}
+
+#' Remove NULL elements from list
+compact <- function(x) {
+  x[!sapply(x, is.null)]
+}
+
+#' Fetch with standardized logging
+fetch_with_logging <- function(fn, description) {
+  log_info("Fetching {description}...")
+  
+  result <- tryCatch({
+    fn()
+  }, error = function(e) {
+    log_error("{description} fetch failed: {e$message}")
+    NULL
+  })
+  
+  if (!is.null(result)) {
+    n <- if (is.data.frame(result)) nrow(result) else length(result)
+    log_info("Retrieved {n} {description}")
+  }
+  
+  result
+}
+
+#' Return empty result structure
+empty_result <- function() {
+  list(
+    profiles = data.table::data.table(),
+    tests = data.table::data.table(),
+    trials = data.table::data.table(),
+    fetch_complete = FALSE,
+    fetch_timeout = FALSE
+  )
+}
+
+# ============================================================================
 # Reconciliation Helper: Retry Missing Test IDs
 # ============================================================================
 reconcile_missing_trials <- function(missing_ids, round_number = 1) {
@@ -1309,49 +1369,48 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
     log_info("Retrieved {nrow(all_profiles)} profiles")
   }
   
-  # Step 2c: Fetch trials in batches of 250 tests using get_forcedecks_trials_only()
-  # This is the key improvement - batch size of 250 is optimal for API efficiency
+  # Step 2c: Fetch trials in batches using sequential processing with time checks
+  # Batch size of 250 is optimal for API efficiency
   if (nrow(all_tests) > 0) {
-    log_info("Fetching trials in batches of 250 tests...")
+    log_info("Fetching trials in batches of {CONFIG$batch_size} tests...")
     
-    # Calculate remaining time and determine how many batches we can process
-    elapsed_so_far <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    time_remaining <- timeout_seconds - elapsed_so_far - 60  # Reserve 60s for final processing
+    # Calculate remaining time
+    time_remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
     
     if (time_remaining < 30) {
       log_warn("Insufficient time ({round(time_remaining, 1)}s) to fetch trials")
       log_warn("Will process tests metadata only")
       fetch_timeout <- TRUE
     } else {
-      # Split tests into batches of 250
-      batch_size <- 250
+      # Split tests into batches using helper function
+      batch_list <- split_into_batches(all_tests, CONFIG$batch_size)
       total_tests <- nrow(all_tests)
-      num_batches <- ceiling(total_tests / batch_size)
+      num_batches <- length(batch_list)
       
-      log_info("Processing {total_tests} tests in {num_batches} batches of {batch_size}")
+      log_info("Processing {total_tests} tests in {num_batches} batches of {CONFIG$batch_size}")
       log_info("Time available: {round(time_remaining, 1)}s")
       
-      trials_list <- list()
+      trials_list <- vector("list", num_batches)
       tests_processed <- 0
       
-      for (i in seq_len(num_batches)) {
-        # Check if we're approaching timeout before starting next batch
-        elapsed_now <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-        if (elapsed_now >= (timeout_seconds - 60)) {
-          log_warn("Approaching timeout after batch {i-1}/{num_batches}")
-          log_warn("Stopping trial fetch to allow processing time")
+      for (i in seq_along(batch_list)) {
+        # Check time budget BEFORE each batch
+        remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
+        
+        if (remaining < 30) {
+          log_warn("Timeout approaching after batch {i-1}/{num_batches} - stopping")
+          log_warn("Processed {tests_processed}/{total_tests} tests ({round(100*tests_processed/total_tests, 1)}%)")
           fetch_timeout <- TRUE
           break
         }
         
-        # Get batch of tests
-        start_idx <- ((i - 1) * batch_size) + 1
-        end_idx <- min(i * batch_size, total_tests)
-        batch_tests <- all_tests[start_idx:end_idx, ]
+        batch_tests <- batch_list[[i]]
+        start_idx <- ((i - 1) * CONFIG$batch_size) + 1
+        end_idx <- min(i * CONFIG$batch_size, total_tests)
         
         log_info("Batch {i}/{num_batches}: fetching trials for tests {start_idx}-{end_idx}...")
         
-        # Fetch trials for this batch using get_forcedecks_trials_only()
+        # Fetch trials for this batch
         batch_trials <- tryCatch({
           valdr::get_forcedecks_trials_only(batch_tests)
         }, error = function(e) {
@@ -1362,16 +1421,22 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
         if (!is.null(batch_trials) && length(batch_trials) > 0) {
           trials_list[[i]] <- data.table::as.data.table(batch_trials)
           tests_processed <- tests_processed + nrow(batch_tests)
-          batch_elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+          batch_elapsed <- round(elapsed_since(start_time), 1)
           log_info("Batch {i}/{num_batches}: {nrow(trials_list[[i]])} trial records fetched (elapsed: {batch_elapsed}s, processed: {tests_processed}/{total_tests} tests)")
         } else {
           log_warn("Batch {i} returned no trial data")
         }
+        
+        # Progress logging every 5 batches
+        if (i %% 5 == 0) {
+          log_info("Progress: {i}/{num_batches} batches ({round(elapsed_since(start_time))}s elapsed)")
+        }
       }
       
-      # Combine all trial batches
-      if (length(trials_list) > 0) {
-        all_trials <- data.table::rbindlist(trials_list, use.names = TRUE, fill = TRUE)
+      # Combine all trial batches (remove NULLs first)
+      trials_list_clean <- compact(trials_list)
+      if (length(trials_list_clean) > 0) {
+        all_trials <- data.table::rbindlist(trials_list_clean, use.names = TRUE, fill = TRUE)
         log_info("Combined trials: {nrow(all_trials)} total trial records from {tests_processed} tests")
         
         if (tests_processed < total_tests) {
@@ -1392,7 +1457,7 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
     fetch_timeout <- TRUE
   }
   
-  elapsed_final <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+  elapsed_final <- round(elapsed_since(start_time), 1)
   log_info("ForceDecks fetch finished in {elapsed_final}s: {nrow(all_profiles)} profiles, {nrow(all_tests)} tests, {nrow(all_trials)} trials")
   
   return(list(
