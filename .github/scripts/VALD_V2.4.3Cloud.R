@@ -844,14 +844,56 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
   }
   
   # Cloud: Write to BigQuery
+  staging_tbl <- NULL  # Track staging table for cleanup
+  staging_name <- NULL
+  
   tryCatch({
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, table_name)
     
+    # PRE-FLIGHT DIAGNOSTICS: Check for common MERGE failure causes
+    # 1. Check for duplicate keys
+    if (!(key %in% names(data))) {
+      stop(sprintf("Key column '%s' not found in data. Available columns: %s", 
+                   key, paste(names(data), collapse = ", ")))
+    }
+    
+    dup_keys <- data[[key]][duplicated(data[[key]])]
+    if (length(dup_keys) > 0) {
+      log_error("MERGE WILL FAIL: Found {length(dup_keys)} duplicate keys in data")
+      log_error("Example duplicate keys: {paste(head(unique(dup_keys), 5), collapse = ', ')}")
+      stop(sprintf("Cannot MERGE: %d duplicate keys found in column '%s'", length(dup_keys), key))
+    }
+    
+    # 2. Check for NULL/NA values in key column
+    null_keys <- sum(is.na(data[[key]]) | data[[key]] == "")
+    if (null_keys > 0) {
+      log_error("MERGE WILL FAIL: Found {null_keys} NULL/empty keys in column '{key}'")
+      stop(sprintf("Cannot MERGE: %d NULL/empty values in key column '%s'", null_keys, key))
+    }
+    
+    log_info("Pre-flight checks passed: {nrow(data)} unique keys, no NULLs")
+    
     # Create table if not exists (WITHOUT expiration)
-    if (!bigrquery::bq_table_exists(tbl)) {
-      log_info("Creating BigQuery table: {table_name}")
-      bigrquery::bq_table_create(tbl, fields = bigrquery::as_bq_fields(data))
+    table_exists <- bigrquery::bq_table_exists(tbl)
+    if (!table_exists) {
+      log_info("Creating BigQuery table: {table_name} (no expiration)")
+      bigrquery::bq_table_create(
+        tbl, 
+        fields = bigrquery::as_bq_fields(data),
+        expiration_time = NULL
+      )
+    } else {
+      # Table exists - check for schema compatibility
+      existing_schema <- bigrquery::bq_table_meta(tbl)$schema$fields
+      existing_cols <- sapply(existing_schema, function(f) f$name)
+      new_cols <- names(data)
+      
+      missing_in_existing <- setdiff(new_cols, existing_cols)
+      if (length(missing_in_existing) > 0) {
+        log_warn("New columns not in existing table: {paste(missing_in_existing, collapse = ', ')}")
+        log_warn("MERGE may fail due to schema mismatch - consider adding columns to table first")
+      }
     }
     
     if (mode == "TRUNCATE") {
@@ -862,7 +904,32 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       staging_name <- paste0(table_name, "_staging_", format(Sys.time(), "%Y%m%d%H%M%S"))
       staging_tbl <- bigrquery::bq_table(ds, staging_name)
       
+      # Create staging table with 1-hour expiration as safety net
+      # This ensures it auto-deletes even if manual cleanup fails
+      log_info("Creating temporary staging table: {staging_name} (1-hour expiration)")
+      tryCatch({
+        bigrquery::bq_table_create(
+          staging_tbl,
+          fields = bigrquery::as_bq_fields(data),
+          expiration_time = Sys.time() + 3600  # 1 hour from now
+        )
+      }, error = function(e) {
+        # If table already exists from previous failed run, delete and recreate
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          log_warn("Staging table {staging_name} already exists, deleting old one")
+          bigrquery::bq_table_delete(staging_tbl)
+          bigrquery::bq_table_create(
+            staging_tbl,
+            fields = bigrquery::as_bq_fields(data),
+            expiration_time = Sys.time() + 3600
+          )
+        } else {
+          stop(e)
+        }
+      })
+      
       # Upload to staging
+      log_info("Uploading {nrow(data)} rows to staging table: {staging_name}")
       bigrquery::bq_table_upload(staging_tbl, data, write_disposition = "WRITE_TRUNCATE")
       
       # Build column lists for MERGE
@@ -885,11 +952,51 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
           VALUES ({insert_vals})
       ")
       
-      # Execute merge
-      bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      log_info("Executing MERGE for {table_name}...")
       
-      # Drop staging table
-      bigrquery::bq_table_delete(staging_tbl)
+      # Execute merge and capture job details
+      job <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      
+      # Wait for job completion and get detailed status
+      job_result <- bigrquery::bq_job_wait(job, quiet = FALSE)
+      
+      # Check if job succeeded
+      job_status <- bigrquery::bq_job_status(job)
+      if (!is.null(job_status$errorResult)) {
+        # Job failed - extract detailed error information
+        error_msg <- job_status$errorResult$message
+        error_reason <- job_status$errorResult$reason
+        error_location <- job_status$errorResult$location
+        
+        log_error("MERGE job failed with reason: {error_reason}")
+        log_error("Error message: {error_msg}")
+        if (!is.null(error_location)) {
+          log_error("Error location: {error_location}")
+        }
+        
+        # Try to drop staging table even on failure
+        tryCatch({
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Cleaned up staging table after failure")
+        }, error = function(cleanup_err) {
+          log_warn("Could not clean up staging table: {cleanup_err$message}")
+        })
+        
+        stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
+      }
+      
+      # Success - drop staging table immediately
+      tryCatch({
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Dropped staging table: {staging_name}")
+        } else {
+          log_warn("Staging table {staging_name} already deleted or never existed")
+        }
+      }, error = function(e) {
+        log_error("Failed to drop staging table {staging_name}: {e$message}")
+        log_warn("Staging table will auto-expire in 1 hour")
+      })
       
       log_info("Merged {table_name}: {nrow(data)} rows (MERGE)")
     }
@@ -898,6 +1005,25 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
   }, error = function(e) {
     log_error("BigQuery upsert failed for {table_name}: {e$message}")
+    
+    # Log additional context for debugging
+    log_error("Data shape: {nrow(data)} rows x {ncol(data)} columns")
+    log_error("Key column: '{key}' (type: {class(data[[key]])[1]})")
+    log_error("Mode: {mode}")
+    
+    # Cleanup staging table if it exists
+    if (!is.null(staging_tbl) && !is.null(staging_name)) {
+      tryCatch({
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Cleaned up staging table {staging_name} after error")
+        }
+      }, error = function(cleanup_err) {
+        log_warn("Could not clean up staging table {staging_name}: {cleanup_err$message}")
+        log_warn("Staging table will auto-expire in 1 hour")
+      })
+    }
+    
     record_error(paste0("BQ_", table_name), e$message)
     invisible(FALSE)
   })
@@ -2475,7 +2601,9 @@ determine_run_status <- function() {
     run_type = run_type,
     fd_changed = fd_changed,
     nord_changed = nord_changed,
-    any_changes = TRUE
+    any_changes = TRUE,
+    max_fd_date = latest_date_current,
+    max_nord_date = latest_nord_date_current
   ))
 }
 
@@ -2500,6 +2628,8 @@ if (LOCAL_MODE) {
   fd_changed <- TRUE
   nord_changed <- TRUE
   LOG_RUN_TYPE <- "FULL_RUN"
+  max_fd_date <- NULL
+  max_nord_date <- NULL
   log_and_store("Run type: FULL_RUN (local default)")
   
 } else {
@@ -2509,6 +2639,8 @@ if (LOCAL_MODE) {
   fd_changed <- run_status$fd_changed
   nord_changed <- run_status$nord_changed
   LOG_RUN_TYPE <- run_status$run_type
+  max_fd_date <- run_status$max_fd_date
+  max_nord_date <- run_status$max_nord_date
   
   if (!run_status$any_changes) {
     log_and_store("=== STANDDOWN: No changes detected ===")
@@ -2519,6 +2651,7 @@ if (LOCAL_MODE) {
   
   log_and_store("Run type: {LOG_RUN_TYPE}")
   log_and_store("FD changed: {fd_changed} | Nord changed: {nord_changed}")
+  log_and_store("Max dates - FD: {max_fd_date} | Nord: {max_nord_date}")
 }
 
 # ============================================================================
@@ -2569,12 +2702,24 @@ log_and_store("Roster loaded: {nrow(Vald_roster)} athletes")
 
 if (LOG_RUN_TYPE == "FULL_RUN") {
   fetch_start_date <- CONFIG$start_date  # "2024-01-01"
+  log_and_store("Using FULL_RUN start date: {fetch_start_date}")
   
-} else if (LOG_RUN_TYPE == "PARTIAL_RUN") {
-  fetch_start_date <- as.character(as.Date(max_fd_date) - CONFIG$overlap_days)
+} else if (LOG_RUN_TYPE %in% c("UPDATE_RUN", "PARTIAL_RUN")) {
+  # UPDATE_RUN and PARTIAL_RUN are synonymous - both mean incremental update
+  # BUG FIX: Was checking only for "PARTIAL_RUN" which was never set
+  if (!is.null(max_fd_date) && !is.na(max_fd_date)) {
+    fetch_start_date <- as.character(as.Date(max_fd_date) - CONFIG$overlap_days)
+    log_and_store("Using {LOG_RUN_TYPE} start date: {fetch_start_date} (max_fd_date: {max_fd_date}, overlap: {CONFIG$overlap_days} days)")
+  } else {
+    # Fallback to full run if max_fd_date not available
+    fetch_start_date <- CONFIG$start_date
+    log_warn("max_fd_date not available, falling back to FULL_RUN start date: {fetch_start_date}")
+  }
   
 } else {
-  # STANDDOWN - skip fetch
+  # STANDDOWN or unknown - use default
+  fetch_start_date <- CONFIG$start_date
+  log_and_store("Using default start date for {LOG_RUN_TYPE}: {fetch_start_date}")
 }
 
 # Reset the consumed cursor
@@ -3205,12 +3350,25 @@ if (fd_changed) {
 # ============================================================================                    
 if (LOG_RUN_TYPE == "FULL_RUN") {
   fetch_start_date <- CONFIG$start_date  # "2024-01-01"
+  log_and_store("NordBord: Using FULL_RUN start date: {fetch_start_date}")
   
-} else if (LOG_RUN_TYPE == "PARTIAL_RUN") {
-  fetch_start_date <- as.character(as.Date(max_fd_date) - CONFIG$overlap_days)
+} else if (LOG_RUN_TYPE %in% c("UPDATE_RUN", "PARTIAL_RUN")) {
+  # UPDATE_RUN and PARTIAL_RUN are synonymous - both mean incremental update
+  # BUG FIX: Was checking only for "PARTIAL_RUN" which was never set
+  # BUG FIX: Was using max_fd_date instead of max_nord_date
+  if (!is.null(max_nord_date) && !is.na(max_nord_date)) {
+    fetch_start_date <- as.character(as.Date(max_nord_date) - CONFIG$overlap_days)
+    log_and_store("NordBord: Using {LOG_RUN_TYPE} start date: {fetch_start_date} (max_nord_date: {max_nord_date}, overlap: {CONFIG$overlap_days} days)")
+  } else {
+    # Fallback to full run if max_nord_date not available
+    fetch_start_date <- CONFIG$start_date
+    log_warn("max_nord_date not available, falling back to FULL_RUN start date: {fetch_start_date}")
+  }
   
 } else {
-  # STANDDOWN - skip fetch
+  # STANDDOWN or unknown - use default  
+  fetch_start_date <- CONFIG$start_date
+  log_and_store("NordBord: Using default start date for {LOG_RUN_TYPE}: {fetch_start_date}")
 }
 
 # Reset the consumed cursor

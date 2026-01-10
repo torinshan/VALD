@@ -66,32 +66,23 @@ jobs:
     - name: Install R dependencies (pak)
       uses: r-lib/actions/setup-r-dependencies@v2
       with:
-        extra-packages: 'DBI
-          bigrquery
-          dplyr
-          tidyr
-          readr
-          stringr
-          purrr
-          tibble
-          data.table
-          hms
-          lubridate
-          httr2
-          jsonlite
-          xml2
-          curl
-          valdr
-          gargle
-          rlang
-          lifecycle
-          glue
-          slider
-          R.utils
-          logger
-          readxl
-          furrr
-          future'
+        # Only runtime dependencies needed for production
+        extra-packages: |
+          any::bigrquery
+          any::dplyr
+          any::tidyr
+          any::readr
+          any::stringr
+          any::data.table
+          any::lubridate
+          any::httr2
+          any::jsonlite
+          any::valdr
+          any::logger
+          any::readxl
+          any::furrr
+        # Prevent dev dependencies from being installed
+        dependencies: '"hard"'
         cache: true
     - name: System libs
       run: "sudo apt-get update\nsudo apt-get install -y \\\n  libcurl4-openssl-dev\
