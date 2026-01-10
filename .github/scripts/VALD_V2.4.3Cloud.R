@@ -2364,10 +2364,12 @@ determine_run_status <- function() {
     if (!is.null(probe_result$tests)) {
       data.table::as.data.table(probe_result$tests)
     } else {
+      log_warn("NordBord probe returned NULL tests")
       data.table::data.table()
     }
   }, error = function(e) {
     log_error("NordBord probe failed: {e$message}")
+    log_warn("If NordBord table doesn't exist, will treat as new data")
     data.table::data.table()
   })
   
@@ -2426,8 +2428,25 @@ determine_run_status <- function() {
   nord_date_mismatch <- !identical(as.Date(nord_api_latest_date), as.Date(latest_nord_date_current))
   nord_count_mismatch <- nord_api_test_count != count_nord_tests_current
   
-  fd_changed <- fd_date_mismatch || fd_count_mismatch
-  nord_changed <- nord_date_mismatch || nord_count_mismatch
+  # Special case: If table doesn't exist (0 rows) but API probe failed/returned 0,
+  # we should still try to fetch in case the probe failed but data exists
+  nord_table_missing <- count_nord_tests_current == 0
+  fd_table_missing <- count_tests_current == 0
+  
+  # If tables are missing, always mark as changed to trigger fetch attempt
+  fd_changed <- fd_date_mismatch || fd_count_mismatch || (fd_table_missing && api_test_count == 0)
+  nord_changed <- nord_date_mismatch || nord_count_mismatch || (nord_table_missing && nord_api_test_count == 0)
+  
+  # Override: If table is missing, force a fetch even if probe failed
+  if (nord_table_missing) {
+    log_warn("NordBord table missing - forcing fetch attempt even if probe returned 0")
+    nord_changed <- TRUE
+  }
+  if (fd_table_missing) {
+    log_warn("ForceDecks table missing - forcing fetch attempt even if probe returned 0")
+    fd_changed <- TRUE
+  }
+  
   any_changes <- fd_changed || nord_changed
   
   log_check_summary("ForceDecks", count_tests_current, latest_date_current, 
@@ -2580,6 +2599,19 @@ if (fd_changed) {
     
     fd_data <- adaptive_fetch_forcedecks(timeout_seconds = CONFIG$timeout_fd_full)
     
+    # Validate fetch result structure
+    if (is.null(fd_data)) {
+      log_error("adaptive_fetch_forcedecks returned NULL!")
+      log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: NULL fetch result) ===")
+      record_error("ForceDecks_Fetch", "Fetch function returned NULL")
+      # Skip to next section
+    } else if (!is.list(fd_data)) {
+      log_error("adaptive_fetch_forcedecks returned non-list: {class(fd_data)}")
+      log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: Invalid fetch result type) ===")
+      record_error("ForceDecks_Fetch", paste("Fetch returned:", class(fd_data)))
+      # Skip to next section  
+    } else {
+    
     # Track if fetch was complete or partial
     fetch_was_complete <- isTRUE(fd_data$fetch_complete)
     fetch_had_timeout <- isTRUE(fd_data$fetch_timeout)
@@ -2595,10 +2627,15 @@ if (fd_changed) {
     tests_count <- if (!is.null(fd_data$tests)) nrow(fd_data$tests) else 0
     trials_count <- if (!is.null(fd_data$trials)) nrow(fd_data$trials) else 0
     
+    # Diagnostic logging
+    log_and_store("Fetch results: tests_count={tests_count}, trials_count={trials_count}, fetch_complete={fetch_was_complete}, fetch_timeout={fetch_had_timeout}")
+    
     # Process data if we have tests AND trials, OR if we timed out with partial data
     # In timeout scenario, we might have tests but incomplete trials - still worth processing
     has_processable_data <- (tests_count > 0 && trials_count > 0) || 
                             (fetch_had_timeout && tests_count > 0)
+    
+    log_and_store("has_processable_data={has_processable_data} (calculated from: tests_count={tests_count}, trials_count={trials_count}, fetch_had_timeout={fetch_had_timeout})")
     
     if (!has_processable_data) {
       log_warn("No processable ForceDecks data (tests: {tests_count}, trials: {trials_count}, timeout: {fetch_had_timeout})")
@@ -2664,6 +2701,7 @@ if (fd_changed) {
       # we'll skip to updating reference tables at the end
       if (trials_count > 0) {
         log_and_store("Pivoting trials: {nrow(trials_raw)} records...")
+        log_and_store("Trial structure check: columns={paste(names(trials_raw), collapse=', ')}")
       
       if ("resultLimb" %in% names(trials_raw)) {
         trials_wide <- data.table::dcast(
@@ -3076,6 +3114,18 @@ if (fd_changed) {
           
           log_info("Export schema: {ncol(cmj_export)} columns, {nrow(cmj_export)} rows")
           
+          # Deduplication: Ensure unique test_IDs before export
+          n_before_dedup <- nrow(cmj_export)
+          cmj_export <- unique(cmj_export, by = "test_ID")
+          n_after_dedup <- nrow(cmj_export)
+          
+          if (n_before_dedup > n_after_dedup) {
+            log_warn("Deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
+            log_warn("Retained {n_after_dedup} unique CMJ records for export")
+          } else {
+            log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
+          }
+          
           bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
           update_status("fd_cmj_processed", TRUE)
@@ -3186,7 +3236,57 @@ if (fd_changed) {
       # Update Reference Tables
       # ========================================================================
       # This runs whether we have trials or not - update tests table if we have tests
-      if (exists("fd_raw") && nrow(fd_raw) > 0) {
+      # Updated logic: Always try to process tests_raw if available (timeout scenario)
+      if (exists("tests_raw") && nrow(tests_raw) > 0) {
+        log_info("Updating reference tables from tests_raw ({nrow(tests_raw)} tests)")
+        tryCatch({
+          # Ensure required columns exist in tests_raw
+          if (!all(c("test_ID", "vald_id", "date", "test_type") %in% names(tests_raw))) {
+            log_error("Missing required columns in tests_raw. Available: {paste(names(tests_raw), collapse = ', ')}")
+          } else {
+            # Update dates table
+            dates_df <- data.table::data.table(
+              date = unique(tests_raw$date),
+              source = "ForceDecks",
+              updated = Sys.time()
+            )
+            dates_df <- dates_df[!is.na(date)]
+            
+            # Deduplication: Ensure unique dates before export
+            dates_df <- unique(dates_df, by = "date")
+            log_info("Deduplication: {nrow(dates_df)} unique dates after removing duplicates")
+            
+            if (nrow(dates_df) > 0) {
+              bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
+              log_and_store("Updated dates table: {nrow(dates_df)} unique dates exported to BigQuery")
+            }
+            
+            # Update tests table
+            tests_df <- tests_raw[, .(test_ID, vald_id, date, test_type)]
+            tests_df <- tests_df[!is.na(test_ID)]
+            
+            # Deduplication: Ensure unique test_IDs before export
+            tests_df <- unique(tests_df, by = "test_ID")
+            log_info("Deduplication: {nrow(tests_df)} unique test_IDs after removing duplicates")
+            
+            if (nrow(tests_df) > 0) {
+              bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
+              update_status("refs_updated", TRUE)
+              log_and_store("Updated tests table: {nrow(tests_df)} tests exported to BigQuery")
+              
+              # Log processing outcome
+              if (trials_count == 0) {
+                log_warn("Tests exported without trial data - subsequent runs will process trials via MERGE")
+              }
+            }
+          }
+        }, error = function(e) {
+          log_error("RefTables update failed: {e$message}")
+          record_error("RefTables", e$message)
+        })
+      } else if (exists("fd_raw") && nrow(fd_raw) > 0) {
+        # Legacy path: use fd_raw if available (normal processing with trials)
+        log_info("Updating reference tables from fd_raw ({nrow(fd_raw)} records)")
         tryCatch({
           dates_df <- data.table::data.table(
             date = unique(fd_raw$date),
@@ -3194,57 +3294,45 @@ if (fd_changed) {
             updated = Sys.time()
           )
           dates_df <- dates_df[!is.na(date)]
+          
+          # Deduplication: Ensure unique dates before export
+          dates_df <- unique(dates_df, by = "date")
+          log_info("Deduplication: {nrow(dates_df)} unique dates after removing duplicates")
+          
           if (nrow(dates_df) > 0) {
             bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-            log_and_store("Updated dates: {nrow(dates_df)} unique dates")
+            log_and_store("Updated dates table: {nrow(dates_df)} unique dates exported to BigQuery")
           }
           
-          tests_df <- unique(fd_raw[, .(test_ID, vald_id, date, test_type)], by = "test_ID")
+          tests_df <- fd_raw[, .(test_ID, vald_id, date, test_type)]
           tests_df <- tests_df[!is.na(test_ID)]
+          
+          # Deduplication: Ensure unique test_IDs before export
+          tests_df <- unique(tests_df, by = "test_ID")
+          log_info("Deduplication: {nrow(tests_df)} unique test_IDs after removing duplicates")
+          
           if (nrow(tests_df) > 0) {
             bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
             update_status("refs_updated", TRUE)
-            log_and_store("Updated tests: {nrow(tests_df)} tests")
+            log_and_store("Updated tests table: {nrow(tests_df)} tests exported to BigQuery")
           }
         }, error = function(e) {
+          log_error("RefTables update failed: {e$message}")
           record_error("RefTables", e$message)
         })
-      } else if (nrow(tests_raw) > 0 && trials_count == 0) {
-        # Timeout case: we have tests but no trials, update tests table directly
-        log_warn("Timeout: updating tests table without trial data processing")
-        tryCatch({
-          tests_df <- tests_raw[, .(test_ID, vald_id, date, test_type)]
-          tests_df <- unique(tests_df, by = "test_ID")
-          tests_df <- tests_df[!is.na(test_ID)]
-          if (nrow(tests_df) > 0) {
-            bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
-            update_status("refs_updated", TRUE)
-            log_and_store("Updated tests: {nrow(tests_df)} tests (no trial data)")
-          }
-          
-          # Also update dates if available
-          if ("date" %in% names(tests_df)) {
-            dates_df <- data.table::data.table(
-              date = unique(tests_df$date),
-              source = "ForceDecks",
-              updated = Sys.time()
-            )
-            dates_df <- dates_df[!is.na(date)]
-            if (nrow(dates_df) > 0) {
-              bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-              log_and_store("Updated dates: {nrow(dates_df)} unique dates")
-            }
-          }
-        }, error = function(e) {
-          record_error("RefTables_TestsOnly", e$message)
-        })
+      } else {
+        log_warn("No test data available to update reference tables")
       }
     }
+    
+    } # End of fd_data validation else block
     
     log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
     
   }, error = function(e) {
     log_error("ForceDecks branch failed: {e$message}")
+    log_error("Error class: {paste(class(e), collapse=', ')}")
+    log_error("Call stack: {paste(deparse(sys.calls()), collapse=' | ')}")
     record_error("ForceDecks_Branch", e$message)
   })
 } else {
