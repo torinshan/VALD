@@ -859,6 +859,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     log_info("Pre-flight checks passed (new data): {nrow(data)} unique keys, no NULLs")
     
     # Check if table exists BEFORE using it in conditionals
+    # FIX: Moved up from below, with NA handling
     table_exists <- tryCatch({
       result <- bigrquery::bq_table_exists(tbl)
       if (is.na(result)) FALSE else result
@@ -909,7 +910,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     }
     
     # Create table if not exists (WITHOUT expiration)
-    # Note: table_exists already assigned above with NA handling
+    # FIX: Removed duplicate table_exists assignment - already done above
     if (!table_exists) {
       log_info("Creating BigQuery table: {table_name} (no expiration)")
       bigrquery::bq_table_create(
@@ -940,12 +941,15 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       # Create staging table with 1-hour expiration as safety net
       # This ensures it auto-deletes even if manual cleanup fails
+      # FIX: BigQuery expects expiration_time in MILLISECONDS since epoch
+      staging_expiration_ms <- as.numeric(Sys.time() + 3600) * 1000
+      
       log_info("Creating temporary staging table: {staging_name} (1-hour expiration)")
       tryCatch({
         bigrquery::bq_table_create(
           staging_tbl,
           fields = bigrquery::as_bq_fields(data),
-          expiration_time = as.integer(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
+          expiration_time = staging_expiration_ms
         )
       }, error = function(e) {
         # If table already exists from previous failed run, delete and recreate
@@ -956,7 +960,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
           bigrquery::bq_table_create(
             staging_tbl,
             fields = bigrquery::as_bq_fields(data),
-            expiration_time = as.numeric(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
+            expiration_time = staging_expiration_ms
           )
         } else {
           stop(e)
@@ -3363,111 +3367,92 @@ if (fd_changed) {
       }
       
       # ========================================================================
-      # Update Reference Tables
+      # Update Reference Tables FROM PROCESSED DATA ONLY
       # ========================================================================
-      # This runs whether we have trials or not - update tests table if we have tests
-      # Updated logic: Always try to process tests_raw if available (timeout scenario)
-      if (exists("tests_raw") && nrow(tests_raw) > 0) {
-        log_info("Updating reference tables from tests_raw ({nrow(tests_raw)} tests)")
-        tryCatch({
-          # Ensure required columns exist in tests_raw
+      # CRITICAL: Only update reference tables with tests that were ACTUALLY PROCESSED
+      # This ensures change detection works correctly for subsequent runs
+      # If we update with all fetched tests, unprocessed tests will never be retried
+      
+      tryCatch({
+        # Collect test_IDs from all exported data tables
+        processed_test_ids <- character(0)
+        
+        if (exists("cmj_export") && is.data.table(cmj_export) && nrow(cmj_export) > 0) {
+          processed_test_ids <- c(processed_test_ids, cmj_export$test_ID)
+        }
+        if (exists("dj_export") && is.data.table(dj_export) && nrow(dj_export) > 0) {
+          processed_test_ids <- c(processed_test_ids, dj_export$test_ID)
+        }
+        if (exists("rsi_export") && is.data.table(rsi_export) && nrow(rsi_export) > 0) {
+          processed_test_ids <- c(processed_test_ids, rsi_export$test_ID)
+        }
+        if (exists("slj_export") && is.data.table(slj_export) && nrow(slj_export) > 0) {
+          processed_test_ids <- c(processed_test_ids, slj_export$test_ID)
+        }
+        if (exists("imtp_export") && is.data.table(imtp_export) && nrow(imtp_export) > 0) {
+          processed_test_ids <- c(processed_test_ids, imtp_export$test_ID)
+        }
+        if (exists("rebound_all") && is.data.table(rebound_all) && nrow(rebound_all) > 0 && "test_ID" %in% names(rebound_all)) {
+          processed_test_ids <- c(processed_test_ids, rebound_all$test_ID)
+        }
+        
+        processed_test_ids <- unique(processed_test_ids)
+        n_processed <- length(processed_test_ids)
+        n_fetched <- if (exists("tests_raw") && is.data.table(tests_raw)) nrow(tests_raw) else 0
+        
+        log_info("Reference tables: {n_processed} tests processed out of {n_fetched} fetched")
+        
+        if (n_processed > 0 && exists("tests_raw") && nrow(tests_raw) > 0) {
+          
+          # Ensure required columns exist
           if (!all(c("test_ID", "vald_id", "date", "test_type") %in% names(tests_raw))) {
             log_error("Missing required columns in tests_raw. Available: {paste(names(tests_raw), collapse = ', ')}")
           } else {
-            # Update dates table
+            
+            # Filter tests_raw to ONLY include tests that were actually processed
+            tests_df <- tests_raw[test_ID %in% processed_test_ids, .(test_ID, vald_id, date, test_type)]
+            tests_df <- unique(tests_df, by = "test_ID")
+            
+            # Dates table: only dates from PROCESSED tests
             dates_df <- data.table::data.table(
-              date = unique(tests_raw$date),
+              date = unique(tests_df$date),
               source = "ForceDecks",
               updated = Sys.time()
             )
             dates_df <- dates_df[!is.na(date)]
-            
-            # Deduplication: Ensure unique dates before export
             dates_df <- unique(dates_df, by = "date")
-            log_info("Deduplication: {nrow(dates_df)} unique dates after removing duplicates")
             
             if (nrow(dates_df) > 0) {
               bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-              log_and_store("Updated dates table: {nrow(dates_df)} unique dates exported to BigQuery")
+              log_and_store("Updated dates table: {nrow(dates_df)} dates from {n_processed} processed tests")
             }
-            
-            # Update tests table
-            tests_df <- tests_raw[, .(test_ID, vald_id, date, test_type)]
-            tests_df <- tests_df[!is.na(test_ID)]
-            
-            # Deduplication: Ensure unique test_IDs before export
-            tests_df <- unique(tests_df, by = "test_ID")
-            log_info("Deduplication: {nrow(tests_df)} unique test_IDs after removing duplicates")
             
             if (nrow(tests_df) > 0) {
               bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
               update_status("refs_updated", TRUE)
-              log_and_store("Updated tests table: {nrow(tests_df)} tests exported to BigQuery")
-              
-              # Log processing outcome based on fetch evaluation
-              if (!fetch_eval$has_trials) {
-                log_warn("Tests exported without trial data - subsequent runs will process trials via MERGE")
-              }
+              log_and_store("Updated tests table: {nrow(tests_df)} processed tests (of {n_fetched} fetched)")
+            }
+            
+            # Log gap for awareness
+            n_unprocessed <- n_fetched - n_processed
+            if (n_unprocessed > 0) {
+              log_warn("Gap detected: {n_unprocessed} tests fetched but not processed")
+              log_warn("These tests will be retried in subsequent runs via change detection")
             }
           }
-        }, error = function(e) {
-          log_error("RefTables update failed: {e$message}")
-          record_error("RefTables", e$message)
-        })
-      } else if (exists("fd_raw") && nrow(fd_raw) > 0) {
-        # Legacy path: use fd_raw if available (normal processing with trials)
-        log_info("Updating reference tables from fd_raw ({nrow(fd_raw)} records)")
-        tryCatch({
-          dates_df <- data.table::data.table(
-            date = unique(fd_raw$date),
-            source = "ForceDecks",
-            updated = Sys.time()
-          )
-          dates_df <- dates_df[!is.na(date)]
           
-          # Deduplication: Ensure unique dates before export
-          dates_df <- unique(dates_df, by = "date")
-          log_info("Deduplication: {nrow(dates_df)} unique dates after removing duplicates")
+        } else if (n_processed == 0) {
+          log_warn("No tests were processed - reference tables NOT updated")
+          log_warn("This preserves change detection for next run to retry")
           
-          if (nrow(dates_df) > 0) {
-            bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-            log_and_store("Updated dates table: {nrow(dates_df)} unique dates exported to BigQuery")
-          }
-          
-          tests_df <- fd_raw[, .(test_ID, vald_id, date, test_type)]
-          tests_df <- tests_df[!is.na(test_ID)]
-          
-          # Deduplication: Ensure unique test_IDs before export
-          tests_df <- unique(tests_df, by = "test_ID")
-          log_info("Deduplication: {nrow(tests_df)} unique test_IDs after removing duplicates")
-          
-          if (nrow(tests_df) > 0) {
-            bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
-            update_status("refs_updated", TRUE)
-            log_and_store("Updated tests table: {nrow(tests_df)} tests exported to BigQuery")
-          }
-        }, error = function(e) {
-          log_error("RefTables update failed: {e$message}")
-          record_error("RefTables", e$message)
-        })
-      } else {
-        log_warn("No test data available to update reference tables")
-      }
-    }
-    
-    } # End of fd_data validation else block
-    
-    log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
-    
-  }, error = function(e) {
-    log_error("ForceDecks branch failed: {e$message}")
-    log_error("Error class: {paste(class(e), collapse=', ')}")
-    log_error("Call stack: {paste(deparse(sys.calls()), collapse=' | ')}")
-    record_error("ForceDecks_Branch", e$message)
-  })
-} else {
-  log_and_store("ForceDecks: No changes detected - skipping")
-}
+        } else {
+          log_warn("tests_raw not available - cannot update reference tables")
+        }
+        
+      }, error = function(e) {
+        log_error("RefTables update failed: {e$message}")
+        record_error("RefTables", e$message)
+      })
 
 # ============================================================================
 # Reset Start Date AS Needed - Nord
