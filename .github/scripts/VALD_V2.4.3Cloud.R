@@ -830,7 +830,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     tbl <- bigrquery::bq_table(ds, table_name)
     
     # PRE-FLIGHT DIAGNOSTICS: Check for common MERGE failure causes
-    # 1. Check for duplicate keys
+    # 1. Check for duplicate keys in NEW data
     if (!(key %in% names(data))) {
       stop(sprintf("Key column '%s' not found in data. Available columns: %s", 
                    key, paste(names(data), collapse = ", ")))
@@ -838,7 +838,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
     dup_keys <- data[[key]][duplicated(data[[key]])]
     if (length(dup_keys) > 0) {
-      log_error("MERGE WILL FAIL: Found {length(dup_keys)} duplicate keys in data")
+      log_error("MERGE WILL FAIL: Found {length(dup_keys)} duplicate keys in NEW data")
       log_error("Example duplicate keys: {paste(head(unique(dup_keys), 5), collapse = ', ')}")
       stop(sprintf("Cannot MERGE: %d duplicate keys found in column '%s'", length(dup_keys), key))
     }
@@ -850,7 +850,48 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       stop(sprintf("Cannot MERGE: %d NULL/empty values in key column '%s'", null_keys, key))
     }
     
-    log_info("Pre-flight checks passed: {nrow(data)} unique keys, no NULLs")
+    log_info("Pre-flight checks passed (new data): {nrow(data)} unique keys, no NULLs")
+    
+    # 3. Query existing keys from BigQuery table (MERGE mode only)
+    if (mode == "MERGE" && table_exists) {
+      log_info("Querying existing keys from BigQuery table '{table_name}'...")
+      
+      existing_keys_result <- tryCatch({
+        query_sql <- sprintf(
+          "SELECT DISTINCT `%s` FROM `%s.%s.%s`",
+          key, CONFIG$gcp_project, CONFIG$bq_dataset, table_name
+        )
+        
+        existing_keys_tbl <- bigrquery::bq_project_query(CONFIG$gcp_project, query_sql)
+        existing_keys_df <- bigrquery::bq_table_download(existing_keys_tbl, n_max = Inf)
+        
+        if (nrow(existing_keys_df) > 0) {
+          existing_keys_vec <- existing_keys_df[[key]]
+          log_info("Found {length(existing_keys_vec)} existing keys in BigQuery table")
+          existing_keys_vec
+        } else {
+          log_info("No existing keys found in BigQuery table (empty table)")
+          character(0)
+        }
+      }, error = function(e) {
+        log_warn("Could not query existing keys: {e$message}")
+        log_warn("Proceeding with MERGE without deduplication check")
+        character(0)
+      })
+      
+      # Check for overlap between new and existing keys
+      if (length(existing_keys_result) > 0) {
+        overlap_keys <- intersect(data[[key]], existing_keys_result)
+        
+        if (length(overlap_keys) > 0) {
+          log_info("Overlap detected: {length(overlap_keys)} keys already exist in table")
+          log_info("MERGE will UPDATE these existing records")
+          log_info("Example overlapping keys: {paste(head(overlap_keys, 5), collapse = ', ')}")
+        } else {
+          log_info("No overlap: all {nrow(data)} keys are new (will be INSERTed)")
+        }
+      }
+    }
     
     # Create table if not exists (WITHOUT expiration)
     table_exists <- bigrquery::bq_table_exists(tbl)
@@ -1070,6 +1111,43 @@ upload_schema_mismatches <- function() {
 }
 
 # ============================================================================
+# Fetch Result Evaluation - Four Scenario Branching
+# ============================================================================
+evaluate_fetch_result <- function(fetch_data) {
+  # Evaluate fetch result and determine processing action
+  # Returns list with flags and action to take
+  
+  tests_count <- if (!is.null(fetch_data$tests)) nrow(fetch_data$tests) else 0
+  trials_count <- if (!is.null(fetch_data$trials)) nrow(fetch_data$trials) else 0
+  fetch_timeout <- isTRUE(fetch_data$fetch_timeout)
+  fetch_complete <- isTRUE(fetch_data$fetch_complete)
+  
+  # Determine processing scenario
+  action <- dplyr::case_when(
+    tests_count > 0 & trials_count > 0 & !fetch_timeout ~ "full_process",
+    tests_count > 0 & trials_count > 0 & fetch_timeout  ~ "partial_process",
+    tests_count > 0 & trials_count == 0                 ~ "tests_only",
+    TRUE                                                 ~ "skip"
+  )
+  
+  result <- list(
+    can_process = tests_count > 0,
+    has_tests = tests_count > 0,
+    has_trials = trials_count > 0,
+    is_partial = fetch_timeout,
+    is_complete = fetch_complete,
+    tests_count = tests_count,
+    trials_count = trials_count,
+    action = action
+  )
+  
+  # Log the evaluation
+  log_info("Fetch evaluation: action={action}, tests={tests_count}, trials={trials_count}, timeout={fetch_timeout}, complete={fetch_complete}")
+  
+  return(result)
+}
+
+# ============================================================================
 # Reconciliation Helper: Retry Missing Test IDs
 # ============================================================================
 reconcile_missing_trials <- function(missing_ids, round_number = 1) {
@@ -1126,8 +1204,8 @@ select_fetch_strategy <- function(expected_tests) {
 
 adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) {
   # Batch-based fetch with graceful timeout handling
-  # Strategy: Fetch all tests first (fast), then fetch trials in batches of 250
-  # Process each batch as it arrives, stop when timeout approaches
+  # Strategy: Manual time checking between batches, not withTimeout wrapper
+  # This preserves accumulated data when timeout approaches
   # Next run will fill gaps via MERGE mode
   
   start_time <- Sys.time()
@@ -1140,18 +1218,18 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
   fetch_complete <- FALSE
   fetch_timeout <- FALSE
   
-  # Step 1: Try the all-in-one fetch with timeout
-  # This is faster when it works and respects the timeout
+  # Step 1: Try the all-in-one fetch with manual time check
+  # This is faster when it works
   result <- tryCatch({
-    R.utils::withTimeout({
-      valdr::get_forcedecks_data()
-    }, timeout = timeout_seconds)
+    # Check if we have enough time for all-in-one fetch (reserve 60s buffer)
+    remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     
-  }, TimeoutException = function(e) {
-    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
-    log_warn("ForceDecks all-in-one fetch TIMEOUT after {elapsed}s")
-    log_warn("Will switch to batch-based fetch strategy")
-    NULL
+    if (remaining < 120) {
+      log_warn("Insufficient time for all-in-one fetch ({round(remaining, 1)}s), using batch strategy")
+      NULL
+    } else {
+      valdr::get_forcedecks_data()
+    }
     
   }, error = function(e) {
     elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
@@ -1180,28 +1258,22 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
     ))
   }
   
-  # Step 2: All-in-one failed (timeout or error)
+  # Step 2: All-in-one failed (error or insufficient time)
   # Use batch-based strategy: fetch all tests, then fetch trials in batches
   log_info("Starting batch-based fetch strategy...")
   
   # Step 2a: Fetch all tests (fast - typically < 2 minutes)
   tests_result <- tryCatch({
     remaining_time <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    fetch_timeout_limit <- min(remaining_time - 60, 120)  # Max 2 minutes, reserve 60s buffer
     
-    if (fetch_timeout_limit > 10) {
-      log_info("Fetching all tests (timeout: {round(fetch_timeout_limit, 1)}s)...")
-      R.utils::withTimeout({
-        valdr::get_forcedecks_tests_only()
-      }, timeout = fetch_timeout_limit)
-    } else {
-      log_warn("Insufficient time remaining ({round(fetch_timeout_limit, 1)}s) - aborting")
+    if (remaining_time < 30) {
+      log_warn("Insufficient time remaining ({round(remaining_time, 1)}s) - aborting")
       NULL
+    } else {
+      log_info("Fetching all tests (time remaining: {round(remaining_time, 1)}s)...")
+      valdr::get_forcedecks_tests_only()
     }
     
-  }, TimeoutException = function(e) {
-    log_error("Tests-only fetch timed out - cannot proceed")
-    NULL
   }, error = function(e) {
     log_error("Tests-only fetch failed: {e$message}")
     NULL
@@ -1340,14 +1412,17 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   fetch_timeout <- FALSE
   
   result <- tryCatch({
-    R.utils::withTimeout({
+    # Check if we have enough time before starting fetch
+    remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    
+    if (remaining < 30) {
+      log_warn("Insufficient time for Nordbord fetch ({round(remaining, 1)}s)")
+      fetch_timeout <- TRUE
+      NULL
+    } else {
+      log_info("Fetching Nordbord data (time remaining: {round(remaining, 1)}s)...")
       valdr::get_nordbord_data()
-    }, timeout = timeout_seconds)
-  }, TimeoutException = function(e) {
-    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
-    log_warn("Nordbord fetch TIMEOUT after {elapsed}s")
-    fetch_timeout <<- TRUE
-    NULL
+    }
   }, error = function(e) {
     elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
     log_error("Nordbord API error after {elapsed}s: {e$message}")
@@ -2612,37 +2687,30 @@ if (fd_changed) {
       # Skip to next section  
     } else {
     
-    # Track if fetch was complete or partial
-    fetch_was_complete <- isTRUE(fd_data$fetch_complete)
-    fetch_had_timeout <- isTRUE(fd_data$fetch_timeout)
+    # Evaluate fetch result using four-scenario branching
+    fetch_eval <- evaluate_fetch_result(fd_data)
     
-    update_status("fd_fetch_complete", fetch_was_complete)
-    update_status("fd_fetch_timeout", fetch_had_timeout)
+    # Update status flags
+    update_status("fd_fetch_complete", fetch_eval$is_complete)
+    update_status("fd_fetch_timeout", fetch_eval$is_partial)
     
-    if (fetch_had_timeout) {
-      log_warn("Fetch was incomplete due to timeout - processing available data")
+    # Log scenario-specific messages
+    if (fetch_eval$action == "full_process") {
+      log_info("Scenario: FULL_PROCESS - Complete data with tests and trials")
+    } else if (fetch_eval$action == "partial_process") {
+      log_warn("Scenario: PARTIAL_PROCESS - Timeout occurred, processing available data")
       log_warn("Subsequent runs will backfill missing data via MERGE")
+    } else if (fetch_eval$action == "tests_only") {
+      log_warn("Scenario: TESTS_ONLY - Have tests but no trials (likely timeout)")
+      log_warn("Will update tests table only, trials will be fetched in next run")
+    } else {
+      log_warn("Scenario: SKIP - No processable data")
     }
     
-    tests_count <- if (!is.null(fd_data$tests)) nrow(fd_data$tests) else 0
-    trials_count <- if (!is.null(fd_data$trials)) nrow(fd_data$trials) else 0
-    
-    # Diagnostic logging
-    log_and_store("Fetch results: tests_count={tests_count}, trials_count={trials_count}, fetch_complete={fetch_was_complete}, fetch_timeout={fetch_had_timeout}")
-    
-    # Process data if we have tests AND trials, OR if we timed out with partial data
-    # In timeout scenario, we might have tests but incomplete trials - still worth processing
-    has_processable_data <- (tests_count > 0 && trials_count > 0) || 
-                            (fetch_had_timeout && tests_count > 0)
-    
-    log_and_store("has_processable_data={has_processable_data} (calculated from: tests_count={tests_count}, trials_count={trials_count}, fetch_had_timeout={fetch_had_timeout})")
-    
-    if (!has_processable_data) {
-      log_warn("No processable ForceDecks data (tests: {tests_count}, trials: {trials_count}, timeout: {fetch_had_timeout})")
+    # Process based on evaluation result
+    if (!fetch_eval$can_process) {
+      log_warn("No processable ForceDecks data (action: {fetch_eval$action})")
     } else {
-      if (tests_count > 0 && trials_count == 0) {
-        log_warn("Have tests but no trials (likely timeout) - will update tests table only")
-      }
       update_status("fd_fetched", TRUE)
       
       profiles    <- fd_data$profiles
@@ -2699,7 +2767,7 @@ if (fd_changed) {
       # ========================================================================
       # Only process trials if we have them; if timeout occurred with no trials,
       # we'll skip to updating reference tables at the end
-      if (trials_count > 0) {
+      if (fetch_eval$has_trials) {
         log_and_store("Pivoting trials: {nrow(trials_raw)} records...")
         log_and_store("Trial structure check: columns={paste(names(trials_raw), collapse=', ')}")
       
@@ -3274,8 +3342,8 @@ if (fd_changed) {
               update_status("refs_updated", TRUE)
               log_and_store("Updated tests table: {nrow(tests_df)} tests exported to BigQuery")
               
-              # Log processing outcome
-              if (trials_count == 0) {
+              # Log processing outcome based on fetch evaluation
+              if (!fetch_eval$has_trials) {
                 log_warn("Tests exported without trial data - subsequent runs will process trials via MERGE")
               }
             }
