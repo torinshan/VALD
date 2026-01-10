@@ -494,6 +494,22 @@ if (nchar(client_id) == 0 || nchar(client_secret) == 0 || nchar(tenant_id) == 0)
   quit(status = 1)
 }
 
+# Pre-populate keyring to prevent credential retrieval issues
+# This forces valdr to use fresh credentials each run instead of cached values
+tryCatch({
+  if (!LOCAL_MODE && Sys.getenv("KEYRING_BACKEND") == "env") {
+    suppressWarnings({
+      keyring::key_set_with_value("valdr", "client_id", client_id)
+      keyring::key_set_with_value("valdr", "client_secret", client_secret)
+      keyring::key_set_with_value("valdr", "tenant_id", tenant_id)
+    })
+    cat("Keyring pre-populated with VALD credentials\n")
+  }
+}, error = function(e) {
+  # Keyring not available, valdr will use environment variables fallback
+  cat("Keyring not available (expected in cloud), using environment variables\n")
+})
+
 # Set credentials using valdr package
 tryCatch({
   valdr::set_credentials(client_id, client_secret, tenant_id, region)
@@ -501,6 +517,20 @@ tryCatch({
 }, error = function(e) {
   cat("FATAL: Failed to set VALD credentials:", conditionMessage(e), "\n")
   quit(status = 1)
+})
+
+# Clear any cached access tokens to force fresh authentication
+tryCatch({
+  if (!LOCAL_MODE) {
+    # Delete cached access token if it exists to force refresh
+    suppressWarnings({
+      tryCatch(keyring::key_delete("valdr", "access_token"), error = function(e) NULL)
+    })
+    cat("Cleared cached access token to force fresh authentication\n")
+  }
+}, error = function(e) {
+  # Non-fatal - just log
+  cat("Note: Could not clear cached token (may not exist)\n")
 })
 
 # Set start date for API queries
@@ -843,64 +873,112 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     return(local_upsert(data, table_name, key, mode, partition_field, cluster_fields))
   }
   
-  # Cloud: Write to BigQuery
-  tryCatch({
-    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
-    tbl <- bigrquery::bq_table(ds, table_name)
+  # Cloud: Write to BigQuery with retry logic
+  max_retries <- 3
+  retry_count <- 0
+  staging_tbl <- NULL
+  
+  while (retry_count < max_retries) {
+    result <- tryCatch({
+      ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+      tbl <- bigrquery::bq_table(ds, table_name)
+      
+      # Create table if not exists (WITHOUT expiration)
+      if (!bigrquery::bq_table_exists(tbl)) {
+        log_info("Creating BigQuery table: {table_name} (no expiration)")
+        # Explicitly create table with no expiration
+        bigrquery::bq_table_create(
+          tbl, 
+          fields = bigrquery::as_bq_fields(data),
+          expiration_time = NULL  # No expiration
+        )
+      }
+      
+      if (mode == "TRUNCATE") {
+        bigrquery::bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
+        log_info("Wrote {table_name}: {nrow(data)} rows (TRUNCATE)")
+      } else {
+        # MERGE mode: Use staging table + MERGE SQL
+        staging_name <- paste0(table_name, "_staging_", format(Sys.time(), "%Y%m%d%H%M%S"))
+        staging_tbl <- bigrquery::bq_table(ds, staging_name)
+        
+        # Upload to staging (also with no expiration)
+        bigrquery::bq_table_upload(staging_tbl, data, write_disposition = "WRITE_TRUNCATE")
+        log_info("Created staging table: {staging_name}")
+        
+        # Build column lists for MERGE
+        update_cols <- setdiff(names(data), key)
+        update_clause <- paste(sapply(update_cols, function(col) {
+          paste0("T.`", col, "` = S.`", col, "`")
+        }), collapse = ", ")
+        
+        insert_cols <- paste0("`", names(data), "`", collapse = ", ")
+        insert_vals <- paste0("S.`", names(data), "`", collapse = ", ")
+        
+        merge_sql <- glue::glue("
+          MERGE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}` T
+          USING `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{staging_name}` S
+          ON T.`{key}` = S.`{key}`
+          WHEN MATCHED THEN
+            UPDATE SET {update_clause}
+          WHEN NOT MATCHED THEN
+            INSERT ({insert_cols})
+            VALUES ({insert_vals})
+        ")
+        
+        log_info("Executing MERGE for {table_name}...")
+        
+        # Execute merge with error capture
+        job <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+        
+        # Wait for job to complete and check status
+        bigrquery::bq_job_wait(job)
+        
+        # Drop staging table
+        tryCatch({
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Dropped staging table: {staging_name}")
+        }, error = function(e) {
+          log_warn("Failed to drop staging table {staging_name}: {e$message}")
+        })
+        
+        log_info("Merged {table_name}: {nrow(data)} rows (MERGE)")
+      }
+      
+      return(TRUE)
+      
+    }, error = function(e) {
+      retry_count <<- retry_count + 1
+      
+      # Clean up staging table if it exists
+      if (!is.null(staging_tbl)) {
+        tryCatch({
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Cleaned up staging table after error")
+        }, error = function(cleanup_err) {
+          log_warn("Could not clean up staging table: {cleanup_err$message}")
+        })
+      }
+      
+      if (retry_count < max_retries) {
+        log_warn("BigQuery upsert failed for {table_name} (attempt {retry_count}/{max_retries}): {e$message}")
+        log_info("Retrying in 2 seconds...")
+        Sys.sleep(2)
+        return(NULL)  # Continue retry loop
+      } else {
+        log_error("BigQuery upsert FAILED for {table_name} after {max_retries} attempts: {e$message}")
+        record_error(paste0("BQ_", table_name), e$message)
+        return(FALSE)
+      }
+    })
     
-    # Create table if not exists (WITHOUT expiration)
-    if (!bigrquery::bq_table_exists(tbl)) {
-      log_info("Creating BigQuery table: {table_name}")
-      bigrquery::bq_table_create(tbl, fields = bigrquery::as_bq_fields(data))
+    # If result is not NULL (success or final failure), break the loop
+    if (!is.null(result)) {
+      return(invisible(result))
     }
-    
-    if (mode == "TRUNCATE") {
-      bigrquery::bq_table_upload(tbl, data, write_disposition = "WRITE_TRUNCATE")
-      log_info("Wrote {table_name}: {nrow(data)} rows (TRUNCATE)")
-    } else {
-      # MERGE mode: Use staging table + MERGE SQL
-      staging_name <- paste0(table_name, "_staging_", format(Sys.time(), "%Y%m%d%H%M%S"))
-      staging_tbl <- bigrquery::bq_table(ds, staging_name)
-      
-      # Upload to staging
-      bigrquery::bq_table_upload(staging_tbl, data, write_disposition = "WRITE_TRUNCATE")
-      
-      # Build column lists for MERGE
-      update_cols <- setdiff(names(data), key)
-      update_clause <- paste(sapply(update_cols, function(col) {
-        paste0("T.`", col, "` = S.`", col, "`")
-      }), collapse = ", ")
-      
-      insert_cols <- paste0("`", names(data), "`", collapse = ", ")
-      insert_vals <- paste0("S.`", names(data), "`", collapse = ", ")
-      
-      merge_sql <- glue::glue("
-        MERGE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}` T
-        USING `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{staging_name}` S
-        ON T.`{key}` = S.`{key}`
-        WHEN MATCHED THEN
-          UPDATE SET {update_clause}
-        WHEN NOT MATCHED THEN
-          INSERT ({insert_cols})
-          VALUES ({insert_vals})
-      ")
-      
-      # Execute merge
-      bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
-      
-      # Drop staging table
-      bigrquery::bq_table_delete(staging_tbl)
-      
-      log_info("Merged {table_name}: {nrow(data)} rows (MERGE)")
-    }
-    
-    invisible(TRUE)
-    
-  }, error = function(e) {
-    log_error("BigQuery upsert failed for {table_name}: {e$message}")
-    record_error(paste0("BQ_", table_name), e$message)
-    invisible(FALSE)
-  })
+  }
+  
+  return(invisible(FALSE))
 }
 
 # Local upsert function (for LOCAL_MODE)
@@ -3076,6 +3154,10 @@ if (fd_changed) {
       # Phase 2: Secondary Tables with V2.4.2 Processing
       # ========================================================================
       log_info("Phase 2: Processing secondary tables with V2.4.2 schemas...")
+      
+      # NOTE: The following test types may not have data in every run.
+      # "No data found" messages are informational, not errors.
+      # Tests are only processed when new data is available from VALD API.
       
       # Process Drop Jump Tests (V2.4.2)
       dj_all <- fd_raw[test_type %in% c("DJ")]
