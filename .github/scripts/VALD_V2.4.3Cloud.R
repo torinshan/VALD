@@ -3453,6 +3453,18 @@ if (fd_changed) {
         log_error("RefTables update failed: {e$message}")
         record_error("RefTables", e$message)
       })
+      
+    }
+    
+    log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
+    
+  }, error = function(e) {
+    log_error("ForceDecks branch failed: {e$message}")
+    record_error("ForceDecks_Branch", e$message)
+  })
+} else {
+  log_and_store("ForceDecks: No changes detected - skipping")
+}
 
 # ============================================================================
 # Reset Start Date AS Needed - Nord
