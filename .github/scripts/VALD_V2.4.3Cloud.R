@@ -858,6 +858,15 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
     log_info("Pre-flight checks passed (new data): {nrow(data)} unique keys, no NULLs")
     
+    # Check if table exists BEFORE using it in conditionals
+    table_exists <- tryCatch({
+      result <- bigrquery::bq_table_exists(tbl)
+      if (is.na(result)) FALSE else result
+    }, error = function(e) {
+      log_warn("Could not check table existence: {e$message}")
+      FALSE
+    })
+    
     # 3. Query existing keys from BigQuery table (MERGE mode only)
     if (mode == "MERGE" && table_exists) {
       log_info("Querying existing keys from BigQuery table '{table_name}'...")
@@ -900,12 +909,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     }
     
     # Create table if not exists (WITHOUT expiration)
-    table_exists <- bigrquery::bq_table_exists(tbl)
-    # Handle potential NA return value from bq_table_exists
-    if (is.na(table_exists)) {
-      log_error("Unable to determine if table {table_name} exists - treating as non-existent")
-      table_exists <- FALSE
-    }
+    # Note: table_exists already assigned above with NA handling
     if (!table_exists) {
       log_info("Creating BigQuery table: {table_name} (no expiration)")
       bigrquery::bq_table_create(
@@ -3518,11 +3522,33 @@ if (nord_changed) {
       log_warn("No Nordbord tests returned")
     } else {
       nord_raw <- nord_data$tests
+      
+      # Deduplicate API response (valdr pagination returns overlapping records)
+      n_raw <- nrow(nord_raw)
+      nord_raw <- unique(nord_raw, by = "testId")
+      n_deduped <- nrow(nord_raw)
+      
+      if (n_raw > n_deduped) {
+        log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed")
+      }
+      
       update_status("nord_fetched", TRUE)
       log_and_store("Fetched {nrow(nord_raw)} Nordbord tests")
       
       # Process with V2.4.2 unilateral detection
       nord_export <- process_nordbord(nord_raw, Vald_roster)
+      
+      # Deduplication: Ensure unique test_IDs before export
+      n_before_dedup <- nrow(nord_export)
+      nord_export <- unique(nord_export, by = "test_ID")
+      n_after_dedup <- nrow(nord_export)
+      
+      if (n_before_dedup > n_after_dedup) {
+        log_warn("NordBord deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
+        log_warn("Retained {n_after_dedup} unique NordBord records for export")
+      } else {
+        log_info("NordBord deduplication: All {n_after_dedup} test_IDs are unique")
+      }
       
       bq_upsert(nord_export, "vald_nord_all", key = "test_ID", mode = "MERGE",
                 partition_field = "date", cluster_fields = c("vald_id"))
