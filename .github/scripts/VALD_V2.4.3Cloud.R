@@ -844,6 +844,9 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
   }
   
   # Cloud: Write to BigQuery
+  staging_tbl <- NULL  # Track staging table for cleanup
+  staging_name <- NULL
+  
   tryCatch({
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, table_name)
@@ -900,6 +903,30 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       # MERGE mode: Use staging table + MERGE SQL
       staging_name <- paste0(table_name, "_staging_", format(Sys.time(), "%Y%m%d%H%M%S"))
       staging_tbl <- bigrquery::bq_table(ds, staging_name)
+      
+      # Create staging table with 1-hour expiration as safety net
+      # This ensures it auto-deletes even if manual cleanup fails
+      log_info("Creating temporary staging table: {staging_name} (1-hour expiration)")
+      tryCatch({
+        bigrquery::bq_table_create(
+          staging_tbl,
+          fields = bigrquery::as_bq_fields(data),
+          expiration_time = Sys.time() + 3600  # 1 hour from now
+        )
+      }, error = function(e) {
+        # If table already exists from previous failed run, delete and recreate
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          log_warn("Staging table {staging_name} already exists, deleting old one")
+          bigrquery::bq_table_delete(staging_tbl)
+          bigrquery::bq_table_create(
+            staging_tbl,
+            fields = bigrquery::as_bq_fields(data),
+            expiration_time = Sys.time() + 3600
+          )
+        } else {
+          stop(e)
+        }
+      })
       
       # Upload to staging
       log_info("Uploading {nrow(data)} rows to staging table: {staging_name}")
@@ -958,12 +985,17 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
       }
       
-      # Success - drop staging table
+      # Success - drop staging table immediately
       tryCatch({
-        bigrquery::bq_table_delete(staging_tbl)
-        log_info("Dropped staging table: {staging_name}")
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Dropped staging table: {staging_name}")
+        } else {
+          log_warn("Staging table {staging_name} already deleted or never existed")
+        }
       }, error = function(e) {
-        log_warn("Failed to drop staging table {staging_name}: {e$message}")
+        log_error("Failed to drop staging table {staging_name}: {e$message}")
+        log_warn("Staging table will auto-expire in 1 hour")
       })
       
       log_info("Merged {table_name}: {nrow(data)} rows (MERGE)")
@@ -978,6 +1010,19 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     log_error("Data shape: {nrow(data)} rows x {ncol(data)} columns")
     log_error("Key column: '{key}' (type: {class(data[[key]])[1]})")
     log_error("Mode: {mode}")
+    
+    # Cleanup staging table if it exists
+    if (!is.null(staging_tbl) && !is.null(staging_name)) {
+      tryCatch({
+        if (bigrquery::bq_table_exists(staging_tbl)) {
+          bigrquery::bq_table_delete(staging_tbl)
+          log_info("Cleaned up staging table {staging_name} after error")
+        }
+      }, error = function(cleanup_err) {
+        log_warn("Could not clean up staging table {staging_name}: {cleanup_err$message}")
+        log_warn("Staging table will auto-expire in 1 hour")
+      })
+    }
     
     record_error(paste0("BQ_", table_name), e$message)
     invisible(FALSE)
