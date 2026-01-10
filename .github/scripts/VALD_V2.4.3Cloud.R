@@ -2599,6 +2599,19 @@ if (fd_changed) {
     
     fd_data <- adaptive_fetch_forcedecks(timeout_seconds = CONFIG$timeout_fd_full)
     
+    # Validate fetch result structure
+    if (is.null(fd_data)) {
+      log_error("adaptive_fetch_forcedecks returned NULL!")
+      log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: NULL fetch result) ===")
+      record_error("ForceDecks_Fetch", "Fetch function returned NULL")
+      # Skip to next section
+    } else if (!is.list(fd_data)) {
+      log_error("adaptive_fetch_forcedecks returned non-list: {class(fd_data)}")
+      log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: Invalid fetch result type) ===")
+      record_error("ForceDecks_Fetch", paste("Fetch returned:", class(fd_data)))
+      # Skip to next section  
+    } else {
+    
     # Track if fetch was complete or partial
     fetch_was_complete <- isTRUE(fd_data$fetch_complete)
     fetch_had_timeout <- isTRUE(fd_data$fetch_timeout)
@@ -3312,10 +3325,14 @@ if (fd_changed) {
       }
     }
     
+    } # End of fd_data validation else block
+    
     log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
     
   }, error = function(e) {
     log_error("ForceDecks branch failed: {e$message}")
+    log_error("Error class: {paste(class(e), collapse=', ')}")
+    log_error("Call stack: {paste(deparse(sys.calls()), collapse=' | ')}")
     record_error("ForceDecks_Branch", e$message)
   })
 } else {
