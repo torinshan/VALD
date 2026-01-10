@@ -96,7 +96,14 @@ determine_exit_code <- function() {
     return(0)
   }
   
-  # Total failure
+  # If we had a graceful timeout (API timeout only), still return success
+  # The script should not fail just because API calls timed out
+  if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout)) {
+    log_warn("Run completed with API timeout(s) but no data processed - will retry in next run")
+    return(0)
+  }
+  
+  # Total failure (no timeout, just couldn't process anything)
   return(1)
 }
 
@@ -1330,6 +1337,7 @@ safe_fetch_forcedecks <- adaptive_fetch_forcedecks
 
 safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   start_time <- Sys.time()
+  fetch_timeout <- FALSE
   
   result <- tryCatch({
     R.utils::withTimeout({
@@ -1338,6 +1346,7 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   }, TimeoutException = function(e) {
     elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
     log_warn("Nordbord fetch TIMEOUT after {elapsed}s")
+    fetch_timeout <<- TRUE
     NULL
   }, error = function(e) {
     elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
@@ -1349,7 +1358,11 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   
   if (is.null(result)) {
     log_warn("Nordbord fetch returned NULL after {elapsed} seconds")
-    return(list(tests = data.table::data.table()))
+    return(list(
+      tests = data.table::data.table(),
+      fetch_complete = FALSE,
+      fetch_timeout = fetch_timeout
+    ))
   }
   
   if (!"tests" %in% names(result)) {
@@ -1364,6 +1377,10 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   
   tests_n <- if (!is.null(result$tests)) nrow(result$tests) else 0
   log_info("Nordbord fetch complete in {elapsed}s: {tests_n} tests")
+  
+  # Add fetch status flags
+  result$fetch_complete <- !fetch_timeout && tests_n > 0
+  result$fetch_timeout <- fetch_timeout
   
   return(result)
 }
