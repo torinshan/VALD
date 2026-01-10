@@ -165,6 +165,8 @@ CONFIG <- list(
   timeout_nordbord = 300,
   max_same_cursor = 3,
   max_retries = 3,
+  min_time_for_full_fetch = 120L, # Minimum time needed for all-in-one fetch
+  min_time_for_operation = 30L,   # Minimum time needed for any operation
   
   # Sequential Processing Configuration
   batch_size = 250L,            # Batch size for sequential trial fetching
@@ -1281,10 +1283,10 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
   # Step 1: Try the all-in-one fetch with manual time check
   # This is faster when it works
   result <- tryCatch({
-    # Check if we have enough time for all-in-one fetch (reserve 60s buffer)
+    # Check if we have enough time for all-in-one fetch (reserve buffer)
     remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     
-    if (remaining < 120) {
+    if (remaining < CONFIG$min_time_for_full_fetch) {
       log_warn("Insufficient time for all-in-one fetch ({round(remaining, 1)}s), using batch strategy")
       NULL
     } else {
@@ -1326,7 +1328,7 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
   tests_result <- tryCatch({
     remaining_time <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     
-    if (remaining_time < 30) {
+    if (remaining_time < CONFIG$min_time_for_operation) {
       log_warn("Insufficient time remaining ({round(remaining_time, 1)}s) - aborting")
       NULL
     } else {
@@ -1377,7 +1379,7 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
     # Calculate remaining time
     time_remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
     
-    if (time_remaining < 30) {
+    if (time_remaining < CONFIG$min_time_for_operation) {
       log_warn("Insufficient time ({round(time_remaining, 1)}s) to fetch trials")
       log_warn("Will process tests metadata only")
       fetch_timeout <- TRUE
@@ -1397,7 +1399,7 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
         # Check time budget BEFORE each batch
         remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
         
-        if (remaining < 30) {
+        if (remaining < CONFIG$min_time_for_operation) {
           log_warn("Timeout approaching after batch {i-1}/{num_batches} - stopping")
           log_warn("Processed {tests_processed}/{total_tests} tests ({round(100*tests_processed/total_tests, 1)}%)")
           fetch_timeout <- TRUE
@@ -1405,10 +1407,8 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
         }
         
         batch_tests <- batch_list[[i]]
-        start_idx <- ((i - 1) * CONFIG$batch_size) + 1
-        end_idx <- min(i * CONFIG$batch_size, total_tests)
         
-        log_info("Batch {i}/{num_batches}: fetching trials for tests {start_idx}-{end_idx}...")
+        log_info("Batch {i}/{num_batches}: fetching trials for {nrow(batch_tests)} tests...")
         
         # Fetch trials for this batch
         batch_trials <- tryCatch({
@@ -1480,7 +1480,7 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
     # Check if we have enough time before starting fetch
     remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
     
-    if (remaining < 30) {
+    if (remaining < CONFIG$min_time_for_operation) {
       log_warn("Insufficient time for Nordbord fetch ({round(remaining, 1)}s)")
       fetch_timeout <- TRUE
       NULL
