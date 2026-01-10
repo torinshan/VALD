@@ -733,7 +733,8 @@ upload_logs_to_bigquery <- function() {
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     log_tbl <- bigrquery::bq_table(ds, "vald_processing_log")
     
-    if (!bigrquery::bq_table_exists(log_tbl)) {
+    log_table_exists <- bigrquery::bq_table_exists(log_tbl)
+    if (is.na(log_table_exists) || !log_table_exists) {
       log_info("Creating vald_processing_log table...")
       bigrquery::bq_table_create(log_tbl, fields = bigrquery::as_bq_fields(log_entries_dt))
     }
@@ -807,7 +808,8 @@ read_bq_table <- function(table_name) {
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, table_name)
     
-    if (!bigrquery::bq_table_exists(tbl)) {
+    table_exists <- bigrquery::bq_table_exists(tbl)
+    if (is.na(table_exists) || !table_exists) {
       log_info("BigQuery table does not exist: {table_name}")
       return(data.table::data.table())
     }
@@ -876,6 +878,11 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
     # Create table if not exists (WITHOUT expiration)
     table_exists <- bigrquery::bq_table_exists(tbl)
+    # Handle potential NA return value from bq_table_exists
+    if (is.na(table_exists)) {
+      log_error("Unable to determine if table {table_name} exists - treating as non-existent")
+      table_exists <- FALSE
+    }
     if (!table_exists) {
       log_info("Creating BigQuery table: {table_name} (no expiration)")
       bigrquery::bq_table_create(
@@ -911,17 +918,18 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         bigrquery::bq_table_create(
           staging_tbl,
           fields = bigrquery::as_bq_fields(data),
-          expiration_time = Sys.time() + 3600  # 1 hour from now
+          expiration_time = as.numeric(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
         )
       }, error = function(e) {
         # If table already exists from previous failed run, delete and recreate
-        if (bigrquery::bq_table_exists(staging_tbl)) {
+        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
+        if (!is.na(staging_exists) && staging_exists) {
           log_warn("Staging table {staging_name} already exists, deleting old one")
           bigrquery::bq_table_delete(staging_tbl)
           bigrquery::bq_table_create(
             staging_tbl,
             fields = bigrquery::as_bq_fields(data),
-            expiration_time = Sys.time() + 3600
+            expiration_time = as.numeric(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
           )
         } else {
           stop(e)
@@ -976,8 +984,11 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         
         # Try to drop staging table even on failure
         tryCatch({
-          bigrquery::bq_table_delete(staging_tbl)
-          log_info("Cleaned up staging table after failure")
+          staging_exists <- bigrquery::bq_table_exists(staging_tbl)
+          if (!is.na(staging_exists) && staging_exists) {
+            bigrquery::bq_table_delete(staging_tbl)
+            log_info("Cleaned up staging table after failure")
+          }
         }, error = function(cleanup_err) {
           log_warn("Could not clean up staging table: {cleanup_err$message}")
         })
@@ -987,7 +998,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       # Success - drop staging table immediately
       tryCatch({
-        if (bigrquery::bq_table_exists(staging_tbl)) {
+        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
+        if (!is.na(staging_exists) && staging_exists) {
           bigrquery::bq_table_delete(staging_tbl)
           log_info("Dropped staging table: {staging_name}")
         } else {
@@ -1014,7 +1026,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     # Cleanup staging table if it exists
     if (!is.null(staging_tbl) && !is.null(staging_name)) {
       tryCatch({
-        if (bigrquery::bq_table_exists(staging_tbl)) {
+        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
+        if (!is.na(staging_exists) && staging_exists) {
           bigrquery::bq_table_delete(staging_tbl)
           log_info("Cleaned up staging table {staging_name} after error")
         }
@@ -1145,7 +1158,8 @@ upload_schema_mismatches <- function() {
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, "schema_mismatches")
     
-    if (!bigrquery::bq_table_exists(tbl)) {
+    mismatch_table_exists <- bigrquery::bq_table_exists(tbl)
+    if (is.na(mismatch_table_exists) || !mismatch_table_exists) {
       bigrquery::bq_table_create(tbl, fields = bigrquery::as_bq_fields(schema_mismatches))
     }
     
