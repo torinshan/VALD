@@ -169,7 +169,7 @@ CONFIG <- list(
   min_time_for_operation = 30L,   # Minimum time needed for any operation
   
   # Sequential Processing Configuration
-  batch_size = 250L,            # Batch size for sequential trial fetching
+  batch_size = 50L,             # Batch size for sequential trial fetching (reduced for frequent time checks)
   time_buffer_seconds = 60L,    # Reserve time for final processing
   
   # BigQuery Configuration (from environment)
@@ -1264,88 +1264,64 @@ select_fetch_strategy <- function(expected_tests) {
   return("sequential")
 }
 
-adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) {
-  # Batch-based fetch with graceful timeout handling
-  # Strategy: Manual time checking between batches, not withTimeout wrapper
-  # This preserves accumulated data when timeout approaches
-  # Next run will fill gaps via MERGE mode
+adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
+                                       batch_size = 50L,
+                                       time_buffer_seconds = 60L) {
+  # Corrected adaptive fetch with batch-level time estimation
+  # Key improvements:
+  # 1. Smaller batch size (50 instead of 250) for frequent time checks
+  # 2. Dynamic sec/test estimation based on actual batch performance
+  # 3. Predictive timeout check: stops before starting batch that won't complete
+  # 4. Config fallback defaults (no hard dependency on global CONFIG)
+  
+  # Time estimation constants
+  INITIAL_SEC_PER_TEST <- 3      # Conservative initial estimate (seconds)
+  TIME_ESTIMATE_NEW_WEIGHT <- 0.7  # Weight for new measurement in rolling average
+  TIME_ESTIMATE_OLD_WEIGHT <- 0.3  # Weight for old estimate in rolling average
+  MIN_REMAINING_SECONDS <- 30      # Minimum time threshold before stopping
+  REQUIRED_TIME_FRACTION <- 0.5    # Safety buffer: require only 50% of estimated time (conservative)
   
   start_time <- Sys.time()
-  log_info("Starting ForceDecks fetch (timeout: {timeout_seconds}s)...")
+  log_info("Starting ForceDecks fetch (timeout: {timeout_seconds}s, batch_size: {batch_size})...")
   
   # Initialize result containers
   all_profiles <- data.table::data.table()
   all_tests <- data.table::data.table()
   all_trials <- data.table::data.table()
-  fetch_complete <- FALSE
   fetch_timeout <- FALSE
   
-  # Step 1: Try the all-in-one fetch with manual time check
-  # This is faster when it works
-  result <- tryCatch({
-    # Check if we have enough time for all-in-one fetch (reserve buffer)
-    remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    
-    if (remaining < CONFIG$min_time_for_full_fetch) {
-      log_warn("Insufficient time for all-in-one fetch ({round(remaining, 1)}s), using batch strategy")
-      NULL
-    } else {
-      valdr::get_forcedecks_data()
-    }
-    
-  }, error = function(e) {
-    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
-    log_warn("ForceDecks all-in-one fetch ERROR after {elapsed}s: {e$message}")
-    log_warn("Will switch to batch-based fetch strategy")
-    NULL
-  })
-  
-  elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
-  
-  # If all-in-one fetch succeeded, return it
-  if (!is.null(result)) {
-    all_profiles <- if (!is.null(result$profiles)) data.table::as.data.table(result$profiles) else data.table::data.table()
-    all_tests <- if (!is.null(result$tests)) data.table::as.data.table(result$tests) else data.table::data.table()
-    all_trials <- if (!is.null(result$trials)) data.table::as.data.table(result$trials) else data.table::data.table()
-    
-    log_info("ForceDecks fetch complete in {elapsed}s: {nrow(all_profiles)} profiles, {nrow(all_tests)} tests, {nrow(all_trials)} trials")
-    
-    return(list(
-      profiles = all_profiles,
-      result_definitions = data.table::data.table(),
-      tests = all_tests,
-      trials = all_trials,
-      fetch_complete = TRUE,
-      fetch_timeout = FALSE
-    ))
+  # Helper: elapsed time in seconds
+  elapsed_secs <- function() {
+    as.numeric(difftime(Sys.time(), start_time, units = "secs"))
   }
   
-  # Step 2: All-in-one failed (error or insufficient time)
-  # Use batch-based strategy: fetch all tests, then fetch trials in batches
-  log_info("Starting batch-based fetch strategy...")
+  # Helper: remaining time before buffer
+  time_remaining <- function() {
+    timeout_seconds - elapsed_secs() - time_buffer_seconds
+  }
   
-  # Step 2a: Fetch all tests (fast - typically < 2 minutes)
-  tests_result <- tryCatch({
-    remaining_time <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-    
-    if (remaining_time < CONFIG$min_time_for_operation) {
-      log_warn("Insufficient time remaining ({round(remaining_time, 1)}s) - aborting")
-      NULL
-    } else {
-      log_info("Fetching all tests (time remaining: {round(remaining_time, 1)}s)...")
-      valdr::get_forcedecks_tests_only()
-    }
-    
+  # -------------------------------------------------------------------------
+  # Step 1: Fetch profiles (fast, ~10-30 sec)
+  # -------------------------------------------------------------------------
+  log_info("Step 1/3: Fetching profiles...")
+  
+  all_profiles <- tryCatch({
+    result <- valdr::get_profiles_only()
+    if (!is.null(result)) data.table::as.data.table(result) else data.table::data.table()
   }, error = function(e) {
-    log_error("Tests-only fetch failed: {e$message}")
-    NULL
+    log_warn("Profiles fetch failed: {e$message}")
+    data.table::data.table()
   })
   
-  # If we can't get tests, we're done
-  if (is.null(tests_result) || length(tests_result) == 0) {
-    log_error("Could not retrieve tests from API - no data to process")
+  log_info("Profiles: {nrow(all_profiles)} retrieved ({round(elapsed_secs())}s elapsed)")
+  
+  # -------------------------------------------------------------------------
+  # Step 2: Fetch all tests (fast, ~1-2 min)
+  # -------------------------------------------------------------------------
+  if (time_remaining() < 60) {
+    log_error("Insufficient time for tests fetch ({round(time_remaining())}s remaining)")
     return(list(
-      profiles = data.table::data.table(),
+      profiles = all_profiles,
       result_definitions = data.table::data.table(),
       tests = data.table::data.table(),
       trials = data.table::data.table(),
@@ -1354,114 +1330,127 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) 
     ))
   }
   
-  # We have tests!
-  all_tests <- data.table::as.data.table(tests_result)
-  log_info("Retrieved {nrow(all_tests)} tests from API")
+  log_info("Step 2/3: Fetching all tests...")
   
-  # Step 2b: Fetch profiles (fast, optional)
-  profiles_result <- tryCatch({
-    valdr::get_forcedecks_profiles()
+  all_tests <- tryCatch({
+    result <- valdr::get_forcedecks_tests_only()
+    if (!is.null(result)) data.table::as.data.table(result) else data.table::data.table()
   }, error = function(e) {
-    log_warn("Could not fetch profiles: {e$message}")
-    NULL
+    log_error("Tests fetch failed: {e$message}")
+    data.table::data.table()
   })
   
-  if (!is.null(profiles_result)) {
-    all_profiles <- data.table::as.data.table(profiles_result)
-    log_info("Retrieved {nrow(all_profiles)} profiles")
+  if (nrow(all_tests) == 0) {
+    log_error("No tests retrieved - nothing to process")
+    return(list(
+      profiles = all_profiles,
+      result_definitions = data.table::data.table(),
+      tests = data.table::data.table(),
+      trials = data.table::data.table(),
+      fetch_complete = FALSE,
+      fetch_timeout = FALSE
+    ))
   }
   
-  # Step 2c: Fetch trials in batches using sequential processing with time checks
-  # Batch size of 250 is optimal for API efficiency
-  if (nrow(all_tests) > 0) {
-    log_info("Fetching trials in batches of {CONFIG$batch_size} tests...")
+  log_info("Tests: {nrow(all_tests)} retrieved ({round(elapsed_secs())}s elapsed)")
+  
+  # -------------------------------------------------------------------------
+  # Step 3: Fetch trials in small batches with time checks
+  # -------------------------------------------------------------------------
+  log_info("Step 3/3: Fetching trials in batches of {batch_size}...")
+  
+  total_tests <- nrow(all_tests)
+  num_batches <- ceiling(total_tests / batch_size)
+  
+  log_info("Processing {total_tests} tests across {num_batches} batches")
+  log_info("Time remaining for trials: {round(time_remaining())}s")
+  
+  # Estimate time per test from first batch (using conservative constant)
+  estimated_sec_per_test <- INITIAL_SEC_PER_TEST
+  
+  trials_list <- vector("list", num_batches)
+  batches_completed <- 0
+  
+  for (i in seq_len(num_batches)) {
     
-    # Calculate remaining time
-    time_remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
+    remaining <- time_remaining()
     
-    if (time_remaining < CONFIG$min_time_for_operation) {
-      log_warn("Insufficient time ({round(time_remaining, 1)}s) to fetch trials")
-      log_warn("Will process tests metadata only")
+    # Estimate if we have time for this batch
+    estimated_batch_time <- batch_size * estimated_sec_per_test
+    
+    # Safety check: Stop if remaining time < max(MIN_REMAINING_SECONDS, REQUIRED_TIME_FRACTION * estimated_batch_time)
+    # The safety buffer accounts for API variability and ensures we don't start a batch
+    # that will likely exceed the timeout, causing GitHub Actions to kill the job mid-batch
+    if (remaining < max(MIN_REMAINING_SECONDS, estimated_batch_time * REQUIRED_TIME_FRACTION)) {
+      log_warn("Stopping before batch {i}/{num_batches} - only {round(remaining)}s remaining")
+      log_warn("Estimated batch time: {round(estimated_batch_time)}s")
       fetch_timeout <- TRUE
-    } else {
-      # Split tests into batches using helper function
-      batch_list <- split_into_batches(all_tests, CONFIG$batch_size)
-      total_tests <- nrow(all_tests)
-      num_batches <- length(batch_list)
-      
-      log_info("Processing {total_tests} tests in {num_batches} batches of {CONFIG$batch_size}")
-      log_info("Time available: {round(time_remaining, 1)}s")
-      
-      trials_list <- vector("list", num_batches)
-      tests_processed <- 0
-      
-      for (i in seq_along(batch_list)) {
-        # Check time budget BEFORE each batch
-        remaining <- timeout_seconds - elapsed_since(start_time) - CONFIG$time_buffer_seconds
-        
-        if (remaining < CONFIG$min_time_for_operation) {
-          log_warn("Timeout approaching after batch {i-1}/{num_batches} - stopping")
-          log_warn("Processed {tests_processed}/{total_tests} tests ({round(100*tests_processed/total_tests, 1)}%)")
-          fetch_timeout <- TRUE
-          break
-        }
-        
-        batch_tests <- batch_list[[i]]
-        
-        log_info("Batch {i}/{num_batches}: fetching trials for {nrow(batch_tests)} tests...")
-        
-        # Fetch trials for this batch
-        batch_trials <- tryCatch({
-          valdr::get_forcedecks_trials_only(batch_tests)
-        }, error = function(e) {
-          log_warn("Batch {i} trial fetch failed: {e$message}")
-          NULL
-        })
-        
-        if (!is.null(batch_trials) && length(batch_trials) > 0) {
-          trials_list[[i]] <- data.table::as.data.table(batch_trials)
-          tests_processed <- tests_processed + nrow(batch_tests)
-          batch_elapsed <- round(elapsed_since(start_time), 1)
-          log_info("Batch {i}/{num_batches}: {nrow(trials_list[[i]])} trial records fetched (elapsed: {batch_elapsed}s, processed: {tests_processed}/{total_tests} tests)")
-        } else {
-          log_warn("Batch {i} returned no trial data")
-        }
-        
-        # Progress logging every 5 batches
-        if (i %% 5 == 0) {
-          log_info("Progress: {i}/{num_batches} batches ({round(elapsed_since(start_time))}s elapsed)")
-        }
-      }
-      
-      # Combine all trial batches (remove NULLs first)
-      trials_list_clean <- compact(trials_list)
-      if (length(trials_list_clean) > 0) {
-        all_trials <- data.table::rbindlist(trials_list_clean, use.names = TRUE, fill = TRUE)
-        log_info("Combined trials: {nrow(all_trials)} total trial records from {tests_processed} tests")
-        
-        if (tests_processed < total_tests) {
-          log_warn("Partial fetch: processed {tests_processed}/{total_tests} tests ({round(100*tests_processed/total_tests, 1)}%)")
-          log_warn("Next run will fetch remaining {total_tests - tests_processed} tests via MERGE")
-          fetch_timeout <- TRUE
-        }
-      } else {
-        log_warn("No trial data retrieved - will process tests metadata only")
-        fetch_timeout <- TRUE
-      }
-      
-      # Mark as complete only if we processed all tests
-      fetch_complete <- !fetch_timeout && tests_processed == total_tests
+      break
     }
+    
+    # Calculate batch indices
+    start_idx <- ((i - 1) * batch_size) + 1
+    end_idx <- min(i * batch_size, total_tests)
+    batch_tests <- all_tests[start_idx:end_idx, ]
+    
+    batch_start <- Sys.time()
+    log_info("Batch {i}/{num_batches}: tests {start_idx}-{end_idx} ({nrow(batch_tests)} tests, {round(remaining)}s remaining)")
+    
+    # Fetch trials for this batch
+    batch_trials <- tryCatch({
+      valdr::get_forcedecks_trials_only(batch_tests)
+    }, error = function(e) {
+      log_warn("Batch {i} failed: {e$message}")
+      NULL
+    })
+    
+    batch_elapsed <- as.numeric(difftime(Sys.time(), batch_start, units = "secs"))
+    
+    # Update time estimate based on actual performance
+    # Verify we have valid data and non-zero elapsed time to prevent division by zero
+    if (!is.null(batch_trials) && nrow(batch_tests) > 0 && batch_elapsed > 0) {
+      actual_sec_per_test <- batch_elapsed / nrow(batch_tests)
+      # Weighted average balances responsiveness to current API speed while smoothing out outliers
+      # Store old value before updating to maintain proper weighted average
+      old_estimate <- estimated_sec_per_test
+      estimated_sec_per_test <- (TIME_ESTIMATE_NEW_WEIGHT * actual_sec_per_test) + 
+                                (TIME_ESTIMATE_OLD_WEIGHT * old_estimate)
+    }
+    
+    if (!is.null(batch_trials) && length(batch_trials) > 0) {
+      trials_list[[i]] <- data.table::as.data.table(batch_trials)
+      batches_completed <- batches_completed + 1
+      log_info("Batch {i} complete: {nrow(trials_list[[i]])} trials in {round(batch_elapsed, 1)}s ({round(batch_elapsed/nrow(batch_tests), 2)}s/test)")
+    } else {
+      log_warn("Batch {i} returned no data")
+    }
+  }
+  
+  # -------------------------------------------------------------------------
+  # Combine results
+  # -------------------------------------------------------------------------
+  # Use compact() helper to remove NULL elements efficiently
+  trials_list <- compact(trials_list)
+  
+  if (length(trials_list) > 0) {
+    all_trials <- data.table::rbindlist(trials_list, use.names = TRUE, fill = TRUE)
+    log_info("Combined {length(trials_list)} batches: {nrow(all_trials)} total trials")
   } else {
-    log_warn("No tests to fetch trials for")
+    all_trials <- data.table::data.table()
+    log_warn("No trial data retrieved")
     fetch_timeout <- TRUE
   }
   
-  elapsed_final <- round(elapsed_since(start_time), 1)
-  log_info("ForceDecks fetch finished in {elapsed_final}s: {nrow(all_profiles)} profiles, {nrow(all_tests)} tests, {nrow(all_trials)} trials")
+  fetch_complete <- !fetch_timeout && (batches_completed == num_batches)
+  
+  log_info("Fetch finished in {round(elapsed_secs())}s")
+  log_info("Result: {nrow(all_profiles)} profiles, {nrow(all_tests)} tests, {nrow(all_trials)} trials")
+  log_info("Status: complete={fetch_complete}, timeout={fetch_timeout}, batches={batches_completed}/{num_batches}")
   
   return(list(
     profiles = all_profiles,
+    # result_definitions field maintained for compatibility with downstream processing
+    # Used by process_nordbord() and other functions that expect this field in the return structure
     result_definitions = data.table::data.table(),
     tests = all_tests,
     trials = all_trials,
@@ -2737,7 +2726,11 @@ if (fd_changed) {
     log_and_store("=== FORCEDECKS BRANCH START ===")
     log_and_store("API Start date: {CONFIG$start_date}")
     
-    fd_data <- adaptive_fetch_forcedecks(timeout_seconds = CONFIG$timeout_fd_full)
+    fd_data <- adaptive_fetch_forcedecks(
+      timeout_seconds = CONFIG$timeout_fd_full,
+      batch_size = CONFIG$batch_size,
+      time_buffer_seconds = CONFIG$time_buffer_seconds
+    )
     
     # Validate fetch result structure
     if (is.null(fd_data)) {
