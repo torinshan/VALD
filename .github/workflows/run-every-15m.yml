@@ -80,7 +80,6 @@ jobs:
           any::valdr
           any::logger
           any::readxl
-          any::furrr
         # Prevent dev dependencies from being installed
         dependencies: '"hard"'
         cache: true

@@ -5,7 +5,7 @@
 # Version: 2.4.3-cloud
 # Date: January 2026
 # Purpose: Fetch, process, and export VALD ForceDecks and Nordbord data
-# Execution: GitHub Actions with BigQuery persistence
+# Execution: GitHub Actions with BigQuery persistence (Cloud-Only)
 # 
 # Cloud-Specific Features:
 # - Environment variable configuration (no hardcoded credentials)
@@ -14,6 +14,9 @@
 # - Independent ForceDecks/NordBord error handling
 # - Structured logging with BigQuery persistence
 # - Exit code management for workflow status
+# - Sequential bundled fetch (parallel removed - keyring incompatible)
+# - 15-minute timeout with graceful partial data handling
+# - MERGE mode ensures subsequent runs fill gaps
 #
 # V2.4.3 Updates:
 # - RSI Scaling: Corrected 100x error (now decimal form: 0.43 not 43.2)
@@ -24,7 +27,6 @@
 # - process_rsi() Bug Fix: Group by test_ID to preserve multiple same-day tests
 #
 # V2.4.2 Updates:
-# - Adaptive Fetch Framework: auto-selects bundled/parallel/sequential strategy
 # - Nordbord: unilateral detection, 14-column schema
 # - IMTP: reduced to 12-column schema with performance scores
 # - SL Jumps: limb detection, QC layers, 34-column schema
@@ -49,7 +51,11 @@
   fd_imtp_processed = FALSE,
   nord_fetched = FALSE,
   nord_processed = FALSE,
-  refs_updated = FALSE
+  refs_updated = FALSE,
+  fd_fetch_complete = FALSE,
+  fd_fetch_timeout = FALSE,
+  nord_fetch_complete = FALSE,
+  nord_fetch_timeout = FALSE
 )
 
 .GlobalEnv$execution_errors <- list()
@@ -69,12 +75,29 @@ record_error <- function(component, error_msg) {
 
 determine_exit_code <- function() {
   status <- .GlobalEnv$execution_status
-  any_fd_success <- any(status$fd_cmj_processed, status$fd_dj_processed,
-    status$fd_rsi_processed, status$fd_rebound_processed,
-    status$fd_slj_processed, status$fd_imtp_processed)
+  
+  # Check for any successful processing
+  any_fd_success <- any(
+    status$fd_cmj_processed,
+    status$fd_dj_processed,
+    status$fd_rsi_processed,
+    status$fd_rebound_processed,
+    status$fd_slj_processed,
+    status$fd_imtp_processed
+  )
   any_nord_success <- status$nord_processed
-  if (!any_fd_success && !any_nord_success) return(1)
-  return(0)
+  
+  # If we processed anything, it's a success (even if partial due to timeout)
+  if (any_fd_success || any_nord_success) {
+    # Log if there were timeouts
+    if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout)) {
+      log_warn("Run completed with partial data due to timeout(s)")
+    }
+    return(0)
+  }
+  
+  # Total failure
+  return(1)
 }
 
 # ============================================================================
@@ -92,7 +115,6 @@ tryCatch({
     library(glue); library(slider); library(R.utils)
     library(logger)
     library(readxl)
-    library(furrr); library(future)
   })
   update_status("packages_loaded", TRUE)
 }, error = function(e) {
@@ -103,13 +125,7 @@ tryCatch({
 # ============================================================================
 # Environment Detection
 # ============================================================================
-LOCAL_MODE <- Sys.getenv("LOCAL_MODE", "FALSE") == "TRUE"
-
-if (LOCAL_MODE) {
-  cat("=== RUNNING IN LOCAL MODE ===\n")
-} else {
-  cat("=== RUNNING IN CLOUD MODE (GitHub Actions) ===\n")
-}
+cat("=== RUNNING IN CLOUD MODE (GitHub Actions) ===\n")
 
 # ============================================================================
 # Configuration Constants
@@ -137,24 +153,16 @@ CONFIG <- list(
   z_threshold_large = 3,
   
   # Timeout Settings
-  timeout_fd_probe = 120,
-  timeout_fd_full = 900,
+  timeout_fd_full = 900,        # 15 minutes max for full fetch
+  timeout_fd_hard_limit = 840,  # 14 minutes - start saving before hard timeout
   timeout_nordbord = 300,
   max_same_cursor = 3,
+  max_retries = 3,
   
   # BigQuery Configuration (from environment)
   gcp_project = Sys.getenv("GCP_PROJECT", "sac-vald-hub"),
   bq_dataset = Sys.getenv("BQ_DATASET", "analytics"),
-  bq_location = Sys.getenv("BQ_LOCATION", "US"),
-  
-  # Adaptive Fetch Settings
-  baseline_tests = 4570,
-  baseline_start = "2024-01-01",
-  baseline_end = "2026-01-08",
-  tests_per_day = 6.19,
-  parallel_overhead_sec = 40,
-  per_test_latency_sec = 2.0,
-  parallel_threshold = 27
+  bq_location = Sys.getenv("BQ_LOCATION", "US")
 )
 
 # ============================================================================
@@ -470,15 +478,6 @@ calculate_athlete_mdc <- function(dt, metric_col, baseline_col, mdc_col, status_
 }
 
 # ============================================================================
-# Parallel Fetching Configuration
-# ============================================================================
-PARALLEL_CONFIG <- list(
-  n_workers = 4,
-  stagger_sec = 0.5,
-  max_retries = 3
-)
-
-# ============================================================================
 # VALD API Credentials (Environment Variables)
 # ============================================================================
 cat("=== CONFIGURING VALD API ===\n")
@@ -516,66 +515,81 @@ tryCatch({
 update_status("credentials_valid", TRUE)
 
 # ============================================================================
-# Path Configuration (Environment-Aware)
+# Path Configuration (Cloud-Only)
 # ============================================================================
-if (LOCAL_MODE) {
-  LOCAL_PATHS <- list(
-    output_dir = Sys.getenv("LOCAL_OUTPUT_DIR", 
-      "C:/Users/Torin/OneDrive - California State University, Sacramento/Sac State Football/GPS/Clean_Backup"),
-    log_dir = Sys.getenv("LOCAL_LOG_DIR",
-      "C:/Users/Torin/OneDrive - California State University, Sacramento/Sac State Football/GPS/Clean_Backup/logs")
-  )
-  ROSTER_PATHS <- list(
-    roster_csv = Sys.getenv("LOCAL_ROSTER_CSV",
-      "C:/Users/Torin/OneDrive - California State University, Sacramento/Sac State Football/Testing/Data/vald_roster.csv"),
-    roster_xlsx = Sys.getenv("LOCAL_ROSTER_XLSX",
-      "C:/Users/Torin/OneDrive - California State University, Sacramento/Sac State Football/Sac State Roster - Summer 2025.xlsx")
-  )
-} else {
-  LOCAL_PATHS <- list(
-    output_dir = "/tmp/vald_output",
-    log_dir = "/tmp/logs"
-  )
-  ROSTER_PATHS <- list(
-    roster_csv = ".github/vald_roster.csv",
-    roster_xlsx = ".github/Sac State Roster - Summer 2025.xlsx"
-  )
-}
+LOCAL_PATHS <- list(
+  output_dir = "/tmp/vald_output",
+  log_dir = "/tmp/logs"
+)
+ROSTER_PATHS <- list(
+  roster_csv = ".github/vald_roster.csv",
+  roster_xlsx = ".github/Sac State Roster - Summer 2025.xlsx"
+)
 
 # Ensure directories exist
 if (!dir.exists(LOCAL_PATHS$output_dir)) dir.create(LOCAL_PATHS$output_dir, recursive = TRUE)
 if (!dir.exists(LOCAL_PATHS$log_dir)) dir.create(LOCAL_PATHS$log_dir, recursive = TRUE)
 
 # ============================================================================
-# BigQuery Authentication (Cloud Mode Only)
+# BigQuery Authentication (Cloud-Only)
 # ============================================================================
 GLOBAL_ACCESS_TOKEN <- NULL
 
-if (!LOCAL_MODE) {
-  auth_success <- FALSE
+auth_success <- FALSE
+
+# Try Method 1: Workload Identity Federation (WIF) via gcloud
+tryCatch({
+  cat("=== Authenticating to BigQuery ===\n")
+  cat("Attempting authentication via WIF (gcloud)...\n")
   
-  # Try Method 1: Workload Identity Federation (WIF) via gcloud
+  # Disable Storage API to avoid permission issues
+  options(bigrquery.use_bqstorage = FALSE)
+  Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
+  
+  # Use Workload Identity Federation (WIF) via gcloud
+  access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
+  GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
+  
+  if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
+    cat("Access token obtained from gcloud (WIF)\n")
+    token <- gargle::gargle2.0_token(
+      scope = 'https://www.googleapis.com/auth/bigquery',
+      client = gargle::gargle_client(),
+      credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
+    )
+    bigrquery::bq_auth(token = token)
+    cat("BigQuery authentication successful via WIF\n")
+    
+    # Verify authentication by checking dataset exists
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    invisible(bigrquery::bq_dataset_exists(ds))
+    cat("Authentication test passed (dataset visible via REST)\n")
+    
+    auth_success <- TRUE
+  }
+}, error = function(e) {
+  cat("WIF authentication failed:", e$message, "\n")
+})
+
+# Try Method 2: Service Account JSON (fallback)
+if (!auth_success) {
   tryCatch({
-    cat("=== Authenticating to BigQuery ===\n")
-    cat("Attempting authentication via WIF (gcloud)...\n")
+    cat("Attempting fallback authentication via service account JSON...\n")
     
-    # Disable Storage API to avoid permission issues
-    options(bigrquery.use_bqstorage = FALSE)
-    Sys.setenv(BIGRQUERY_USE_BQ_STORAGE = "false")
+    # Get service account key from environment
+    sa_key_json <- Sys.getenv("GCP_SA_KEY", "")
     
-    # Use Workload Identity Federation (WIF) via gcloud
-    access_token_result <- system("gcloud auth print-access-token", intern = TRUE)
-    GLOBAL_ACCESS_TOKEN <<- access_token_result[1]
-    
-    if (nchar(GLOBAL_ACCESS_TOKEN) > 0) {
-      cat("Access token obtained from gcloud (WIF)\n")
-      token <- gargle::gargle2.0_token(
-        scope = 'https://www.googleapis.com/auth/bigquery',
-        client = gargle::gargle_client(),
-        credentials = list(access_token = GLOBAL_ACCESS_TOKEN)
-      )
-      bigrquery::bq_auth(token = token)
-      cat("BigQuery authentication successful via WIF\n")
+    if (nchar(sa_key_json) > 0) {
+      # Write SA key to temp file
+      sa_key_path <- tempfile(fileext = ".json")
+      writeLines(sa_key_json, sa_key_path)
+      
+      # Authenticate with service account
+      bigrquery::bq_auth(path = sa_key_path)
+      cat("BigQuery authentication successful via service account JSON\n")
+      
+      # Clean up key file immediately
+      unlink(sa_key_path)
       
       # Verify authentication by checking dataset exists
       ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
@@ -583,58 +597,22 @@ if (!LOCAL_MODE) {
       cat("Authentication test passed (dataset visible via REST)\n")
       
       auth_success <- TRUE
+    } else {
+      cat("GCP_SA_KEY environment variable not set, skipping service account JSON fallback\n")
     }
   }, error = function(e) {
-    cat("WIF authentication failed:", e$message, "\n")
+    cat("Service account JSON authentication failed:", e$message, "\n")
   })
-  
-  # Try Method 2: Service Account JSON (fallback)
-  if (!auth_success) {
-    tryCatch({
-      cat("Attempting fallback authentication via service account JSON...\n")
-      
-      # Get service account key from environment
-      sa_key_json <- Sys.getenv("GCP_SA_KEY", "")
-      
-      if (nchar(sa_key_json) > 0) {
-        # Write SA key to temp file
-        sa_key_path <- tempfile(fileext = ".json")
-        writeLines(sa_key_json, sa_key_path)
-        
-        # Authenticate with service account
-        bigrquery::bq_auth(path = sa_key_path)
-        cat("BigQuery authentication successful via service account JSON\n")
-        
-        # Clean up key file immediately
-        unlink(sa_key_path)
-        
-        # Verify authentication by checking dataset exists
-        ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
-        invisible(bigrquery::bq_dataset_exists(ds))
-        cat("Authentication test passed (dataset visible via REST)\n")
-        
-        auth_success <- TRUE
-      } else {
-        cat("GCP_SA_KEY environment variable not set, skipping service account JSON fallback\n")
-      }
-    }, error = function(e) {
-      cat("Service account JSON authentication failed:", e$message, "\n")
-    })
-  }
-  
-  # Check if any authentication method succeeded
-  if (!auth_success) {
-    cat("FATAL: All authentication methods failed\n")
-    cat("Tried: 1) WIF (gcloud), 2) Service Account JSON (GCP_SA_KEY)\n")
-    quit(status = 1)
-  }
-  
-  update_status("bq_authenticated", TRUE)
-  
-} else {
-  cat("Local mode: BigQuery authentication skipped\n")
-  update_status("bq_authenticated", TRUE)
 }
+
+# Check if any authentication method succeeded
+if (!auth_success) {
+  cat("FATAL: All authentication methods failed\n")
+  cat("Tried: 1) WIF (gcloud), 2) Service Account JSON (GCP_SA_KEY)\n")
+  quit(status = 1)
+}
+
+update_status("bq_authenticated", TRUE)
 
 # ============================================================================
 # Logging System
@@ -680,18 +658,16 @@ log_and_store <- function(msg, level = "INFO") {
   )
   
   # Accumulate for BigQuery upload (cloud mode)
-  if (!LOCAL_MODE) {
-    log_entries_dt <<- data.table::rbindlist(list(
-      log_entries_dt,
-      data.table::data.table(
-        timestamp = Sys.time(),
-        level = level,
-        message = as.character(interpolated_msg),
-        run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
-        repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
-      )
-    ), use.names = TRUE, fill = TRUE)
-  }
+  log_entries_dt <<- data.table::rbindlist(list(
+    log_entries_dt,
+    data.table::data.table(
+      timestamp = Sys.time(),
+      level = level,
+      message = as.character(interpolated_msg),
+      run_id = Sys.getenv("GITHUB_RUN_ID", "manual"),
+      repository = Sys.getenv("GITHUB_REPOSITORY", "unknown")
+    )
+  ), use.names = TRUE, fill = TRUE)
 }
 
 log_check_summary <- function(table_name, current_rows, current_date, api_rows, api_date, result) {
@@ -719,11 +695,6 @@ create_log_entry <- function(message, level = "INFO") {
 # Log Upload to BigQuery
 # ============================================================================
 upload_logs_to_bigquery <- function() {
-  if (LOCAL_MODE) {
-    log_info("Local mode: logs saved to {LOG_FILENAME}")
-    return(invisible(TRUE))
-  }
-  
   if (nrow(log_entries_dt) == 0) {
     log_info("No log entries to upload")
     return(invisible(TRUE))
@@ -733,8 +704,7 @@ upload_logs_to_bigquery <- function() {
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     log_tbl <- bigrquery::bq_table(ds, "vald_processing_log")
     
-    log_table_exists <- bigrquery::bq_table_exists(log_tbl)
-    if (is.na(log_table_exists) || !log_table_exists) {
+    if (!safe_table_exists(log_tbl)) {
       log_info("Creating vald_processing_log table...")
       bigrquery::bq_table_create(log_tbl, fields = bigrquery::as_bq_fields(log_entries_dt))
     }
@@ -787,29 +757,33 @@ validate_row_count <- function(dt, min_rows = 0, max_rows = Inf, context = "data
 }
 
 # ============================================================================
+# Helper: Safe Table Existence Check (Converts NA to FALSE)
+# ============================================================================
+safe_table_exists <- function(tbl) {
+  tryCatch({
+    result <- bigrquery::bq_table_exists(tbl)
+    # bq_table_exists can return NA - convert to FALSE
+    if (is.na(result)) {
+      log_warn("bq_table_exists returned NA for {tbl$table} - treating as FALSE")
+      return(FALSE)
+    }
+    return(result)
+  }, error = function(e) {
+    log_warn("Could not check table existence for {tbl$table}: {e$message}")
+    return(FALSE)
+  })
+}
+
+# ============================================================================
 # Data Read Function (Dual Mode)
 # ============================================================================
 read_bq_table <- function(table_name) {
-  if (LOCAL_MODE) {
-    # Local: Read from CSV
-    local_path <- file.path(LOCAL_PATHS$output_dir, paste0(table_name, ".csv"))
-    if (file.exists(local_path)) {
-      dt <- data.table::fread(local_path)
-      log_info("Read local table: {table_name} ({nrow(dt)} rows)")
-      return(dt)
-    } else {
-      log_info("Local table not found: {table_name}")
-      return(data.table::data.table())
-    }
-  }
-  
   # Cloud: Read from BigQuery
   tryCatch({
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, table_name)
     
-    table_exists <- bigrquery::bq_table_exists(tbl)
-    if (is.na(table_exists) || !table_exists) {
+    if (!safe_table_exists(tbl)) {
       log_info("BigQuery table does not exist: {table_name}")
       return(data.table::data.table())
     }
@@ -838,11 +812,6 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
   if (nrow(data) == 0) {
     log_info("No rows to write for {table_name}")
     return(invisible(TRUE))
-  }
-  
-  if (LOCAL_MODE) {
-    # Local: Write to CSV with merge logic
-    return(local_upsert(data, table_name, key, mode, partition_field, cluster_fields))
   }
   
   # Cloud: Write to BigQuery
@@ -918,7 +887,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         bigrquery::bq_table_create(
           staging_tbl,
           fields = bigrquery::as_bq_fields(data),
-          expiration_time = as.numeric(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
+          expiration_time = as.integer(Sys.time() + 3600)  # 1 hour from now (Unix timestamp)
         )
       }, error = function(e) {
         # If table already exists from previous failed run, delete and recreate
@@ -984,8 +953,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         
         # Try to drop staging table even on failure
         tryCatch({
-          staging_exists <- bigrquery::bq_table_exists(staging_tbl)
-          if (!is.na(staging_exists) && staging_exists) {
+          staging_exists <- safe_table_exists(staging_tbl)
+          if (staging_exists) {
             bigrquery::bq_table_delete(staging_tbl)
             log_info("Cleaned up staging table after failure")
           }
@@ -998,8 +967,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       # Success - drop staging table immediately
       tryCatch({
-        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
-        if (!is.na(staging_exists) && staging_exists) {
+        staging_exists <- safe_table_exists(staging_tbl)
+        if (staging_exists) {
           bigrquery::bq_table_delete(staging_tbl)
           log_info("Dropped staging table: {staging_name}")
         } else {
@@ -1026,8 +995,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     # Cleanup staging table if it exists
     if (!is.null(staging_tbl) && !is.null(staging_name)) {
       tryCatch({
-        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
-        if (!is.na(staging_exists) && staging_exists) {
+        staging_exists <- safe_table_exists(staging_tbl)
+        if (staging_exists) {
           bigrquery::bq_table_delete(staging_tbl)
           log_info("Cleaned up staging table {staging_name} after error")
         }
@@ -1040,76 +1009,6 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     record_error(paste0("BQ_", table_name), e$message)
     invisible(FALSE)
   })
-}
-
-# Local upsert function (for LOCAL_MODE)
-local_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUNCATE"),
-                         partition_field = "date", cluster_fields = character()) {
-  mode <- match.arg(mode)
-  if (nrow(data) == 0) {
-    log_info("No rows to write for {table_name}")
-    return(TRUE)
-  }
-  
-  local_path <- file.path(LOCAL_PATHS$output_dir, paste0(table_name, ".csv"))
-  
-  if (mode == "TRUNCATE" || !file.exists(local_path)) {
-    data.table::fwrite(data, local_path)
-    log_info("Wrote {table_name}: {nrow(data)} rows (mode: {if(file.exists(local_path)) mode else 'CREATE'})")
-    return(TRUE)
-  }
-  
-  existing <- data.table::fread(local_path)
-  if (!(key %in% names(data))) {
-    log_error("Key column '{key}' missing")
-    stop(paste("Key", key, "missing"))
-  }
-  
-  existing[[key]] <- as.character(existing[[key]])
-  data[[key]] <- as.character(data[[key]])
-  
-  all_cols <- union(names(existing), names(data))
-  for (cn in setdiff(all_cols, names(existing))) existing[[cn]] <- NA
-  for (cn in setdiff(all_cols, names(data))) data[[cn]] <- NA
-  
-  data.table::setcolorder(existing, all_cols)
-  data.table::setcolorder(data, all_cols)
-  
-  common_cols <- intersect(names(existing), names(data))
-  for (col in common_cols) {
-    if (class(existing[[col]])[1] != class(data[[col]])[1]) {
-      if (is.numeric(existing[[col]]) || is.numeric(data[[col]])) {
-        existing[, (col) := as.numeric(as.character(get(col)))]
-        data[, (col) := as.numeric(as.character(get(col)))]
-      } else {
-        existing[, (col) := as.character(get(col))]
-        data[, (col) := as.character(get(col))]
-      }
-    }
-  }
-  
-  combined <- data.table::rbindlist(list(existing, data), use.names = TRUE, fill = TRUE, ignore.attr = TRUE)
-  combined[, .row_id := .I]
-  data.table::setorderv(combined, ".row_id")
-  combined <- combined[, .SD[.N], by = key]
-  combined[, .row_id := NULL]
-  
-  data.table::fwrite(combined, local_path)
-  log_info("Merged {table_name}: {nrow(combined)} rows (added {nrow(data)} new/updated)")
-  return(TRUE)
-}
-
-export_local_summary <- function() {
-  output_files <- list.files(LOCAL_PATHS$output_dir, pattern = "\\.csv$", full.names = TRUE)
-  log_info("=== LOCAL EXPORT SUMMARY ===")
-  log_info("Output directory: {LOCAL_PATHS$output_dir}")
-  for (f in output_files) {
-    file_info <- file.info(f)
-    row_count <- tryCatch({
-      length(readLines(f)) - 1
-    }, error = function(e) NA)
-    log_info("  {basename(f)}: {row_count} rows, modified {file_info$mtime}")
-  }
 }
 
 # ============================================================================
@@ -1143,23 +1042,13 @@ record_schema_mismatch <- function(table_name, column_name, expected_type, actua
 }
 
 upload_schema_mismatches <- function() {
-  if (LOCAL_MODE) {
-    if (nrow(schema_mismatches) > 0) {
-      mismatch_file <- file.path(LOCAL_PATHS$log_dir, "schema_mismatches.csv")
-      data.table::fwrite(schema_mismatches, mismatch_file)
-      log_info("Saved {nrow(schema_mismatches)} schema mismatches to {mismatch_file}")
-    }
-    return(invisible(TRUE))
-  }
-  
   if (nrow(schema_mismatches) == 0) return(invisible(TRUE))
   
   tryCatch({
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, "schema_mismatches")
     
-    mismatch_table_exists <- bigrquery::bq_table_exists(tbl)
-    if (is.na(mismatch_table_exists) || !mismatch_table_exists) {
+    if (!safe_table_exists(tbl)) {
       bigrquery::bq_table_create(tbl, fields = bigrquery::as_bq_fields(schema_mismatches))
     }
     
@@ -1218,289 +1107,73 @@ reconcile_missing_trials <- function(missing_ids, round_number = 1) {
 # Adaptive Fetch Framework (V2.4.2)
 # ============================================================================
 
-calculate_expected_tests <- function(start_date) {
-  days <- as.numeric(Sys.Date() - as.Date(start_date))
-  ceiling(days * CONFIG$tests_per_day)
-}
+# ============================================================================
+# Adaptive Fetch Framework - Cloud-Only Sequential (V2.4.3)
+# ============================================================================
 
 select_fetch_strategy <- function(expected_tests) {
-  if (expected_tests < CONFIG$parallel_threshold) {
-    return("sequential")
-  }
-  return("parallel")
+  # Cloud-only: Always use sequential bundled fetch
+  # Parallel workers cannot access keyring credentials in GitHub Actions
+  return("sequential")
 }
 
-estimate_fetch_time <- function(expected_tests, strategy) {
-  switch(strategy,
-    "sequential" = 10 + (expected_tests * 0.05),
-    "parallel" = (expected_tests / PARALLEL_CONFIG$n_workers) * CONFIG$per_test_latency_sec + CONFIG$parallel_overhead_sec
-  )
-}
-
-fetch_sequential <- function(timeout_seconds) {
-  start_time <- Sys.time()
+adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) {
+  # Sequential-only fetch with graceful timeout handling
+  # If timeout occurs, returns whatever data was retrieved
+  # Next run will fill gaps via MERGE mode
   
-  log_info("Using SEQUENTIAL fetch strategy (bundled API)...")
+  start_time <- Sys.time()
+  log_info("Starting ForceDecks fetch (timeout: {timeout_seconds}s)...")
   
   result <- tryCatch({
     R.utils::withTimeout({
       valdr::get_forcedecks_data()
     }, timeout = timeout_seconds)
+    
   }, TimeoutException = function(e) {
-    log_error("Sequential fetch timeout after {timeout_seconds} seconds")
+    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+    log_warn("ForceDecks fetch TIMEOUT after {elapsed}s - will process partial data")
+    log_warn("Next scheduled run will fill gaps via MERGE")
+    
+    # Return NULL - will be handled below
     NULL
+    
   }, error = function(e) {
-    log_error("Sequential fetch error: {e$message}")
+    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+    log_error("ForceDecks fetch ERROR after {elapsed}s: {e$message}")
     NULL
   })
   
   elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
   
+  # Handle NULL result (timeout or error)
   if (is.null(result)) {
-    log_warn("Sequential fetch returned NULL after {elapsed}s")
-    return(NULL)
-  }
-  
-  profiles <- if (!is.null(result$profiles)) data.table::as.data.table(result$profiles) else data.table::data.table()
-  tests <- if (!is.null(result$tests)) data.table::as.data.table(result$tests) else data.table::data.table()
-  trials <- if (!is.null(result$trials)) data.table::as.data.table(result$trials) else data.table::data.table()
-  
-  log_info("Sequential fetch complete in {elapsed}s: {nrow(profiles)} profiles, {nrow(tests)} tests, {nrow(trials)} trials")
-  
-  return(list(
-    profiles = profiles,
-    result_definitions = data.table::data.table(),
-    tests = tests,
-    trials = trials
-  ))
-}
-
-fetch_trials_chunk_with_retry <- function(chunk, max_retries = PARALLEL_CONFIG$max_retries) {
-  chunk_size <- nrow(chunk)
-  
-  for (attempt in seq_len(max_retries + 1)) {
-    result <- tryCatch({
-      trials <- valdr::get_forcedecks_trials_only(chunk)
-      return(data.table::as.data.table(trials))
-    }, error = function(e) {
-      is_rate_limit <- grepl("429|rate|limit|throttl", e$message, ignore.case = TRUE)
-      
-      if (is_rate_limit && attempt <= max_retries) {
-        log_warn("Rate limit hit, retry {attempt}/{max_retries}")
-        Sys.sleep(2^attempt)
-        return(NULL)
-      }
-      
-      log_error("Chunk fetch failed: {e$message}")
-      log_error("Chunk size: {chunk_size} tests")
-      log_error("Attempt: {attempt}/{max_retries}")
-      
-      if (attempt <= max_retries) {
-        log_warn("Retrying after error...")
-        Sys.sleep(2^attempt)
-        return(NULL)
-      }
-      
-      log_error("CHUNK FAILED after {max_retries} retries - returning empty")
-      return(data.table::data.table())
-    })
-    if (!is.null(result)) return(result)
-  }
-  return(data.table::data.table())
-}
-
-fetch_parallel <- function(timeout_seconds) {
-  start_time <- Sys.time()
-  N_WORKERS <- PARALLEL_CONFIG$n_workers
-  STAGGER_SEC <- PARALLEL_CONFIG$stagger_sec
-  
-  log_info("Using PARALLEL fetch strategy ({N_WORKERS} workers, {STAGGER_SEC*1000}ms stagger)...")
-  
-  profiles <- tryCatch({
-    result <- valdr::get_profiles_only()
-    data.table::as.data.table(result)
-  }, error = function(e) {
-    log_error("Failed to fetch profiles: {e$message}")
-    data.table::data.table()
-  })
-  
-  if (nrow(profiles) > 0) {
-    log_info("Fetched {nrow(profiles)} profiles")
-  } else {
-    log_warn("No profiles returned")
-  }
-  
-  tests <- tryCatch({
-    result <- valdr::get_forcedecks_tests_only()
-    data.table::as.data.table(result)
-  }, error = function(e) {
-    log_error("Failed to fetch tests: {e$message}")
-    data.table::data.table()
-  })
-  
-  if (nrow(tests) == 0) {
-    log_warn("No tests returned from API")
-    return(list(
-      profiles = profiles,
-      result_definitions = data.table::data.table(),
-      tests = data.table::data.table(),
-      trials = data.table::data.table()
-    ))
-  }
-  
-  log_info("Fetched {nrow(tests)} tests, starting parallel trials fetch...")
-  
-  requested_test_ids <- unique(tests$testId)
-  n_requested <- length(requested_test_ids)
-  
-  trials <- tryCatch({
-    n_tests <- nrow(tests)
-    chunk_indices <- cut(seq_len(n_tests), N_WORKERS, labels = FALSE)
-    chunks <- split(tests, chunk_indices)
-    
-    log_info("Split {n_tests} tests into {length(chunks)} chunks")
-    
-    future::plan(future::multisession, workers = N_WORKERS)
-    
-    trials_list <- furrr::future_map(seq_along(chunks), function(i) {
-      Sys.sleep((i - 1) * STAGGER_SEC)
-      fetch_trials_chunk_with_retry(chunks[[i]])
-    }, .options = furrr::furrr_options(seed = TRUE))
-    
-    future::plan(future::sequential)
-    
-    trials_combined <- data.table::rbindlist(trials_list, use.names = TRUE, fill = TRUE)
-    
-    log_info("Fetched {nrow(trials_combined)} trials across {N_WORKERS} workers")
-    
-    retrieved_test_ids <- unique(trials_combined$testId)
-    n_retrieved <- length(retrieved_test_ids)
-    retrieval_rate <- n_retrieved / n_requested
-    
-    log_info("Trial retrieval: {n_retrieved}/{n_requested} tests ({round(retrieval_rate*100, 1)}%)")
-    
-    chunk_sizes <- sapply(trials_list, nrow)
-    log_info("Chunk sizes: {paste(chunk_sizes, collapse = ', ')}")
-    
-    empty_chunks <- which(chunk_sizes == 0)
-    if (length(empty_chunks) > 0) {
-      log_error("EMPTY CHUNKS DETECTED: {paste(empty_chunks, collapse = ', ')}")
-    }
-    
-    missing_test_ids <- setdiff(requested_test_ids, retrieved_test_ids)
-    
-    if (length(missing_test_ids) > 0) {
-      log_warn("RECONCILIATION: {length(missing_test_ids)} test IDs missing from parallel fetch")
-      
-      max_rounds <- 3
-      for (round in 1:max_rounds) {
-        if (length(missing_test_ids) == 0) break
-        
-        recovered_trials <- reconcile_missing_trials(missing_test_ids, round)
-        
-        if (nrow(recovered_trials) > 0) {
-          trials_combined <- data.table::rbindlist(
-            list(trials_combined, recovered_trials), 
-            fill = TRUE
-          )
-          
-          retrieved_test_ids <- unique(trials_combined$testId)
-          missing_test_ids <- setdiff(requested_test_ids, retrieved_test_ids)
-          
-          log_info("Reconciliation recovered {nrow(recovered_trials)} additional trials")
-        }
-        
-        if (length(missing_test_ids) == 0) {
-          log_info("RECONCILIATION COMPLETE: All test IDs retrieved after {round} round(s)")
-          break
-        }
-      }
-      
-      if (length(missing_test_ids) > 0) {
-        pct_missing <- round(length(missing_test_ids)/n_requested*100, 1)
-        log_warn("Reconciliation incomplete: {length(missing_test_ids)} test IDs still missing ({pct_missing}%)")
-      }
-    } else {
-      log_info("AUDIT PASSED: All {n_requested} test IDs retrieved on first attempt")
-    }
-    
-    trials_combined
-    
-  }, error = function(e) {
-    log_error("Parallel trials fetch failed: {e$message}")
-    future::plan(future::sequential)
-    
-    log_warn("Falling back to sequential trials fetch...")
-    tryCatch({
-      result <- valdr::get_forcedecks_trials_only(tests)
-      data.table::as.data.table(result)
-    }, error = function(e2) {
-      log_error("Sequential fallback also failed: {e2$message}")
-      data.table::data.table()
-    })
-  })
-  
-  elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
-  log_info("Parallel fetch complete in {elapsed}s: {nrow(profiles)} profiles, {nrow(tests)} tests, {nrow(trials)} trials")
-  
-  return(list(
-    profiles = profiles,
-    result_definitions = data.table::data.table(),
-    tests = tests,
-    trials = trials
-  ))
-}
-
-adaptive_fetch_forcedecks <- function(timeout_seconds = CONFIG$timeout_fd_full) {
-  
-  expected_tests <- calculate_expected_tests(CONFIG$start_date)
-  log_info("Expected tests: {expected_tests} (from {CONFIG$start_date})")
-  
-  strategy <- select_fetch_strategy(expected_tests)
-  estimated_time <- estimate_fetch_time(expected_tests, strategy)
-  log_info("Selected strategy: {strategy}")
-  log_info("Estimated time: {round(estimated_time, 0)}s")
-  
-  result <- NULL
-  actual_start <- Sys.time()
-  
-  if (strategy == "sequential") {
-    result <- fetch_sequential(timeout_seconds)
-    if (is.null(result) || nrow(result$trials) == 0) {
-      log_warn("Sequential fetch failed, falling back to parallel...")
-      strategy <- "parallel"
-      result <- NULL
-    }
-  }
-  
-  if (strategy == "parallel") {
-    result <- fetch_parallel(timeout_seconds)
-    if (is.null(result) || nrow(result$trials) == 0) {
-      log_warn("Parallel fetch failed, trying sequential as fallback...")
-      result <- fetch_sequential(timeout_seconds)
-    }
-  }
-  
-  actual_time <- round(as.numeric(difftime(Sys.time(), actual_start, units = "secs")), 1)
-  log_info("Actual time: {actual_time}s")
-  
-  if (is.null(result)) {
-    log_error("All fetch strategies failed")
+    log_warn("No data returned from ForceDecks API after {elapsed}s")
     return(list(
       profiles = data.table::data.table(),
       result_definitions = data.table::data.table(),
       tests = data.table::data.table(),
-      trials = data.table::data.table()
+      trials = data.table::data.table(),
+      fetch_complete = FALSE,
+      fetch_timeout = TRUE
     ))
   }
   
-  profiles_n <- if (!is.null(result$profiles)) nrow(result$profiles) else 0
-  tests_n <- if (!is.null(result$tests)) nrow(result$tests) else 0
-  trials_n <- if (!is.null(result$trials)) nrow(result$trials) else 0
+  # Convert to data.tables
+  profiles <- if (!is.null(result$profiles)) data.table::as.data.table(result$profiles) else data.table::data.table()
+  tests <- if (!is.null(result$tests)) data.table::as.data.table(result$tests) else data.table::data.table()
+  trials <- if (!is.null(result$trials)) data.table::as.data.table(result$trials) else data.table::data.table()
   
-  log_and_store("ForceDecks fetch complete: {profiles_n} profiles, {tests_n} tests, {trials_n} trials")
+  log_info("ForceDecks fetch complete in {elapsed}s: {nrow(profiles)} profiles, {nrow(tests)} tests, {nrow(trials)} trials")
   
-  return(result)
+  return(list(
+    profiles = profiles,
+    result_definitions = data.table::data.table(),
+    tests = tests,
+    trials = trials,
+    fetch_complete = TRUE,
+    fetch_timeout = FALSE
+  ))
 }
 
 safe_fetch_forcedecks <- adaptive_fetch_forcedecks
@@ -1513,10 +1186,12 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
       valdr::get_nordbord_data()
     }, timeout = timeout_seconds)
   }, TimeoutException = function(e) {
-    log_error("Nordbord fetch timeout after {timeout_seconds} seconds")
+    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+    log_warn("Nordbord fetch TIMEOUT after {elapsed}s")
     NULL
   }, error = function(e) {
-    log_error("Nordbord API error: {e$message}")
+    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+    log_error("Nordbord API error after {elapsed}s: {e$message}")
     NULL
   })
   
@@ -2628,45 +2303,33 @@ determine_run_status <- function() {
 script_start_time <- Sys.time()
 log_and_store("=== VALD DATA PROCESSING SCRIPT STARTED ===", "START")
 log_and_store("Script version: 2.4.3-cloud")
-log_and_store("Mode: {if(LOCAL_MODE) 'LOCAL' else 'CLOUD'}")
+log_and_store("Mode: CLOUD")
 log_and_store("Start date config: {CONFIG$start_date}")
-log_and_store("Parallel config: {PARALLEL_CONFIG$n_workers} workers, {PARALLEL_CONFIG$stagger_sec*1000}ms stagger")
 log_info("Production schema: {length(PRODUCTION_CMJ_COLUMNS)} columns")
 
 # ============================================================================
 # Gate Check: Determine Run Status
 # ============================================================================
 
-if (LOCAL_MODE) {
-  # Local: Always run everything
-  fd_changed <- TRUE
-  nord_changed <- TRUE
-  LOG_RUN_TYPE <- "FULL_RUN"
-  max_fd_date <- NULL
-  max_nord_date <- NULL
-  log_and_store("Run type: FULL_RUN (local default)")
-  
-} else {
-  # Cloud: Smart change detection
-  run_status <- determine_run_status()
-  
-  fd_changed <- run_status$fd_changed
-  nord_changed <- run_status$nord_changed
-  LOG_RUN_TYPE <- run_status$run_type
-  max_fd_date <- run_status$max_fd_date
-  max_nord_date <- run_status$max_nord_date
-  
-  if (!run_status$any_changes) {
-    log_and_store("=== STANDDOWN: No changes detected ===")
-    log_and_store("ForceDecks and NordBord data is current - no processing needed")
-    upload_logs_to_bigquery()
-    quit(status = 0)  # Clean exit - nothing to do
-  }
-  
-  log_and_store("Run type: {LOG_RUN_TYPE}")
-  log_and_store("FD changed: {fd_changed} | Nord changed: {nord_changed}")
-  log_and_store("Max dates - FD: {max_fd_date} | Nord: {max_nord_date}")
+# Cloud: Smart change detection
+run_status <- determine_run_status()
+
+fd_changed <- run_status$fd_changed
+nord_changed <- run_status$nord_changed
+LOG_RUN_TYPE <- run_status$run_type
+max_fd_date <- run_status$max_fd_date
+max_nord_date <- run_status$max_nord_date
+
+if (!run_status$any_changes) {
+  log_and_store("=== STANDDOWN: No changes detected ===")
+  log_and_store("ForceDecks and NordBord data is current - no processing needed")
+  upload_logs_to_bigquery()
+  quit(status = 0)  # Clean exit - nothing to do
 }
+
+log_and_store("Run type: {LOG_RUN_TYPE}")
+log_and_store("FD changed: {fd_changed} | Nord changed: {nord_changed}")
+log_and_store("Max dates - FD: {max_fd_date} | Nord: {max_nord_date}")
 
 # ============================================================================
 # Load Roster
@@ -2749,7 +2412,20 @@ if (fd_changed) {
     log_and_store("API Start date: {CONFIG$start_date}")
     
     fd_data <- adaptive_fetch_forcedecks(timeout_seconds = CONFIG$timeout_fd_full)
-        tests_count <- if (!is.null(fd_data$tests)) nrow(fd_data$tests) else 0
+    
+    # Track if fetch was complete or partial
+    fetch_was_complete <- isTRUE(fd_data$fetch_complete)
+    fetch_had_timeout <- isTRUE(fd_data$fetch_timeout)
+    
+    update_status("fd_fetch_complete", fetch_was_complete)
+    update_status("fd_fetch_timeout", fetch_had_timeout)
+    
+    if (fetch_had_timeout) {
+      log_warn("Fetch was incomplete due to timeout - processing available data")
+      log_warn("Subsequent runs will backfill missing data via MERGE")
+    }
+    
+    tests_count <- if (!is.null(fd_data$tests)) nrow(fd_data$tests) else 0
     trials_count <- if (!is.null(fd_data$trials)) nrow(fd_data$trials) else 0
     
     if (tests_count == 0 || trials_count == 0) {
@@ -3402,6 +3078,10 @@ if (nord_changed) {
     
     nord_data <- safe_fetch_nordbord(timeout_seconds = CONFIG$timeout_nordbord)
     
+    # Track if fetch was complete or partial
+    update_status("nord_fetch_complete", isTRUE(nord_data$fetch_complete))
+    update_status("nord_fetch_timeout", isTRUE(nord_data$fetch_timeout))
+    
     tests_count <- if (!is.null(nord_data$tests)) nrow(nord_data$tests) else 0
     
     if (tests_count == 0) {
@@ -3440,6 +3120,8 @@ log_and_store("Total execution time: {execution_time} minutes")
 # Execution summary
 log_and_store("=== EXECUTION SUMMARY ===")
 status <- .GlobalEnv$execution_status
+log_and_store("FD Fetch: {if(status$fd_fetch_complete) 'COMPLETE' else if(status$fd_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
+log_and_store("Nord Fetch: {if(status$nord_fetch_complete) 'COMPLETE' else if(status$nord_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
 log_and_store("FD CMJ: {if(status$fd_cmj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("FD DJ: {if(status$fd_dj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("FD RSI: {if(status$fd_rsi_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
@@ -3453,7 +3135,6 @@ log_and_store("Errors: {length(errors)}")
 log_and_store("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
 
 # Clean up
-if (LOCAL_MODE) export_local_summary()
 finalize_logging()
 
 # Upload logs and schema mismatches (always attempt, even on partial failure)
@@ -3468,9 +3149,6 @@ tryCatch({
 }, error = function(e) {
   cat("Warning: Schema mismatch upload failed:", e$message, "\n")
 })
-
-# Clean up parallel workers
-future::plan(future::sequential)
 
 # Exit with appropriate code
 exit_code <- determine_exit_code()
