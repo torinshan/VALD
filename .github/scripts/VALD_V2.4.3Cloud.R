@@ -1407,7 +1407,8 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
     batch_elapsed <- as.numeric(difftime(Sys.time(), batch_start, units = "secs"))
     
     # Update time estimate based on actual performance
-    if (!is.null(batch_trials) && nrow(batch_tests) > 0) {
+    # Verify we have valid data and non-zero elapsed time to prevent division by zero
+    if (!is.null(batch_trials) && nrow(batch_tests) > 0 && batch_elapsed > 0) {
       actual_sec_per_test <- batch_elapsed / nrow(batch_tests)
       # Weighted average balances responsiveness to current API speed while smoothing out outliers
       # Store old value before updating to maintain proper weighted average
