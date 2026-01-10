@@ -1279,7 +1279,7 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
   TIME_ESTIMATE_NEW_WEIGHT <- 0.7  # Weight for new measurement in rolling average
   TIME_ESTIMATE_OLD_WEIGHT <- 0.3  # Weight for old estimate in rolling average
   MIN_REMAINING_SECONDS <- 30      # Minimum time threshold before stopping
-  SAFETY_BUFFER_MULTIPLIER <- 0.5  # Require 50% more time than estimated for batch
+  REQUIRED_TIME_FRACTION <- 0.5    # Safety buffer: require only 50% of estimated time (conservative)
   
   start_time <- Sys.time()
   log_info("Starting ForceDecks fetch (timeout: {timeout_seconds}s, batch_size: {batch_size})...")
@@ -1378,10 +1378,10 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
     # Estimate if we have time for this batch
     estimated_batch_time <- batch_size * estimated_sec_per_test
     
-    # Safety check: Stop if remaining time < max(MIN_REMAINING_SECONDS, SAFETY_BUFFER_MULTIPLIER * estimated_batch_time)
+    # Safety check: Stop if remaining time < max(MIN_REMAINING_SECONDS, REQUIRED_TIME_FRACTION * estimated_batch_time)
     # The safety buffer accounts for API variability and ensures we don't start a batch
     # that will likely exceed the timeout, causing GitHub Actions to kill the job mid-batch
-    if (remaining < max(MIN_REMAINING_SECONDS, estimated_batch_time * SAFETY_BUFFER_MULTIPLIER)) {
+    if (remaining < max(MIN_REMAINING_SECONDS, estimated_batch_time * REQUIRED_TIME_FRACTION)) {
       log_warn("Stopping before batch {i}/{num_batches} - only {round(remaining)}s remaining")
       log_warn("Estimated batch time: {round(estimated_batch_time)}s")
       fetch_timeout <- TRUE
@@ -1410,8 +1410,10 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
     if (!is.null(batch_trials) && nrow(batch_tests) > 0) {
       actual_sec_per_test <- batch_elapsed / nrow(batch_tests)
       # Weighted average balances responsiveness to current API speed while smoothing out outliers
+      # Store old value before updating to maintain proper weighted average
+      old_estimate <- estimated_sec_per_test
       estimated_sec_per_test <- (TIME_ESTIMATE_NEW_WEIGHT * actual_sec_per_test) + 
-                                (TIME_ESTIMATE_OLD_WEIGHT * estimated_sec_per_test)
+                                (TIME_ESTIMATE_OLD_WEIGHT * old_estimate)
     }
     
     if (!is.null(batch_trials) && length(batch_trials) > 0) {
@@ -1426,7 +1428,8 @@ adaptive_fetch_forcedecks <- function(timeout_seconds = 900L,
   # -------------------------------------------------------------------------
   # Combine results
   # -------------------------------------------------------------------------
-  trials_list <- trials_list[!sapply(trials_list, is.null)]
+  # Use compact() helper to remove NULL elements efficiently
+  trials_list <- compact(trials_list)
   
   if (length(trials_list) > 0) {
     all_trials <- data.table::rbindlist(trials_list, use.names = TRUE, fill = TRUE)
