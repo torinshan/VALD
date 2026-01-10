@@ -2563,6 +2563,25 @@ Vald_roster_backfill <- Vald_roster
 log_and_store("Roster loaded: {nrow(Vald_roster)} athletes")
 
 # ============================================================================
+# Reset Start Date AS Needed - FD
+# ============================================================================                    
+# After run type decision, before ForceDecks Branch:
+
+if (LOG_RUN_TYPE == "FULL_RUN") {
+  fetch_start_date <- CONFIG$start_date  # "2024-01-01"
+  
+} else if (LOG_RUN_TYPE == "PARTIAL_RUN") {
+  fetch_start_date <- as.character(as.Date(max_fd_date) - CONFIG$overlap_days)
+  
+} else {
+  # STANDDOWN - skip fetch
+}
+
+# Reset the consumed cursor
+valdr::set_start_date(paste0(fetch_start_date, "T00:00:00Z"))
+log_and_store("Start date reset for {LOG_RUN_TYPE}: {fetch_start_date}")
+                    
+# ============================================================================
 # ForceDecks Processing Branch
 # ============================================================================
 if (fd_changed) {
@@ -3181,6 +3200,23 @@ if (fd_changed) {
   log_and_store("ForceDecks: No changes detected - skipping")
 }
 
+# ============================================================================
+# Reset Start Date AS Needed - Nord
+# ============================================================================                    
+if (LOG_RUN_TYPE == "FULL_RUN") {
+  fetch_start_date <- CONFIG$start_date  # "2024-01-01"
+  
+} else if (LOG_RUN_TYPE == "PARTIAL_RUN") {
+  fetch_start_date <- as.character(as.Date(max_fd_date) - CONFIG$overlap_days)
+  
+} else {
+  # STANDDOWN - skip fetch
+}
+
+# Reset the consumed cursor
+valdr::set_start_date(paste0(fetch_start_date, "T00:00:00Z"))
+log_and_store("Start date reset for {LOG_RUN_TYPE}: {fetch_start_date}")
+                                  
 # ============================================================================
 # NordBord Processing Branch
 # ============================================================================
