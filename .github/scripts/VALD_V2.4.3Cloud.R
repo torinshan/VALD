@@ -3504,7 +3504,7 @@ if (nord_changed) {
     log_and_store("=== NORDBORD BRANCH START ===")
     
     # Reset start date before Nordbord fetch
-    set_start_date(paste0(CONFIG$start_date, "T00:00:00Z"))
+    valdr::set_start_date(paste0(CONFIG$start_date, "T00:00:00Z"))
     log_info("Reset start date to {CONFIG$start_date} for Nordbord fetch")
     
     nord_data <- safe_fetch_nordbord(timeout_seconds = CONFIG$timeout_nordbord)
