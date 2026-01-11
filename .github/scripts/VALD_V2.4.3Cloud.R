@@ -2740,21 +2740,18 @@ if (fd_changed) {
       time_buffer_seconds = CONFIG$time_buffer_seconds
     )
     
-    # Validate fetch result structure
+        # Validate fetch result structure
     if (is.null(fd_data)) {
       log_error("adaptive_fetch_forcedecks returned NULL!")
       log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: NULL fetch result) ===")
       record_error("ForceDecks_Fetch", "Fetch function returned NULL")
-      # Skip to next section
     } else if (!is.list(fd_data)) {
       log_error("adaptive_fetch_forcedecks returned non-list: {class(fd_data)}")
       log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: Invalid fetch result type) ===")
       record_error("ForceDecks_Fetch", paste("Fetch returned:", class(fd_data)))
-      # Skip to next section  
     } else {
-    
-    # Evaluate fetch result using four-scenario branching
-    fetch_eval <- evaluate_fetch_result(fd_data)
+      # Evaluate fetch result using four-scenario branching
+      fetch_eval <- evaluate_fetch_result(fd_data)
     
     # Update status flags
     update_status("fd_fetch_complete", fetch_eval$is_complete)
@@ -3454,6 +3451,7 @@ if (fd_changed) {
         record_error("RefTables", e$message)
       })
       
+    }
     }
     
     log_and_store("=== FORCEDECKS BRANCH COMPLETE ===")
