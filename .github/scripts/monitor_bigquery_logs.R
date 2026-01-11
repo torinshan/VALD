@@ -133,7 +133,8 @@ analyze_logs <- function(logs) {
   logs_dt <- as.data.table(logs)
   
   # ===== ERROR LOGS =====
-  errors <- logs_dt[level == "ERROR" | grepl("(?i)error|fail|exception", message)]
+  # Pre-filter by level first for efficiency, then check message content
+  errors <- logs_dt[level == "ERROR" | (level != "ERROR" & grepl("(?i)error|fail|exception", message, perl = TRUE))]
   
   cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
   cat("   ERRORS & FAILURES\n")
@@ -142,17 +143,17 @@ analyze_logs <- function(logs) {
   if (nrow(errors) > 0) {
     cat("Total Errors Found:", nrow(errors), "\n\n")
     
-    # Group by error type
+    # Group by error type - use single regex with alternation for efficiency
     error_patterns <- errors %>%
       mutate(
         error_type = case_when(
-          grepl("(?i)authentication|auth|credentials", message) ~ "Authentication",
-          grepl("(?i)timeout|timed out", message) ~ "Timeout",
-          grepl("(?i)api|vald api", message) ~ "API Error",
-          grepl("(?i)bigquery|bq", message) ~ "BigQuery Error",
-          grepl("(?i)connection|network", message) ~ "Connection",
-          grepl("(?i)missing|not found|does not exist", message) ~ "Missing Data/Resource",
-          grepl("(?i)invalid|incorrect", message) ~ "Invalid Data",
+          grepl("(?i)authentication|auth|credentials", message, perl = TRUE) ~ "Authentication",
+          grepl("(?i)timeout|timed out", message, perl = TRUE) ~ "Timeout",
+          grepl("(?i)api|vald api", message, perl = TRUE) ~ "API Error",
+          grepl("(?i)bigquery|bq", message, perl = TRUE) ~ "BigQuery Error",
+          grepl("(?i)connection|network", message, perl = TRUE) ~ "Connection",
+          grepl("(?i)missing|not found|does not exist", message, perl = TRUE) ~ "Missing Data/Resource",
+          grepl("(?i)invalid|incorrect", message, perl = TRUE) ~ "Invalid Data",
           TRUE ~ "Other Error"
         )
       ) %>%
@@ -187,7 +188,8 @@ analyze_logs <- function(logs) {
   }
   
   # ===== WARNING LOGS =====
-  warnings <- logs_dt[level == "WARN" | grepl("(?i)warning|warn", message)]
+  # Pre-filter by level first for efficiency
+  warnings <- logs_dt[level == "WARN" | (level != "WARN" & grepl("(?i)warning|warn", message, perl = TRUE))]
   
   cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
   cat("   WARNINGS\n")
@@ -225,8 +227,8 @@ analyze_logs <- function(logs) {
       start_time = min(timestamp),
       end_time = max(timestamp),
       num_logs = n(),
-      num_errors = sum(level == "ERROR" | grepl("(?i)error|fail", message)),
-      num_warnings = sum(level == "WARN" | grepl("(?i)warning", message)),
+      num_errors = sum(level == "ERROR" | grepl("(?i)error|fail", message, perl = TRUE)),
+      num_warnings = sum(level == "WARN" | grepl("(?i)warning", message, perl = TRUE)),
       .groups = "drop"
     ) %>%
     mutate(
@@ -261,20 +263,20 @@ analyze_logs <- function(logs) {
   cat("   COMMON ISSUE PATTERNS\n")
   cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
   
-  # Detect common patterns
-  issue_logs <- logs_dt[grepl("(?i)timeout|failed|error|skipped|no data|missing", message)]
+  # Detect common patterns - use single regex for efficiency
+  issue_logs <- logs_dt[grepl("(?i)timeout|failed|error|skipped|no data|missing", message, perl = TRUE)]
   
   if (nrow(issue_logs) > 0) {
-    # Extract key phrases
+    # Extract key phrases - use perl = TRUE for better performance
     common_issues <- issue_logs %>%
       mutate(
         issue = case_when(
-          grepl("(?i)vald api.*timeout", message) ~ "VALD API Timeout",
-          grepl("(?i)no.*data|no matching|no records", message) ~ "No Data Available",
-          grepl("(?i)skipped|bypassed|disabled", message) ~ "Processing Skipped",
-          grepl("(?i)authentication.*failed", message) ~ "Authentication Failed",
-          grepl("(?i)table.*not.*exist", message) ~ "Missing Table",
-          grepl("(?i)fetch.*failed", message) ~ "Data Fetch Failed",
+          grepl("(?i)vald api.*timeout", message, perl = TRUE) ~ "VALD API Timeout",
+          grepl("(?i)no.*data|no matching|no records", message, perl = TRUE) ~ "No Data Available",
+          grepl("(?i)skipped|bypassed|disabled", message, perl = TRUE) ~ "Processing Skipped",
+          grepl("(?i)authentication.*failed", message, perl = TRUE) ~ "Authentication Failed",
+          grepl("(?i)table.*not.*exist", message, perl = TRUE) ~ "Missing Table",
+          grepl("(?i)fetch.*failed", message, perl = TRUE) ~ "Data Fetch Failed",
           TRUE ~ "Other Issue"
         )
       ) %>%
