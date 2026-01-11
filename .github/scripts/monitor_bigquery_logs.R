@@ -99,10 +99,15 @@ query_logs <- function() {
       bq_table_download()
     
     cat("   Retrieved:", nrow(logs), "log entries\n")
-    cat("   Date Range:", 
-        format(min(logs$timestamp), "%Y-%m-%d %H:%M"),
-        "to",
-        format(max(logs$timestamp), "%Y-%m-%d %H:%M"), "\n\n")
+    
+    if (nrow(logs) > 0) {
+      cat("   Date Range:", 
+          format(min(logs$timestamp), "%Y-%m-%d %H:%M"),
+          "to",
+          format(max(logs$timestamp), "%Y-%m-%d %H:%M"), "\n\n")
+    } else {
+      cat("   No logs found in the specified time range\n\n")
+    }
     
     return(logs)
     
