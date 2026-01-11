@@ -3448,9 +3448,10 @@ if (fd_changed) {
               common_cols <- intersect(names(cmj_clean), names(existing_only))
               
               if (length(common_cols) > 0) {
-                # Add missing columns to existing_only
-                for (col in setdiff(names(cmj_clean), names(existing_only))) {
-                  existing_only[, (col) := NA]
+                # Add missing columns to existing_only efficiently (all at once)
+                missing_cols <- setdiff(names(cmj_clean), names(existing_only))
+                if (length(missing_cols) > 0) {
+                  existing_only[, (missing_cols) := NA]
                 }
                 
                 # Add is_new_data column to existing_only (all FALSE)
@@ -3557,7 +3558,9 @@ if (fd_changed) {
             # Apply Athlete-Specific MDC Thresholds (V2.4.3)
             log_and_store("Calculating athlete-specific MDC thresholds...")
             
-            # Use cmj_combined for MDC calculation instead of cmj_clean
+            # V2.4.3: Reassign cmj_combined to cmj_clean for MDC calculation
+            # This is intentional to minimize changes to downstream code that expects cmj_clean
+            # At this point cmj_clean contains the combined (historical + new) data with scores calculated
             cmj_clean <- cmj_combined
             
             cmj_clean <- calculate_athlete_mdc(
@@ -3667,6 +3670,10 @@ if (fd_changed) {
           
             log_info("Export schema: {ncol(cmj_export)} columns, {nrow(cmj_export)} rows")
           
+            # V2.4.3: Track duplicate test_IDs BEFORE deduplication
+            all_cmj_ids <- cmj_export$test_ID
+            dup_cmj_ids <- unique(all_cmj_ids[duplicated(all_cmj_ids)])
+          
             # V2.4.3: Deduplication prioritizing old data
             # Since we're only exporting new data, dedup within new data only
             # Old data is preserved in BigQuery untouched
@@ -3676,9 +3683,9 @@ if (fd_changed) {
           
             if (n_before_dedup > n_after_dedup) {
               # Track duplicates that were removed
-              all_ids <- cmj_export_candidates$test_ID
-              dup_ids <- all_ids[duplicated(all_ids)]
-              record_filtered_tests(dup_ids, "CMJ_DEDUP", "Duplicate test_ID in new data", "ForceDecks")
+              if (length(dup_cmj_ids) > 0) {
+                record_filtered_tests(dup_cmj_ids, "CMJ_DEDUP", "Duplicate test_ID in new data", "ForceDecks")
+              }
               
               log_warn("Deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
               log_warn("Retained {n_after_dedup} unique CMJ records for export")
@@ -3955,13 +3962,21 @@ if (nord_changed) {
       }
       
       # Deduplicate API response (valdr pagination returns overlapping records)
+      # V2.4.3: Track API pagination duplicates for complete audit trail
+      all_api_ids <- nord_raw$testId
+      api_dup_ids <- unique(all_api_ids[duplicated(all_api_ids)])
+      
       n_raw <- nrow(nord_raw)
       nord_raw <- unique(nord_raw, by = "testId")
       n_deduped <- nrow(nord_raw)
       
       if (n_raw > n_deduped) {
         log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed")
-        # Note: This is expected API behavior, not a filter - don't record as filtered
+        # Track these for complete audit trail (expected behavior, not a data issue)
+        if (length(api_dup_ids) > 0) {
+          record_filtered_tests(api_dup_ids, "NORDBORD_API_PAGINATION", 
+                               "Duplicate from API pagination (expected behavior)", "NordBord")
+        }
       }
       
       update_status("nord_fetched", TRUE)
@@ -3982,6 +3997,10 @@ if (nord_changed) {
         }
       }
       
+      # V2.4.3: Track duplicate test_IDs BEFORE deduplication
+      all_nord_ids <- nord_export$test_ID
+      dup_nord_ids <- unique(all_nord_ids[duplicated(all_nord_ids)])
+      
       # Deduplication: Ensure unique test_IDs before export
       n_before_dedup <- nrow(nord_export)
       nord_export <- unique(nord_export, by = "test_ID")
@@ -3989,8 +4008,9 @@ if (nord_changed) {
       
       if (n_before_dedup > n_after_dedup) {
         # V2.4.3: Track duplicates that were removed
-        all_ids <- nord_export$test_ID[1:n_before_dedup]  # Note: this won't work after unique()
-        # Record the count of duplicates
+        if (length(dup_nord_ids) > 0) {
+          record_filtered_tests(dup_nord_ids, "NORDBORD_DEDUP", "Duplicate test_ID in data", "NordBord")
+        }
         log_warn("NordBord deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
         log_warn("Retained {n_after_dedup} unique NordBord records for export")
       } else {
