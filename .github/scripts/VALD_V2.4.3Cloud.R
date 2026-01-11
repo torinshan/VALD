@@ -18,7 +18,15 @@
 # - 15-minute timeout with graceful partial data handling
 # - MERGE mode ensures subsequent runs fill gaps
 #
-# V2.4.3 Updates:
+# V2.4.3 Updates (Continued):
+# - New vs Old Data Tracking: Query existing test_IDs from BigQuery before processing
+# - Score Calculation: Use combined historical + new data for accurate readiness/performance scores
+# - Deduplication: Prioritize old data over new (only export new data)
+# - Filtered Test ID Logging: Track test_IDs filtered at each processing stage
+# - Reconciliation: Compare API test_IDs against saved test_IDs at end of run
+# - New table: filtered_test_ids_log for audit trail
+#
+# V2.4.3 Updates (Original):
 # - RSI Scaling: Corrected 100x error (now decimal form: 0.43 not 43.2)
 # - Readiness Calculation: Changed from observation-based to time-based 30-day window
 # - MDC Thresholds: Athlete-specific with population fallback (not static)
@@ -59,6 +67,76 @@
 )
 
 .GlobalEnv$execution_errors <- list()
+
+# ============================================================================
+# Filtered Test ID Tracking (V2.4.3)
+# ============================================================================
+# Track test_IDs that are filtered out at each stage for audit purposes
+.GlobalEnv$filtered_test_ids <- data.table::data.table(
+  test_ID = character(0),
+  filter_stage = character(0),
+  filter_reason = character(0),
+  data_source = character(0),
+  timestamp = as.POSIXct(character(0))
+)
+
+# Track original API test_IDs for reconciliation
+.GlobalEnv$api_test_ids <- list(
+  forcedecks = character(0),
+  nordbord = character(0)
+)
+
+# Helper function to record filtered test IDs
+record_filtered_tests <- function(test_ids, stage, reason, source = "ForceDecks") {
+  if (length(test_ids) == 0) return(invisible(NULL))
+  
+  new_entries <- data.table::data.table(
+    test_ID = test_ids,
+    filter_stage = stage,
+    filter_reason = reason,
+    data_source = source,
+    timestamp = Sys.time()
+  )
+  
+  .GlobalEnv$filtered_test_ids <- data.table::rbindlist(
+    list(.GlobalEnv$filtered_test_ids, new_entries),
+    use.names = TRUE, fill = TRUE
+  )
+  
+  if (exists("log_info", mode = "function")) {
+    log_info("Filtered {length(test_ids)} test_IDs at stage '{stage}': {reason}")
+  }
+}
+
+#' Helper function to detect and track duplicates in test_ID column
+#' @param dt data.table with test_ID column
+#' @param stage Filter stage name for logging
+#' @param source Data source (ForceDecks or NordBord)
+#' @param id_col Column name containing test IDs (default: "test_ID")
+#' @return List with has_duplicates (logical), dup_ids (unique duplicate IDs), n_duplicates (count)
+detect_and_track_duplicates <- function(dt, stage, source, id_col = "test_ID") {
+  if (!id_col %in% names(dt)) {
+    return(list(has_duplicates = FALSE, dup_ids = character(0), n_duplicates = 0L))
+  }
+  
+  all_ids <- dt[[id_col]]
+  
+  # Fast check for any duplicates
+  if (!anyDuplicated(all_ids)) {
+    return(list(has_duplicates = FALSE, dup_ids = character(0), n_duplicates = 0L))
+  }
+  
+  # Get unique duplicate IDs
+  dup_ids <- unique(all_ids[duplicated(all_ids)])
+  n_duplicates <- length(dup_ids)
+  
+  # Record in filter log
+  if (n_duplicates > 0) {
+    record_filtered_tests(dup_ids, stage, "Duplicate test_ID", source)
+  }
+  
+  return(list(has_duplicates = TRUE, dup_ids = dup_ids, n_duplicates = n_duplicates))
+}
 
 # Safe update functions
 update_status <- function(field, value) {
@@ -1122,6 +1200,224 @@ upload_schema_mismatches <- function() {
     log_error("Schema mismatch upload failed: {e$message}")
     FALSE
   })
+}
+
+# ============================================================================
+# V2.4.3: Query Existing Data for Accurate Score Calculation
+# ============================================================================
+# Columns needed for performance/readiness score calculation
+SCORE_CALCULATION_COLUMNS <- c(
+  "test_ID", "vald_id", "full_name", "team", "date", "test_type",
+  "jump_height_inches_imp_mom", "rsi_modified_imp_mom", 
+  "relative_peak_eccentric_force", "bodymass_relative_takeoff_power",
+  "body_weight_lbs"
+)
+
+#' Query existing data from BigQuery for score calculation
+#' @param table_name The table to query (e.g., "vald_fd_jumps")
+#' @param columns Vector of column names to retrieve
+#' @return data.table with existing data or empty data.table if table doesn't exist
+query_existing_data_for_scores <- function(table_name, columns = SCORE_CALCULATION_COLUMNS) {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, table_name)
+    
+    if (!safe_table_exists(tbl)) {
+      log_info("Table {table_name} does not exist - no existing data for score calculation")
+      return(data.table::data.table())
+    }
+    
+    # Get table schema to find available columns
+    meta <- bigrquery::bq_table_meta(tbl)
+    existing_cols <- sapply(meta$schema$fields, function(f) f$name)
+    
+    # Only select columns that exist in the table
+    available_cols <- intersect(columns, existing_cols)
+    
+    if (length(available_cols) == 0) {
+      log_warn("No score calculation columns found in {table_name}")
+      return(data.table::data.table())
+    }
+    
+    col_list <- paste0("`", available_cols, "`", collapse = ", ")
+    sql <- glue::glue("SELECT {col_list} FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}`")
+    
+    log_info("Querying existing data from {table_name} ({length(available_cols)} columns)...")
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% bigrquery::bq_table_download()
+    dt <- data.table::as.data.table(result)
+    
+    log_info("Retrieved {nrow(dt)} existing records from {table_name} for score calculation")
+    return(dt)
+    
+  }, error = function(e) {
+    log_warn("Could not query existing data from {table_name}: {e$message}")
+    return(data.table::data.table())
+  })
+}
+
+#' Query existing test_IDs from actual data tables (not reference tables)
+#' Used for final reconciliation to ensure all data is accounted for
+#' @param data_sources Character vector of table names to check
+#' @return Named list with test_IDs from each table
+query_saved_test_ids <- function(data_sources = c("vald_fd_jumps", "vald_nord_all", 
+                                                    "vald_fd_dj", "vald_fd_rsi", 
+                                                    "vald_fd_sl_jumps", "vald_fd_imtp",
+                                                    "vald_fd_rebound")) {
+  result <- list()
+  
+  for (table_name in data_sources) {
+    tryCatch({
+      ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+      tbl <- bigrquery::bq_table(ds, table_name)
+      
+      if (!safe_table_exists(tbl)) {
+        result[[table_name]] <- character(0)
+        next
+      }
+      
+      sql <- glue::glue("SELECT DISTINCT test_ID FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}`")
+      query_result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% bigrquery::bq_table_download()
+      
+      result[[table_name]] <- as.character(query_result$test_ID)
+      log_info("Found {length(result[[table_name]])} test_IDs in {table_name}")
+      
+    }, error = function(e) {
+      log_warn("Could not query test_IDs from {table_name}: {e$message}")
+      result[[table_name]] <- character(0)
+    })
+  }
+  
+  return(result)
+}
+
+#' Mark data as new vs existing based on test_ID presence in BigQuery
+#' @param new_data data.table with new data from API
+#' @param existing_test_ids Character vector of test_IDs already in BigQuery
+#' @return data.table with is_new_data column added
+mark_new_vs_existing <- function(new_data, existing_test_ids) {
+  if (!"test_ID" %in% names(new_data)) {
+    log_warn("Cannot mark new vs existing: test_ID column missing")
+    new_data[, is_new_data := TRUE]
+    return(new_data)
+  }
+  
+  new_data[, is_new_data := !(test_ID %in% existing_test_ids)]
+  
+  n_new <- sum(new_data$is_new_data, na.rm = TRUE)
+  n_existing <- sum(!new_data$is_new_data, na.rm = TRUE)
+  log_info("Data classification: {n_new} new records, {n_existing} existing records")
+  
+  return(new_data)
+}
+
+#' Upload filtered test IDs log to BigQuery
+upload_filtered_test_ids <- function() {
+  filtered_ids <- .GlobalEnv$filtered_test_ids
+  
+  if (nrow(filtered_ids) == 0) {
+    log_info("No filtered test IDs to upload")
+    return(invisible(TRUE))
+  }
+  
+  tryCatch({
+    # Add run metadata
+    filtered_ids[, run_id := Sys.getenv("GITHUB_RUN_ID", "manual")]
+    filtered_ids[, repository := Sys.getenv("GITHUB_REPOSITORY", "unknown")]
+    
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "filtered_test_ids_log")
+    
+    if (!safe_table_exists(tbl)) {
+      log_info("Creating filtered_test_ids_log table...")
+      bigrquery::bq_table_create(tbl, fields = bigrquery::as_bq_fields(filtered_ids))
+    }
+    
+    bigrquery::bq_table_upload(tbl, filtered_ids, write_disposition = "WRITE_APPEND")
+    log_info("Uploaded {nrow(filtered_ids)} filtered test ID records to BigQuery")
+    TRUE
+    
+  }, error = function(e) {
+    log_error("Filtered test IDs upload failed: {e$message}")
+    FALSE
+  })
+}
+
+#' Reconcile API test_IDs against saved test_IDs
+#' Logs any test_IDs that were fetched but not saved
+reconcile_test_ids <- function() {
+  log_info("=== TEST ID RECONCILIATION ===")
+  
+  api_ids <- .GlobalEnv$api_test_ids
+  
+  # Query all saved test_IDs from data tables
+  saved_ids <- query_saved_test_ids()
+  
+  # Combine all saved test_IDs across tables
+  all_saved_fd <- unique(unlist(saved_ids[c("vald_fd_jumps", "vald_fd_dj", "vald_fd_rsi", 
+                                             "vald_fd_sl_jumps", "vald_fd_imtp", 
+                                             "vald_fd_rebound")]))
+  all_saved_nord <- unique(unlist(saved_ids["vald_nord_all"]))
+  
+  # ForceDecks reconciliation
+  if (length(api_ids$forcedecks) > 0) {
+    missing_fd <- setdiff(api_ids$forcedecks, all_saved_fd)
+    
+    if (length(missing_fd) > 0) {
+      log_warn("RECONCILIATION: {length(missing_fd)} ForceDecks test_IDs not in any data table")
+      log_warn("Missing test_IDs (first 10): {paste(head(missing_fd, 10), collapse = ', ')}")
+      
+      # Check if these are in the filtered log
+      filtered_ids <- .GlobalEnv$filtered_test_ids
+      if (nrow(filtered_ids) > 0) {
+        in_filtered <- missing_fd[missing_fd %in% filtered_ids$test_ID]
+        not_in_filtered <- setdiff(missing_fd, filtered_ids$test_ID)
+        
+        log_info("  - {length(in_filtered)} are in filtered log (intentionally excluded)")
+        log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR (investigate)")
+        
+        # Record unaccounted test_IDs
+        if (length(not_in_filtered) > 0) {
+          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in any table or filter log", "ForceDecks")
+        }
+      } else {
+        log_warn("  - All {length(missing_fd)} are UNACCOUNTED FOR (no filter log)")
+        record_filtered_tests(missing_fd, "RECONCILIATION", "Unaccounted - no filter log", "ForceDecks")
+      }
+    } else {
+      log_info("RECONCILIATION: All {length(api_ids$forcedecks)} ForceDecks test_IDs accounted for")
+    }
+  } else {
+    log_info("RECONCILIATION: No ForceDecks API test_IDs to reconcile")
+  }
+  
+  # NordBord reconciliation
+  if (length(api_ids$nordbord) > 0) {
+    missing_nord <- setdiff(api_ids$nordbord, all_saved_nord)
+    
+    if (length(missing_nord) > 0) {
+      log_warn("RECONCILIATION: {length(missing_nord)} NordBord test_IDs not in data table")
+      
+      filtered_ids <- .GlobalEnv$filtered_test_ids
+      if (nrow(filtered_ids) > 0) {
+        in_filtered <- missing_nord[missing_nord %in% filtered_ids$test_ID]
+        not_in_filtered <- setdiff(missing_nord, filtered_ids$test_ID)
+        
+        log_info("  - {length(in_filtered)} are in filtered log")
+        if (length(not_in_filtered) > 0) {
+          log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
+          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "NordBord")
+        }
+      } else {
+        record_filtered_tests(missing_nord, "RECONCILIATION", "Unaccounted - no filter log", "NordBord")
+      }
+    } else {
+      log_info("RECONCILIATION: All {length(api_ids$nordbord)} NordBord test_IDs accounted for")
+    }
+  } else {
+    log_info("RECONCILIATION: No NordBord API test_IDs to reconcile")
+  }
+  
+  log_info("=== RECONCILIATION COMPLETE ===")
 }
 
 # ============================================================================
@@ -2784,6 +3080,26 @@ if (fd_changed) {
       log_and_store("Fetched: {nrow(profiles)} profiles, {nrow(tests_raw)} tests, {nrow(trials_raw)} trial records")
       
       # ========================================================================
+      # V2.4.3: Store Original API Test IDs for Reconciliation
+      # ========================================================================
+      if ("testId" %in% names(tests_raw)) {
+        .GlobalEnv$api_test_ids$forcedecks <- unique(as.character(tests_raw$testId))
+        log_info("Stored {length(.GlobalEnv$api_test_ids$forcedecks)} ForceDecks test_IDs for reconciliation")
+      }
+      
+      # ========================================================================
+      # V2.4.3: Query Existing Data for Accurate Score Calculation
+      # ========================================================================
+      log_and_store("Querying existing data for score calculation...")
+      existing_cmj_data <- query_existing_data_for_scores("vald_fd_jumps")
+      existing_cmj_test_ids <- if (nrow(existing_cmj_data) > 0 && "test_ID" %in% names(existing_cmj_data)) {
+        unique(as.character(existing_cmj_data$test_ID))
+      } else {
+        character(0)
+      }
+      log_and_store("Found {length(existing_cmj_test_ids)} existing test_IDs in BigQuery")
+      
+      # ========================================================================
       # Build Roster from API Profiles
       # ========================================================================
       if (nrow(profiles) > 0 && "profileId" %in% names(profiles)) {
@@ -3040,9 +3356,16 @@ if (fd_changed) {
       cmj_types <- c("CMJ", "LCMJ", "SJ", "ABCMJ")
       cmj_all <- fd_raw[test_type %in% cmj_types]
       
+      # V2.4.3: Track test_IDs filtered out by test type
+      non_cmj_test_ids <- setdiff(fd_raw$test_ID, cmj_all$test_ID)
+      # Note: Non-CMJ tests go to other tables (DJ, RSI, SLJ, IMTP), not truly filtered
+      
       log_and_store("CMJ data has {nrow(cmj_all)} rows, {ncol(cmj_all)} columns")
       
       if (nrow(cmj_all) > 0 && "jump_height_inches_imp_mom" %in% names(cmj_all)) {
+        
+        # V2.4.3: Mark new vs existing data
+        cmj_all <- mark_new_vs_existing(cmj_all, existing_cmj_test_ids)
         
         sample_vals <- cmj_all[!is.na(jump_height_inches_imp_mom), head(jump_height_inches_imp_mom, 100)]
         if (length(sample_vals) > 0) {
@@ -3059,9 +3382,23 @@ if (fd_changed) {
           }
         }
         
+        # V2.4.3: Track filtered test_IDs - NA jump height
+        pre_filter_ids <- cmj_all$test_ID
         cmj_all <- cmj_all[!is.na(jump_height_inches_imp_mom)]
+        filtered_na_jh <- setdiff(pre_filter_ids, cmj_all$test_ID)
+        if (length(filtered_na_jh) > 0) {
+          record_filtered_tests(filtered_na_jh, "CMJ_NA_JUMP_HEIGHT", "Missing jump height value", "ForceDecks")
+        }
+        
+        # V2.4.3: Track filtered test_IDs - height range
+        pre_filter_ids <- cmj_all$test_ID
         cmj_all <- cmj_all[jump_height_inches_imp_mom >= CONFIG$jump_height_min_inches & 
                            jump_height_inches_imp_mom <= CONFIG$jump_height_max_inches]
+        filtered_height_range <- setdiff(pre_filter_ids, cmj_all$test_ID)
+        if (length(filtered_height_range) > 0) {
+          record_filtered_tests(filtered_height_range, "CMJ_HEIGHT_RANGE", 
+                               glue::glue("Jump height outside {CONFIG$jump_height_min_inches}-{CONFIG$jump_height_max_inches} inches"), "ForceDecks")
+        }
         
         log_and_store("CMJ after height filter: {nrow(cmj_all)} records")
         
@@ -3081,7 +3418,21 @@ if (fd_changed) {
           log_and_store("Validation: {paste(paste0(validation_summary$final_classification, '=', validation_summary$N), collapse = ', ')}")
           
           clean_classifications <- c("LIKELY_VALID", "VALID_EXTREME")
+          
+          # V2.4.3: Track filtered test_IDs - QC validation failures
+          pre_filter_ids <- cmj_all$test_ID
           cmj_clean <- cmj_all[final_classification %in% clean_classifications]
+          filtered_qc <- setdiff(pre_filter_ids, cmj_clean$test_ID)
+          if (length(filtered_qc) > 0) {
+            # Get breakdown by classification
+            failed_by_class <- cmj_all[!(test_ID %in% cmj_clean$test_ID), .N, by = final_classification]
+            for (i in seq_len(nrow(failed_by_class))) {
+              class_ids <- cmj_all[final_classification == failed_by_class$final_classification[i], test_ID]
+              record_filtered_tests(class_ids, "CMJ_QC_VALIDATION", 
+                                   glue::glue("QC classification: {failed_by_class$final_classification[i]}"), "ForceDecks")
+            }
+          }
+          
           log_and_store("Clean CMJ records: {nrow(cmj_clean)} ({round(100*nrow(cmj_clean)/nrow(cmj_all), 1)}%)")
           
           # Apply Calibration Error Detection
@@ -3089,6 +3440,11 @@ if (fd_changed) {
           
           n_critical <- sum(cmj_clean$qc_flag == "CALIBRATION_ERROR_CRITICAL", na.rm = TRUE)
           if (n_critical > 0) {
+            # V2.4.3: Track filtered test_IDs - calibration errors
+            calibration_error_ids <- cmj_clean[qc_flag == "CALIBRATION_ERROR_CRITICAL", test_ID]
+            record_filtered_tests(calibration_error_ids, "CMJ_CALIBRATION_ERROR", 
+                                 "Critical calibration error detected", "ForceDecks")
+            
             cmj_clean <- cmj_clean[qc_flag != "CALIBRATION_ERROR_CRITICAL"]
             log_and_store("Removed {n_critical} tests with critical calibration errors")
           }
@@ -3096,19 +3452,76 @@ if (fd_changed) {
           if ("qc_flag" %in% names(cmj_clean)) cmj_clean[, qc_flag := NULL]
           if ("equipment_error_flag" %in% names(cmj_clean)) cmj_clean[, equipment_error_flag := NULL]
           
-          # Calculate Readiness Metrics
-          log_and_store("Calculating readiness metrics...")
+          # ======================================================================
+          # V2.4.3: Combine New and Existing Data for Accurate Score Calculation
+          # ======================================================================
+          # To calculate accurate readiness and performance scores, we need:
+          # 1. Historical data from BigQuery for 30-day rolling calculations
+          # 2. New data from API
+          # We combine them, calculate scores, then export ONLY new data
+          log_and_store("Combining new and existing data for score calculation...")
           
-          has_jh <- "jump_height_inches_imp_mom" %in% names(cmj_clean)
-          has_rsi <- "rsi_modified_imp_mom" %in% names(cmj_clean)
-          has_epf <- "relative_peak_eccentric_force" %in% names(cmj_clean)
-          has_power <- "bodymass_relative_takeoff_power" %in% names(cmj_clean)
+          # Store which test_IDs are new before combining
+          new_test_ids <- cmj_clean[is_new_data == TRUE, test_ID]
+          existing_test_ids_in_new <- cmj_clean[is_new_data == FALSE, test_ID]
           
-          if (has_jh && nrow(cmj_clean) > 0) {
-            data.table::setorder(cmj_clean, full_name, test_type, date)
+          log_info("New test_IDs to process: {length(new_test_ids)}")
+          log_info("Existing test_IDs in fetch: {length(existing_test_ids_in_new)}")
+          
+          # Combine with existing data from BigQuery for score calculation
+          if (nrow(existing_cmj_data) > 0) {
+            # Get existing data that is NOT in current fetch (to avoid duplicates)
+            existing_only <- existing_cmj_data[!(test_ID %in% cmj_clean$test_ID)]
+            
+            if (nrow(existing_only) > 0) {
+              # Ensure column alignment - only select columns that exist in cmj_clean
+              common_cols <- intersect(names(cmj_clean), names(existing_only))
+              
+              if (length(common_cols) > 0) {
+                # Add missing columns to existing_only efficiently (all at once)
+                missing_cols <- setdiff(names(cmj_clean), names(existing_only))
+                if (length(missing_cols) > 0) {
+                  existing_only[, (missing_cols) := NA]
+                }
+                
+                # Add is_new_data column to existing_only (all FALSE)
+                existing_only[, is_new_data := FALSE]
+                
+                # Combine for score calculation
+                cmj_combined <- data.table::rbindlist(
+                  list(cmj_clean, existing_only[, names(cmj_clean), with = FALSE]),
+                  use.names = TRUE, fill = TRUE
+                )
+                
+                log_info("Combined dataset for score calculation: {nrow(cmj_combined)} records")
+                log_info("  - From current fetch: {nrow(cmj_clean)}")
+                log_info("  - From BigQuery history: {nrow(existing_only)}")
+              } else {
+                log_warn("No common columns between new and existing data")
+                cmj_combined <- cmj_clean
+              }
+            } else {
+              log_info("All existing data already in current fetch")
+              cmj_combined <- cmj_clean
+            }
+          } else {
+            log_info("No existing data from BigQuery - using new data only")
+            cmj_combined <- cmj_clean
+          }
+          
+          # Calculate Readiness Metrics on COMBINED data
+          log_and_store("Calculating readiness metrics on combined dataset...")
+          
+          has_jh <- "jump_height_inches_imp_mom" %in% names(cmj_combined)
+          has_rsi <- "rsi_modified_imp_mom" %in% names(cmj_combined)
+          has_epf <- "relative_peak_eccentric_force" %in% names(cmj_combined)
+          has_power <- "bodymass_relative_takeoff_power" %in% names(cmj_combined)
+          
+          if (has_jh && nrow(cmj_combined) > 0) {
+            data.table::setorder(cmj_combined, full_name, test_type, date)
             
             # Jump Height: 30-day rolling mean (time-indexed)
-            cmj_clean[, jh_cmj_mean_30d := slider::slide_index_dbl(
+            cmj_combined[, jh_cmj_mean_30d := slider::slide_index_dbl(
               .x = jump_height_inches_imp_mom,
               .i = date,
               .f = ~ mean(.x, na.rm = TRUE),
@@ -3117,7 +3530,7 @@ if (fd_changed) {
             ), by = .(full_name, test_type)]
             
             if (has_rsi) {
-              cmj_clean[, rsi_cmj_mean_30d := slider::slide_index_dbl(
+              cmj_combined[, rsi_cmj_mean_30d := slider::slide_index_dbl(
                 .x = rsi_modified_imp_mom,
                 .i = date,
                 .f = ~ mean(.x, na.rm = TRUE),
@@ -3127,7 +3540,7 @@ if (fd_changed) {
             }
             
             if (has_epf) {
-              cmj_clean[, epf_cmj_mean_30d := slider::slide_index_dbl(
+              cmj_combined[, epf_cmj_mean_30d := slider::slide_index_dbl(
                 .x = relative_peak_eccentric_force,
                 .i = date,
                 .f = ~ mean(.x, na.rm = TRUE),
@@ -3137,14 +3550,14 @@ if (fd_changed) {
             }
             
             # Calculate Readiness Scores
-            cmj_clean[, jump_height_readiness := data.table::fifelse(
+            cmj_combined[, jump_height_readiness := data.table::fifelse(
               !is.na(jh_cmj_mean_30d) & jh_cmj_mean_30d != 0,
               (jump_height_inches_imp_mom - jh_cmj_mean_30d) / jh_cmj_mean_30d,
               NA_real_
             )]
             
             if (has_rsi) {
-              cmj_clean[, rsi_readiness := data.table::fifelse(
+              cmj_combined[, rsi_readiness := data.table::fifelse(
                 !is.na(rsi_cmj_mean_30d) & rsi_cmj_mean_30d != 0,
                 (rsi_modified_imp_mom - rsi_cmj_mean_30d) / rsi_cmj_mean_30d,
                 NA_real_
@@ -3152,27 +3565,33 @@ if (fd_changed) {
             }
             
             if (has_epf) {
-              cmj_clean[, epf_readiness := data.table::fifelse(
+              cmj_combined[, epf_readiness := data.table::fifelse(
                 !is.na(epf_cmj_mean_30d) & epf_cmj_mean_30d != 0,
                 (relative_peak_eccentric_force - epf_cmj_mean_30d) / epf_cmj_mean_30d,
                 NA_real_
               )]
             }
             
+            # Performance scores calculated on combined data for accurate ranking
             if (has_rsi && has_epf && has_power) {
-              cmj_clean[, calc_perf := (
+              cmj_combined[, calc_perf := (
                 data.table::frank(jump_height_inches_imp_mom, na.last = "keep") / .N +
                 data.table::frank(rsi_modified_imp_mom, na.last = "keep") / .N +
                 data.table::frank(relative_peak_eccentric_force, na.last = "keep") / .N +
                 data.table::frank(bodymass_relative_takeoff_power, na.last = "keep") / .N
               )]
-              cmj_clean[, performance_score := data.table::frank(calc_perf, na.last = "keep") / .N * 100]
-              cmj_clean[, team_performance_score := data.table::frank(calc_perf, na.last = "keep") / .N * 100, by = team]
-              cmj_clean[, calc_perf := NULL]
+              cmj_combined[, performance_score := data.table::frank(calc_perf, na.last = "keep") / .N * 100]
+              cmj_combined[, team_performance_score := data.table::frank(calc_perf, na.last = "keep") / .N * 100, by = team]
+              cmj_combined[, calc_perf := NULL]
             }
             
             # Apply Athlete-Specific MDC Thresholds (V2.4.3)
             log_and_store("Calculating athlete-specific MDC thresholds...")
+            
+            # V2.4.3: Reassign cmj_combined to cmj_clean for MDC calculation
+            # This is intentional to minimize changes to downstream code that expects cmj_clean
+            # At this point cmj_clean contains the combined (historical + new) data with scores calculated
+            cmj_clean <- cmj_combined
             
             cmj_clean <- calculate_athlete_mdc(
               dt = cmj_clean,
@@ -3241,26 +3660,68 @@ if (fd_changed) {
             }
           }
           
-          cmj_export <- cmj_clean[, ..PRODUCTION_CMJ_COLUMNS]
+          # ======================================================================
+          # V2.4.3: Filter to NEW data only for export (keep existing data in BQ)
+          # ======================================================================
+          # After calculating scores on combined data, we only export NEW records
+          # This ensures:
+          # 1. Accurate scores calculated with full historical context
+          # 2. Deduplication prioritizes old data (it stays untouched in BQ)
+          # 3. Only new data is merged, avoiding unnecessary updates
           
-          log_info("Export schema: {ncol(cmj_export)} columns, {nrow(cmj_export)} rows")
+          log_info("Filtering to new data only for export...")
           
-          # Deduplication: Ensure unique test_IDs before export
-          n_before_dedup <- nrow(cmj_export)
-          cmj_export <- unique(cmj_export, by = "test_ID")
-          n_after_dedup <- nrow(cmj_export)
-          
-          if (n_before_dedup > n_after_dedup) {
-            log_warn("Deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
-            log_warn("Retained {n_after_dedup} unique CMJ records for export")
+          if ("is_new_data" %in% names(cmj_clean)) {
+            n_total <- nrow(cmj_clean)
+            cmj_export_candidates <- cmj_clean[is_new_data == TRUE]
+            n_new_for_export <- nrow(cmj_export_candidates)
+            n_existing_kept <- n_total - n_new_for_export
+            
+            log_info("Export filtering: {n_new_for_export} new records to export, {n_existing_kept} existing records retained in BQ")
+            
+            # Remove the is_new_data column before export
+            if ("is_new_data" %in% names(cmj_export_candidates)) {
+              cmj_export_candidates[, is_new_data := NULL]
+            }
           } else {
-            log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
+            log_warn("is_new_data column not found - exporting all records")
+            cmj_export_candidates <- cmj_clean
           }
           
-          bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
-                    partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
-          update_status("fd_cmj_processed", TRUE)
-          log_and_store("Exported {nrow(cmj_export)} CMJ records with {ncol(cmj_export)} columns (MERGE mode)")
+          # Remove is_new_data from production columns if present
+          prod_cols_for_export <- setdiff(PRODUCTION_CMJ_COLUMNS, "is_new_data")
+          
+          # Check if we have any new data to export
+          if (nrow(cmj_export_candidates) == 0) {
+            log_info("No new CMJ data to export - all records already exist in BigQuery")
+            update_status("fd_cmj_processed", TRUE)
+          } else {
+            cmj_export <- cmj_export_candidates[, ..prod_cols_for_export]
+          
+            log_info("Export schema: {ncol(cmj_export)} columns, {nrow(cmj_export)} rows")
+          
+            # V2.4.3: Track duplicate test_IDs BEFORE deduplication using helper
+            dup_info <- detect_and_track_duplicates(cmj_export, "CMJ_DEDUP", "ForceDecks")
+          
+            # V2.4.3: Deduplication prioritizing old data
+            # Since we're only exporting new data, dedup within new data only
+            # Old data is preserved in BigQuery untouched
+            n_before_dedup <- nrow(cmj_export)
+            cmj_export <- unique(cmj_export, by = "test_ID")
+            n_after_dedup <- nrow(cmj_export)
+          
+            if (n_before_dedup > n_after_dedup) {
+              log_warn("Deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
+              log_warn("Retained {n_after_dedup} unique CMJ records for export")
+            } else {
+              log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
+            }
+          
+            bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
+                      partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
+            update_status("fd_cmj_processed", TRUE)
+            log_and_store("Exported {nrow(cmj_export)} NEW CMJ records with {ncol(cmj_export)} columns (MERGE mode)")
+          }
         }
       } else {
         log_warn("No valid CMJ data to process")
@@ -3518,13 +3979,22 @@ if (nord_changed) {
     } else {
       nord_raw <- nord_data$tests
       
+      # V2.4.3: Store original API test IDs for reconciliation
+      if ("testId" %in% names(nord_raw)) {
+        .GlobalEnv$api_test_ids$nordbord <- unique(as.character(nord_raw$testId))
+        log_info("Stored {length(.GlobalEnv$api_test_ids$nordbord)} NordBord test_IDs for reconciliation")
+      }
+      
       # Deduplicate API response (valdr pagination returns overlapping records)
+      # V2.4.3: Track API pagination duplicates using helper (with testId column)
+      dup_info_api <- detect_and_track_duplicates(nord_raw, "NORDBORD_API_PAGINATION", "NordBord", id_col = "testId")
+      
       n_raw <- nrow(nord_raw)
       nord_raw <- unique(nord_raw, by = "testId")
       n_deduped <- nrow(nord_raw)
       
       if (n_raw > n_deduped) {
-        log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed")
+        log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed (expected behavior)")
       }
       
       update_status("nord_fetched", TRUE)
@@ -3532,6 +4002,21 @@ if (nord_changed) {
       
       # Process with V2.4.2 unilateral detection
       nord_export <- process_nordbord(nord_raw, Vald_roster)
+      
+      # V2.4.3: Track test_IDs filtered during NordBord processing
+      if ("test_ID" %in% names(nord_export) && "testId" %in% names(nord_raw)) {
+        api_ids <- unique(as.character(nord_raw$testId))
+        export_ids <- unique(as.character(nord_export$test_ID))
+        filtered_in_processing <- setdiff(api_ids, export_ids)
+        
+        if (length(filtered_in_processing) > 0) {
+          record_filtered_tests(filtered_in_processing, "NORDBORD_PROCESSING", 
+                               "Filtered during NordBord processing", "NordBord")
+        }
+      }
+      
+      # V2.4.3: Track duplicate test_IDs BEFORE deduplication using helper
+      dup_info_nord <- detect_and_track_duplicates(nord_export, "NORDBORD_DEDUP", "NordBord")
       
       # Deduplication: Ensure unique test_IDs before export
       n_before_dedup <- nrow(nord_export)
@@ -3568,6 +4053,16 @@ if (nord_changed) {
 execution_time <- round(difftime(Sys.time(), script_start_time, units = "mins"), 2)
 log_and_store("Total execution time: {execution_time} minutes")
 
+# ============================================================================
+# V2.4.3: Test ID Reconciliation (before execution summary)
+# ============================================================================
+# Compare API test_IDs against saved test_IDs to ensure all data is accounted for
+tryCatch({
+  reconcile_test_ids()
+}, error = function(e) {
+  log_error("Test ID reconciliation failed: {e$message}")
+})
+
 # Execution summary
 log_and_store("=== EXECUTION SUMMARY ===")
 status <- .GlobalEnv$execution_status
@@ -3582,6 +4077,18 @@ log_and_store("FD IMTP: {if(status$fd_imtp_processed) 'SUCCESS' else 'SKIPPED/FA
 log_and_store("NordBord: {if(status$nord_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 errors <- .GlobalEnv$execution_errors
 log_and_store("Errors: {length(errors)}")
+
+# V2.4.3: Filtered test ID summary
+filtered_ids <- .GlobalEnv$filtered_test_ids
+if (nrow(filtered_ids) > 0) {
+  filter_summary <- filtered_ids[, .N, by = filter_stage]
+  log_and_store("Filtered Test IDs Summary:")
+  for (i in seq_len(nrow(filter_summary))) {
+    log_and_store("  - {filter_summary$filter_stage[i]}: {filter_summary$N[i]} test_IDs")
+  }
+} else {
+  log_and_store("Filtered Test IDs: None recorded")
+}
 
 log_and_store("=== VALD DATA PROCESSING SCRIPT ENDED ===", "END")
 
@@ -3599,6 +4106,13 @@ tryCatch({
   upload_schema_mismatches()
 }, error = function(e) {
   cat("Warning: Schema mismatch upload failed:", e$message, "\n")
+})
+
+# V2.4.3: Upload filtered test IDs log
+tryCatch({
+  upload_filtered_test_ids()
+}, error = function(e) {
+  cat("Warning: Filtered test IDs upload failed:", e$message, "\n")
 })
 
 # Exit with appropriate code

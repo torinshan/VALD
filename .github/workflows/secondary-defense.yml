@@ -1,0 +1,111 @@
+name: VALD Secondary Defense (Hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # Run every hour at :00
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  secondary-defense:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: vald-secondary-defense
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      GCP_PROJECT: sac-vald-hub
+      BQ_DATASET: analytics
+      BQ_LOCATION: US
+      BIGRQUERY_USE_BQ_STORAGE: 'false'
+      KEYRING_BACKEND: env
+
+    steps:
+      - name: Show current time (UTC/PT)
+        run: |
+          echo "UTC now: $(date -u)"
+          echo "LA  now: $(TZ=America/Los_Angeles date)"
+
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: sac-vald-hub
+          install_components: bq
+
+      - name: Test GCP Authentication
+        run: |
+          gcloud auth list
+          bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install R dependencies (pak)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: |
+            any::bigrquery
+            any::dplyr
+            any::data.table
+            any::lubridate
+            any::httr2
+            any::jsonlite
+            any::valdr
+            any::glue
+            any::gargle
+          dependencies: '"hard"'
+          cache: true
+
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libsecret-1-dev libsecret-1-0
+
+      - name: Verify script exists
+        run: test -f .github/scripts/vald_2.4.3_secondary_defense.R
+
+      - name: Run Secondary Defense Script
+        env:
+          VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
+          VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
+          VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
+          VALD_REGION: ${{ secrets.VALD_REGION || 'use' }}
+          KEYRING_BACKEND: env
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+          BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          RECOVERY_LOOKBACK_DAYS: "30"
+        run: |
+          set -e
+          Rscript .github/scripts/vald_2.4.3_secondary_defense.R
+
+      - name: Check for remaining unaccounted test_IDs
+        if: always()
+        env:
+          GCP_PROJECT: ${{ env.GCP_PROJECT }}
+          BQ_DATASET: ${{ env.BQ_DATASET }}
+        run: |
+          echo "=== Remaining Unaccounted Test IDs ==="
+          bq query --use_legacy_sql=false --location=US --format=pretty \
+            "SELECT data_source, COUNT(DISTINCT test_ID) as count
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.filtered_test_ids_log\`
+             WHERE filter_stage = 'RECONCILIATION'
+             GROUP BY data_source" \
+            2>&1 || echo "No filter log table or no unaccounted test_IDs"
