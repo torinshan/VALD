@@ -59,11 +59,15 @@
   fd_imtp_processed = FALSE,
   nord_fetched = FALSE,
   nord_processed = FALSE,
+  dynamo_fetched = FALSE,
+  dynamo_processed = FALSE,
   refs_updated = FALSE,
   fd_fetch_complete = FALSE,
   fd_fetch_timeout = FALSE,
   nord_fetch_complete = FALSE,
-  nord_fetch_timeout = FALSE
+  nord_fetch_timeout = FALSE,
+  dynamo_fetch_complete = FALSE,
+  dynamo_fetch_timeout = FALSE
 )
 
 .GlobalEnv$execution_errors <- list()
@@ -83,7 +87,8 @@
 # Track original API test_IDs for reconciliation
 .GlobalEnv$api_test_ids <- list(
   forcedecks = character(0),
-  nordbord = character(0)
+  nordbord = character(0),
+  dynamo = character(0)
 )
 
 # Helper function to record filtered test IDs
@@ -164,11 +169,12 @@ determine_exit_code <- function() {
     status$fd_imtp_processed
   )
   any_nord_success <- status$nord_processed
+  any_dynamo_success <- status$dynamo_processed
   
   # If we processed anything, it's a success (even if partial due to timeout)
-  if (any_fd_success || any_nord_success) {
+  if (any_fd_success || any_nord_success || any_dynamo_success) {
     # Log if there were timeouts
-    if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout)) {
+    if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout) || isTRUE(status$dynamo_fetch_timeout)) {
       log_warn("Run completed with partial data due to timeout(s)")
     }
     return(0)
@@ -176,7 +182,7 @@ determine_exit_code <- function() {
   
   # If we had a graceful timeout (API timeout only), still return success
   # The script should not fail just because API calls timed out
-  if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout)) {
+  if (isTRUE(status$fd_fetch_timeout) || isTRUE(status$nord_fetch_timeout) || isTRUE(status$dynamo_fetch_timeout)) {
     log_warn("Run completed with API timeout(s) but no data processed - will retry in next run")
     return(0)
   }
@@ -206,6 +212,9 @@ tryCatch({
   cat("FATAL: Package loading failed:", e$message, "\n")
   quit(status = 1)
 })
+
+# Null coalescing operator (also provided by rlang, but defined here for clarity)
+`%||%` <- function(a, b) if (is.null(a)) b else a
 
 # ============================================================================
 # Environment Detection
@@ -407,6 +416,16 @@ RSI_EXPORT_COLUMNS <- c(
   "rfd_at_100ms_left", "rfd_at_100ms_right", "rfd_at_100ms_bilateral",
   "start_to_peak_force_left", "start_to_peak_force_right", "start_to_peak_force_bilateral",
   "asym_peak_vertical_force"
+)
+
+# DynaMo: 21 columns
+DYNAMO_EXPORT_COLUMNS <- c(
+  "test_ID", "vald_id", "athleteId", "date", "test_metric", "test_body_part",
+  "test_movement", "test_position",
+  "total_reps", "reps_left", "reps_right",
+  "max_force_right", "max_force_left", "max_force_bilateral", "max_force_asymmetry",
+  "impulse_bilateral", "impulse_left", "impulse_right",
+  "rom_left", "rom_right", "trial_limb"
 )
 
 # ============================================================================
@@ -1262,7 +1281,7 @@ query_existing_data_for_scores <- function(table_name, columns = SCORE_CALCULATI
 query_saved_test_ids <- function(data_sources = c("vald_fd_jumps", "vald_nord_all", 
                                                     "vald_fd_dj", "vald_fd_rsi", 
                                                     "vald_fd_sl_jumps", "vald_fd_imtp",
-                                                    "vald_fd_rebound")) {
+                                                    "vald_fd_rebound", "vald_dynamo")) {
   result <- list()
   
   for (table_name in data_sources) {
@@ -1357,6 +1376,7 @@ reconcile_test_ids <- function() {
                                              "vald_fd_sl_jumps", "vald_fd_imtp", 
                                              "vald_fd_rebound")]))
   all_saved_nord <- unique(unlist(saved_ids["vald_nord_all"]))
+  all_saved_dynamo <- unique(unlist(saved_ids["vald_dynamo"]))
   
   # ForceDecks reconciliation
   if (length(api_ids$forcedecks) > 0) {
@@ -1415,6 +1435,33 @@ reconcile_test_ids <- function() {
     }
   } else {
     log_info("RECONCILIATION: No NordBord API test_IDs to reconcile")
+  }
+  
+  # DynaMo reconciliation
+  if (length(api_ids$dynamo) > 0) {
+    missing_dynamo <- setdiff(api_ids$dynamo, all_saved_dynamo)
+    
+    if (length(missing_dynamo) > 0) {
+      log_warn("RECONCILIATION: {length(missing_dynamo)} DynaMo test_IDs not in data table")
+      
+      filtered_ids <- .GlobalEnv$filtered_test_ids
+      if (nrow(filtered_ids) > 0) {
+        in_filtered <- missing_dynamo[missing_dynamo %in% filtered_ids$test_ID]
+        not_in_filtered <- setdiff(missing_dynamo, filtered_ids$test_ID)
+        
+        log_info("  - {length(in_filtered)} are in filtered log")
+        if (length(not_in_filtered) > 0) {
+          log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
+          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "DynaMo")
+        }
+      } else {
+        record_filtered_tests(missing_dynamo, "RECONCILIATION", "Unaccounted - no filter log", "DynaMo")
+      }
+    } else {
+      log_info("RECONCILIATION: All {length(api_ids$dynamo)} DynaMo test_IDs accounted for")
+    }
+  } else {
+    log_info("RECONCILIATION: No DynaMo API test_IDs to reconcile")
   }
   
   log_info("=== RECONCILIATION COMPLETE ===")
@@ -1810,6 +1857,238 @@ safe_fetch_nordbord <- function(timeout_seconds = CONFIG$timeout_nordbord) {
   
   tests_n <- if (!is.null(result$tests)) nrow(result$tests) else 0
   log_info("Nordbord fetch complete in {elapsed}s: {tests_n} tests")
+  
+  # Add fetch status flags
+  result$fetch_complete <- !fetch_timeout && tests_n > 0
+  result$fetch_timeout <- fetch_timeout
+  
+  return(result)
+}
+
+# ============================================================================
+# DynaMo API Fetch Function
+# ============================================================================
+
+#' DynaMo Configuration Constants
+DYNAMO_CONFIG <- list(
+  base_url = "https://prd-use-api-extdynamo.valdperformance.com",
+  token_url = "https://security.valdperformance.com/connect/token",
+  page_size = 50L,
+  rate_limit_ms = 200,
+  min_reps = 1L,
+  min_force = 0
+)
+
+#' Standardization mapping tables for DynaMo
+DYNAMO_MOVEMENT_MAP <- c(
+  "Abduction" = "abduction", "Adduction" = "adduction", "AdductionSqueeze" = "adduction_squeeze",
+  "Flexion" = "flexion", "Extension" = "extension", "Rotation" = "rotation", "Elevation" = "elevation",
+  "Custom" = "custom", "ExternalRotation" = "external_rotation", "InternalRotation" = "internal_rotation",
+  "RotationLeft" = "rotation_left", "RotationRight" = "rotation_right", "Dorsiflexion" = "dorsiflexion",
+  "PlantarFlexion" = "plantarflexion", "Eversion" = "eversion", "Inversion" = "inversion"
+)
+
+DYNAMO_POSITION_MAP <- c(
+  "Neutral" = "neutral", "Seated" = "seated", "Standing" = "standing", "Prone" = "prone",
+  "Supine" = "supine", "SideLying" = "side_lying", "SemiProne" = "semi_prone", "MidProne" = "mid_prone",
+  "LongSitting" = "long_sitting", "HalfKneeling" = "half_kneeling", "Overhead" = "overhead",
+  "Custom" = "custom", "Pronated" = "pronated", "Supinated" = "supinated"
+)
+
+DYNAMO_BODY_REGION_MAP <- c(
+  "Neck" = "neck", "Shoulder" = "shoulder", "Trunk" = "trunk", "Hip" = "hip",
+  "Elbow" = "elbow", "Wrist" = "wrist", "Hand" = "hand", "Knee" = "knee",
+  "Ankle" = "ankle", "Foot" = "foot", "Scapula" = "scapula"
+)
+
+#' Apply standardization mapping with fallback to auto snake_case
+dynamo_std_map <- function(x, map) {
+  result <- map[x]
+  result[is.na(result)] <- tolower(gsub("([a-z])([A-Z])", "\\1_\\2", x[is.na(result)]))
+  unname(result)
+}
+
+#' Safe DynaMo fetch function with timeout handling
+#' Uses httr2 for API calls (valdr doesn't have DynaMo support)
+safe_fetch_dynamo <- function(timeout_seconds = 300) {
+  start_time <- Sys.time()
+  fetch_timeout <- FALSE
+  
+  # Get DynaMo credentials from environment
+  dynamo_client_id <- Sys.getenv("VALD_DYNAMO_CLIENT_ID", Sys.getenv("VALD_CLIENT_ID", ""))
+  dynamo_client_secret <- Sys.getenv("VALD_DYNAMO_CLIENT_SECRET", Sys.getenv("VALD_CLIENT_SECRET", ""))
+  dynamo_team_id <- Sys.getenv("VALD_DYNAMO_TEAM_ID", Sys.getenv("VALD_TENANT_ID", ""))
+  dynamo_region <- Sys.getenv("VALD_DYNAMO_REGION", Sys.getenv("VALD_REGION", "use"))
+  
+  if (nchar(dynamo_client_id) == 0 || nchar(dynamo_client_secret) == 0 || nchar(dynamo_team_id) == 0) {
+    log_warn("DynaMo credentials not configured - skipping DynaMo fetch")
+    return(list(
+      tests = data.table::data.table(),
+      details = list(),
+      fetch_complete = FALSE,
+      fetch_timeout = FALSE
+    ))
+  }
+  
+  # Construct API URLs
+  base_url <- sprintf("https://prd-%s-api-extdynamo.valdperformance.com", dynamo_region)
+  token_url <- "https://security.valdperformance.com/connect/token"
+  
+  result <- tryCatch({
+    # Check if we have enough time before starting fetch
+    remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    
+    if (remaining < CONFIG$min_time_for_operation) {
+      log_warn("Insufficient time for DynaMo fetch ({round(remaining, 1)}s)")
+      fetch_timeout <- TRUE
+      return(NULL)
+    }
+    
+    log_info("Authenticating with DynaMo API...")
+    
+    # Authenticate
+    auth_response <- httr2::request(token_url) |>
+      httr2::req_body_form(
+        grant_type = "client_credentials",
+        client_id = dynamo_client_id,
+        client_secret = dynamo_client_secret
+      ) |>
+      httr2::req_perform()
+    
+    access_token <- httr2::resp_body_json(auth_response)$access_token
+    
+    if (is.null(access_token) || !nzchar(access_token)) {
+      log_error("DynaMo authentication failed - no token received")
+      return(NULL)
+    }
+    
+    log_info("DynaMo authentication successful")
+    
+    # Fetch tests list (paginated)
+    tests_url <- sprintf("%s/v2022q2/teams/%s/tests", base_url, dynamo_team_id)
+    log_info("Fetching DynaMo tests from: {tests_url}")
+    
+    current_page <- 1L
+    all_items <- list()
+    
+    repeat {
+      # Check time remaining
+      remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      if (remaining < 30) {
+        log_warn("DynaMo fetch timeout approaching - stopping at page {current_page}")
+        fetch_timeout <- TRUE
+        break
+      }
+      
+      response <- httr2::request(tests_url) |>
+        httr2::req_headers(
+          Authorization = paste("Bearer", access_token),
+          `Client-Name` = "vald-cloud-fetch",
+          `Client-Version` = "2.4.3"
+        ) |>
+        httr2::req_url_query(
+          modifiedFromUtc = paste0(CONFIG$start_date, "T00:00:00Z"),
+          page = current_page,
+          pageSize = DYNAMO_CONFIG$page_size
+        ) |>
+        httr2::req_perform()
+      
+      status <- httr2::resp_status(response)
+      if (status == 204 || status >= 400) {
+        if (status >= 400) log_error("DynaMo API error: {status}")
+        break
+      }
+      
+      response_data <- httr2::resp_body_json(response)
+      items <- response_data$items
+      total_pages <- response_data$totalPages %||% 1L
+      
+      log_info("DynaMo page {current_page}/{total_pages}: {length(items)} items")
+      
+      if (is.null(items) || length(items) == 0L) break
+      
+      all_items <- c(all_items, items)
+      
+      if (current_page >= total_pages) break
+      current_page <- current_page + 1L
+      Sys.sleep(DYNAMO_CONFIG$rate_limit_ms / 1000)
+    }
+    
+    n_tests <- length(all_items)
+    log_info("Fetched {n_tests} DynaMo test records from list endpoint")
+    
+    if (n_tests == 0L) {
+      return(list(tests = list(), details = list()))
+    }
+    
+    # Fetch detail endpoint for rep-level data
+    log_info("Fetching detail data for {n_tests} DynaMo tests...")
+    
+    all_details <- vector("list", n_tests)
+    fetch_errors <- 0L
+    
+    for (i in seq_len(n_tests)) {
+      # Check time remaining
+      remaining <- timeout_seconds - as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      if (remaining < 15) {
+        log_warn("DynaMo detail fetch timeout - stopping at test {i}/{n_tests}")
+        fetch_timeout <- TRUE
+        break
+      }
+      
+      test_id <- all_items[[i]]$id
+      team_id <- all_items[[i]]$teamId
+      detail_url <- sprintf("%s/v2022q2/teams/%s/tests/%s", base_url, team_id, test_id)
+      
+      detail_result <- tryCatch({
+        httr2::request(detail_url) |>
+          httr2::req_headers(
+            Authorization = paste("Bearer", access_token),
+            `Client-Name` = "vald-cloud-fetch",
+            `Client-Version` = "2.4.3"
+          ) |>
+          httr2::req_perform() |>
+          httr2::resp_body_json()
+      }, error = function(e) {
+        log_debug("Failed DynaMo test {i}: {e$message}")
+        NULL
+      })
+      
+      if (is.null(detail_result)) fetch_errors <- fetch_errors + 1L
+      all_details[[i]] <- detail_result
+      
+      if (i %% 20 == 0 || i == n_tests) {
+        log_info("DynaMo detail fetch progress: {i}/{n_tests}")
+      }
+      
+      Sys.sleep(DYNAMO_CONFIG$rate_limit_ms / 1000)
+    }
+    
+    successful <- !sapply(all_details, is.null)
+    log_info("DynaMo detail fetch complete: {sum(successful)}/{n_tests} successful ({fetch_errors} errors)")
+    
+    list(tests = all_items, details = all_details[successful])
+    
+  }, error = function(e) {
+    elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+    log_error("DynaMo API error after {elapsed}s: {e$message}")
+    NULL
+  })
+  
+  elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")), 1)
+  
+  if (is.null(result)) {
+    log_warn("DynaMo fetch returned NULL after {elapsed} seconds")
+    return(list(
+      tests = data.table::data.table(),
+      details = list(),
+      fetch_complete = FALSE,
+      fetch_timeout = fetch_timeout
+    ))
+  }
+  
+  tests_n <- length(result$tests)
+  log_info("DynaMo fetch complete in {elapsed}s: {tests_n} tests")
   
   # Add fetch status flags
   result$fetch_complete <- !fetch_timeout && tests_n > 0
@@ -2731,6 +3010,254 @@ process_rsi <- function(rsi_raw) {
 }
 
 # ============================================================================
+# DynaMo Processing Function
+# ============================================================================
+
+#' Process DynaMo handheld dynamometer data
+#' Extracts repetition summaries, pivots to wide format, and calculates asymmetries
+#' @param dynamo_tests List of test metadata from API
+#' @param dynamo_details List of detailed test results with rep data
+#' @return data.table with processed DynaMo data matching DYNAMO_EXPORT_COLUMNS schema
+process_dynamo <- function(dynamo_tests, dynamo_details) {
+  log_info("Processing DynaMo with repetition extraction and asymmetry calculation...")
+  
+  if (length(dynamo_tests) == 0) {
+    log_warn("No DynaMo tests to process")
+    return(data.table::data.table())
+  }
+  
+  # Helper function for safe field extraction
+  safe_extract <- function(lst, field, type = "character") {
+    vapply(lst, function(x) {
+      val <- x[[field]]
+      if (is.null(val)) {
+        return(if (type == "numeric") NA_real_ else NA_character_)
+      }
+      if (type == "numeric") as.numeric(val) else as.character(val)
+    }, if (type == "numeric") numeric(1) else character(1), USE.NAMES = FALSE)
+  }
+  
+  # Build tests metadata table
+  log_info("Building DynaMo tests metadata table...")
+  
+  dynamo_tests_dt <- data.table::data.table(
+    id             = safe_extract(dynamo_tests, "id"),
+    athleteId      = safe_extract(dynamo_tests, "athleteId"),
+    teamId         = safe_extract(dynamo_tests, "teamId"),
+    testCategory   = safe_extract(dynamo_tests, "testCategory"),
+    bodyRegion     = safe_extract(dynamo_tests, "bodyRegion"),
+    movement       = safe_extract(dynamo_tests, "movement"),
+    position       = safe_extract(dynamo_tests, "position"),
+    customPosition = safe_extract(dynamo_tests, "customPosition"),
+    laterality     = safe_extract(dynamo_tests, "laterality"),
+    startTimeUTC   = safe_extract(dynamo_tests, "startTimeUTC"),
+    durationSeconds = safe_extract(dynamo_tests, "durationSeconds", "numeric")
+  )
+  
+  log_info("DynaMo tests metadata: {nrow(dynamo_tests_dt)} rows")
+  
+  # Extract repetition summaries from details
+  log_info("Extracting repetition summaries...")
+  
+  dynamo_reps <- data.table::rbindlist(lapply(dynamo_details, function(test) {
+    if (is.null(test)) return(data.table::data.table())
+    
+    test_id <- test$id
+    reps <- test$repetitionTypeSummaries
+    
+    if (is.null(reps) || length(reps) == 0L) return(data.table::data.table())
+    
+    data.table::rbindlist(lapply(reps, function(r) {
+      data.table::data.table(
+        testId              = test_id,
+        repId               = r$id %||% NA_character_,
+        movement            = r$movement %||% NA_character_,
+        laterality          = r$laterality %||% NA_character_,
+        repCount            = as.integer(r$repCount %||% NA),
+        maxForceNewtons     = as.numeric(r$maxForceNewtons %||% NA),
+        avgForceNewtons     = as.numeric(r$avgForceNewtons %||% NA),
+        maxImpulseNewtonSec = as.numeric(r$maxImpulseNewtonSeconds %||% NA),
+        avgImpulseNewtonSec = as.numeric(r$avgImpulseNewtonSeconds %||% NA),
+        maxRomDegrees       = as.numeric(r$maxRomDegrees %||% NA),
+        avgRomDegrees       = as.numeric(r$avgRomDegrees %||% NA)
+      )
+    }), fill = TRUE)
+  }), fill = TRUE)
+  
+  log_info("Extracted {nrow(dynamo_reps)} rep summaries")
+  
+  if (nrow(dynamo_reps) == 0) {
+    log_warn("No repetition data extracted from DynaMo details")
+    return(data.table::data.table())
+  }
+  
+  # Pivot reps: Long to Wide (Left/Right/Bilateral)
+  log_info("Pivoting DynaMo reps to wide format...")
+  
+  # Standardize laterality
+  dynamo_reps[, side := data.table::fifelse(laterality == "LeftSide", "Left", "Right")]
+  
+  # Define metrics
+  metrics <- c("repCount", "maxForceNewtons", "avgForceNewtons", 
+               "maxImpulseNewtonSec", "avgImpulseNewtonSec",
+               "maxRomDegrees", "avgRomDegrees")
+  
+  # Pivot left side
+  reps_left <- dynamo_reps[side == "Left", 
+                           lapply(.SD, mean, na.rm = TRUE), 
+                           by = .(testId, movement), 
+                           .SDcols = metrics
+  ]
+  data.table::setnames(reps_left, metrics, paste0(metrics, "_left"))
+  
+  # Pivot right side
+  reps_right <- dynamo_reps[side == "Right", 
+                            lapply(.SD, mean, na.rm = TRUE), 
+                            by = .(testId, movement), 
+                            .SDcols = metrics
+  ]
+  data.table::setnames(reps_right, metrics, paste0(metrics, "_right"))
+  
+  # Merge
+  dynamo_reps_wide <- merge(reps_left, reps_right, by = c("testId", "movement"), all = TRUE)
+  
+  log_info("Pivoted to {nrow(dynamo_reps_wide)} tests")
+  
+  # Calculate bilateral and asymmetry columns
+  log_info("Calculating bilateral and asymmetry metrics...")
+  
+  # repCount = SUM, everything else = MEAN
+  dynamo_reps_wide[, `:=`(
+    repCount_bilateral = data.table::fcoalesce(repCount_left, 0) + data.table::fcoalesce(repCount_right, 0),
+    maxForceNewtons_bilateral = (data.table::fcoalesce(maxForceNewtons_left, 0) + data.table::fcoalesce(maxForceNewtons_right, 0)) / 2,
+    avgForceNewtons_bilateral = (data.table::fcoalesce(avgForceNewtons_left, 0) + data.table::fcoalesce(avgForceNewtons_right, 0)) / 2,
+    maxImpulseNewtonSec_bilateral = (data.table::fcoalesce(maxImpulseNewtonSec_left, 0) + data.table::fcoalesce(maxImpulseNewtonSec_right, 0)) / 2,
+    avgImpulseNewtonSec_bilateral = (data.table::fcoalesce(avgImpulseNewtonSec_left, 0) + data.table::fcoalesce(avgImpulseNewtonSec_right, 0)) / 2,
+    maxRomDegrees_bilateral = (data.table::fcoalesce(maxRomDegrees_left, 0) + data.table::fcoalesce(maxRomDegrees_right, 0)) / 2,
+    avgRomDegrees_bilateral = (data.table::fcoalesce(avgRomDegrees_left, 0) + data.table::fcoalesce(avgRomDegrees_right, 0)) / 2
+  )]
+  
+  # Asymmetry: (Right - Left) / ((Right + Left) / 2) * 100
+  dynamo_reps_wide[, `:=`(
+    maxForceNewtons_asymmetry = data.table::fifelse(
+      is.na(maxForceNewtons_right) | is.na(maxForceNewtons_left) | 
+        (maxForceNewtons_right + maxForceNewtons_left) == 0,
+      NA_real_,
+      (maxForceNewtons_right - maxForceNewtons_left) / 
+        ((maxForceNewtons_right + maxForceNewtons_left) / 2) * 100
+    ),
+    avgForceNewtons_asymmetry = data.table::fifelse(
+      is.na(avgForceNewtons_right) | is.na(avgForceNewtons_left) |
+        (avgForceNewtons_right + avgForceNewtons_left) == 0,
+      NA_real_,
+      (avgForceNewtons_right - avgForceNewtons_left) / 
+        ((avgForceNewtons_right + avgForceNewtons_left) / 2) * 100
+    )
+  )]
+  
+  # Build mergeable tests metadata (with standardized names)
+  log_info("Standardizing DynaMo test metadata...")
+  
+  mergable_tests <- dynamo_tests_dt[, .(
+    test_id        = id,
+    athleteId      = athleteId,
+    test_metric    = tolower(testCategory),
+    test_body_part = dynamo_std_map(bodyRegion, DYNAMO_BODY_REGION_MAP),
+    test_movement  = dynamo_std_map(movement, DYNAMO_MOVEMENT_MAP),
+    test_position  = dynamo_std_map(position, DYNAMO_POSITION_MAP)
+  )]
+  
+  # Final cleaning and column selection
+  log_info("Final DynaMo cleaning and column selection...")
+  
+  # Parse date from test metadata
+  if (nrow(dynamo_tests_dt) > 0 && "startTimeUTC" %in% names(dynamo_tests_dt)) {
+    date_lookup <- dynamo_tests_dt[, .(
+      test_id = id,
+      date = as.Date(lubridate::ymd_hms(startTimeUTC, tz = "UTC", quiet = TRUE))
+    )]
+  } else {
+    date_lookup <- data.table::data.table(test_id = character(0), date = as.Date(character(0)))
+  }
+  
+  dynamo_clean <- dynamo_reps_wide[, .(
+    test_id = testId,
+    total_reps = repCount_bilateral,
+    reps_left = repCount_left,
+    reps_right = repCount_right,
+    max_force_right = maxForceNewtons_right,
+    max_force_left = maxForceNewtons_left,
+    max_force_bilateral = maxForceNewtons_bilateral,
+    max_force_asymmetry = avgForceNewtons_asymmetry,
+    impulse_bilateral = avgImpulseNewtonSec_bilateral,
+    impulse_left = avgImpulseNewtonSec_left,
+    impulse_right = avgImpulseNewtonSec_right,
+    rom_left = maxRomDegrees_left,
+    rom_right = maxRomDegrees_right
+  )]
+  
+  # Merge with test metadata
+  dynamo_clean <- merge(dynamo_clean, mergable_tests, by = "test_id", all.x = TRUE)
+  
+  # Merge with date lookup
+  dynamo_clean <- merge(dynamo_clean, date_lookup, by = "test_id", all.x = TRUE)
+  
+  # Add vald_id column (from athleteId)
+  if ("athleteId" %in% names(dynamo_clean)) {
+    dynamo_clean[, vald_id := athleteId]
+  } else {
+    dynamo_clean[, vald_id := NA_character_]
+  }
+  
+  # Add trial_limb based on data availability
+  dynamo_clean[, trial_limb := data.table::fcase(
+    !is.na(reps_left) & !is.na(reps_right), "Both",
+    !is.na(reps_left), "Left",
+    !is.na(reps_right), "Right",
+    default = "Both"
+  )]
+  
+  # Deduplicate
+  n_before <- nrow(dynamo_clean)
+  dynamo_clean <- unique(dynamo_clean, by = "test_id")
+  n_after_dedup <- nrow(dynamo_clean)
+  
+  if (n_before != n_after_dedup) {
+    log_info("DynaMo deduplicated: {n_before - n_after_dedup} duplicate test_IDs removed")
+  }
+  
+  # Apply minimum rep filter
+  dynamo_clean <- dynamo_clean[total_reps >= DYNAMO_CONFIG$min_reps]
+  
+  # Apply minimum force filter
+  dynamo_clean <- dynamo_clean[
+    data.table::fcoalesce(max_force_left, 0) > DYNAMO_CONFIG$min_force | 
+    data.table::fcoalesce(max_force_right, 0) > DYNAMO_CONFIG$min_force
+  ]
+  
+  n_final <- nrow(dynamo_clean)
+  log_info("DynaMo after filtering: {n_final} records")
+  
+  # Ensure all export columns exist
+  for (col in DYNAMO_EXPORT_COLUMNS) {
+    if (!col %in% names(dynamo_clean)) {
+      dynamo_clean[, (col) := NA]
+    }
+  }
+  
+  # Rename test_id to test_ID for consistency
+  if ("test_id" %in% names(dynamo_clean)) {
+    data.table::setnames(dynamo_clean, "test_id", "test_ID")
+  }
+  
+  dynamo_export <- dynamo_clean[, ..DYNAMO_EXPORT_COLUMNS]
+  
+  log_info("DynaMo export: {nrow(dynamo_export)} rows, {ncol(dynamo_export)} columns")
+  
+  return(dynamo_export)
+}
+
+# ============================================================================
 # Change Detection (Gate Check)
 # ============================================================================
 
@@ -2767,14 +3294,24 @@ determine_run_status <- function() {
     data.table::data.table()
   })
   
+  dynamo_tbl <- tryCatch({
+    read_bq_table("vald_dynamo")
+  }, error = function(e) {
+    log_warn("Could not read vald_dynamo: {e$message}")
+    data.table::data.table()
+  })
+  
   # Extract comparison metrics
   latest_date_current <- if (nrow(current_dates) > 0) max(current_dates$date, na.rm = TRUE) else BACKSTOP_DATE
   count_tests_current <- nrow(tests_tbl)
   latest_nord_date_current <- if (nrow(nordbord_tbl) > 0) max(nordbord_tbl$date, na.rm = TRUE) else BACKSTOP_DATE
   count_nord_tests_current <- nrow(nordbord_tbl)
+  latest_dynamo_date_current <- if (nrow(dynamo_tbl) > 0) max(dynamo_tbl$date, na.rm = TRUE) else BACKSTOP_DATE
+  count_dynamo_tests_current <- nrow(dynamo_tbl)
   
   log_info("BQ State - FD: {count_tests_current} tests, max date {latest_date_current}")
   log_info("BQ State - Nord: {count_nord_tests_current} tests, max date {latest_nord_date_current}")
+  log_info("BQ State - DynaMo: {count_dynamo_tests_current} tests, max date {latest_dynamo_date_current}")
   
   # -------------------------------------------------------------------------
   # Step 2: Probe Live APIs
@@ -2805,6 +3342,24 @@ determine_run_status <- function() {
     log_warn("If NordBord table doesn't exist, will treat as new data")
     data.table::data.table()
   })
+  
+  # DynaMo probe - check if credentials are configured
+  dynamo_client_id <- Sys.getenv("VALD_DYNAMO_CLIENT_ID", Sys.getenv("VALD_CLIENT_ID", ""))
+  dynamo_configured <- nchar(dynamo_client_id) > 0
+  
+  dynamo_api_latest_date <- BACKSTOP_DATE
+  dynamo_api_test_count <- 0
+  
+  if (dynamo_configured) {
+    log_info("DynaMo credentials configured - probing DynaMo API...")
+    # DynaMo probe uses httr2, not valdr (valdr doesn't support DynaMo)
+    # For change detection, we just check if the table exists and has data
+    # The actual probe happens in safe_fetch_dynamo
+    # For now, always mark as changed if table is empty
+    log_info("DynaMo probe skipped (will use table state for change detection)")
+  } else {
+    log_info("DynaMo credentials not configured - skipping DynaMo")
+  }
   
   # Extract API metrics
   if (nrow(fd_probe) > 0) {
@@ -2851,6 +3406,7 @@ determine_run_status <- function() {
   
   log_info("API State - FD: {api_test_count} tests, max date {api_latest_date}")
   log_info("API State - Nord: {nord_api_test_count} tests, max date {nord_api_latest_date}")
+  log_info("API State - DynaMo: {dynamo_api_test_count} tests (probe skipped)")
   
   # -------------------------------------------------------------------------
   # Step 3: Compare and Decide
@@ -2865,10 +3421,14 @@ determine_run_status <- function() {
   # we should still try to fetch in case the probe failed but data exists
   nord_table_missing <- count_nord_tests_current == 0
   fd_table_missing <- count_tests_current == 0
+  dynamo_table_missing <- count_dynamo_tests_current == 0
   
   # If tables are missing, always mark as changed to trigger fetch attempt
   fd_changed <- fd_date_mismatch || fd_count_mismatch || (fd_table_missing && api_test_count == 0)
   nord_changed <- nord_date_mismatch || nord_count_mismatch || (nord_table_missing && nord_api_test_count == 0)
+  
+  # DynaMo: Always try if configured and table is empty, otherwise skip
+  dynamo_changed <- dynamo_configured && dynamo_table_missing
   
   # Override: If table is missing, force a fetch even if probe failed
   if (nord_table_missing) {
@@ -2879,8 +3439,12 @@ determine_run_status <- function() {
     log_warn("ForceDecks table missing - forcing fetch attempt even if probe returned 0")
     fd_changed <- TRUE
   }
+  if (dynamo_table_missing && dynamo_configured) {
+    log_warn("DynaMo table missing - forcing fetch attempt")
+    dynamo_changed <- TRUE
+  }
   
-  any_changes <- fd_changed || nord_changed
+  any_changes <- fd_changed || nord_changed || dynamo_changed
   
   log_check_summary("ForceDecks", count_tests_current, latest_date_current, 
                     api_test_count, api_latest_date, 
@@ -2888,6 +3452,9 @@ determine_run_status <- function() {
   log_check_summary("NordBord", count_nord_tests_current, latest_nord_date_current,
                     nord_api_test_count, nord_api_latest_date,
                     if(nord_changed) "CHANGED" else "NO_CHANGE")
+  log_check_summary("DynaMo", count_dynamo_tests_current, latest_dynamo_date_current,
+                    dynamo_api_test_count, dynamo_api_latest_date,
+                    if(dynamo_changed) "CHANGED" else if(!dynamo_configured) "SKIPPED" else "NO_CHANGE")
   
   # -------------------------------------------------------------------------
   # Step 4: Determine Run Type
@@ -2898,6 +3465,7 @@ determine_run_status <- function() {
       run_type = "STANDDOWN",
       fd_changed = FALSE,
       nord_changed = FALSE,
+      dynamo_changed = FALSE,
       any_changes = FALSE
     ))
   }
@@ -2909,9 +3477,11 @@ determine_run_status <- function() {
     run_type = run_type,
     fd_changed = fd_changed,
     nord_changed = nord_changed,
+    dynamo_changed = dynamo_changed,
     any_changes = TRUE,
     max_fd_date = latest_date_current,
-    max_nord_date = latest_nord_date_current
+    max_nord_date = latest_nord_date_current,
+    max_dynamo_date = latest_dynamo_date_current
   ))
 }
 
@@ -4047,6 +4617,83 @@ if (nord_changed) {
 }
 
 # ============================================================================
+# DynaMo Processing Branch
+# ============================================================================
+dynamo_changed <- run_status$dynamo_changed %||% FALSE
+
+if (dynamo_changed) {
+  tryCatch({
+    log_and_store("=== DYNAMO BRANCH START ===")
+    
+    dynamo_data <- safe_fetch_dynamo(timeout_seconds = CONFIG$timeout_nordbord)
+    
+    # Track if fetch was complete or partial
+    update_status("dynamo_fetch_complete", isTRUE(dynamo_data$fetch_complete))
+    update_status("dynamo_fetch_timeout", isTRUE(dynamo_data$fetch_timeout))
+    
+    tests_count <- length(dynamo_data$tests)
+    details_count <- length(dynamo_data$details)
+    
+    if (tests_count == 0) {
+      log_warn("No DynaMo tests returned")
+    } else {
+      update_status("dynamo_fetched", TRUE)
+      log_and_store("Fetched {tests_count} DynaMo tests, {details_count} details")
+      
+      # V2.4.3: Store original API test IDs for reconciliation
+      dynamo_test_ids <- vapply(dynamo_data$tests, function(x) x$id %||% NA_character_, character(1))
+      dynamo_test_ids <- dynamo_test_ids[!is.na(dynamo_test_ids)]
+      .GlobalEnv$api_test_ids$dynamo <- unique(dynamo_test_ids)
+      log_info("Stored {length(.GlobalEnv$api_test_ids$dynamo)} DynaMo test_IDs for reconciliation")
+      
+      # Process DynaMo data
+      dynamo_export <- process_dynamo(dynamo_data$tests, dynamo_data$details)
+      
+      if (nrow(dynamo_export) > 0) {
+        # V2.4.3: Track test_IDs filtered during DynaMo processing
+        export_ids <- unique(as.character(dynamo_export$test_ID))
+        filtered_in_processing <- setdiff(dynamo_test_ids, export_ids)
+        
+        if (length(filtered_in_processing) > 0) {
+          record_filtered_tests(filtered_in_processing, "DYNAMO_PROCESSING", 
+                               "Filtered during DynaMo processing", "DynaMo")
+        }
+        
+        # V2.4.3: Track duplicate test_IDs BEFORE deduplication using helper
+        dup_info_dynamo <- detect_and_track_duplicates(dynamo_export, "DYNAMO_DEDUP", "DynaMo")
+        
+        # Deduplication: Ensure unique test_IDs before export
+        n_before_dedup <- nrow(dynamo_export)
+        dynamo_export <- unique(dynamo_export, by = "test_ID")
+        n_after_dedup <- nrow(dynamo_export)
+        
+        if (n_before_dedup > n_after_dedup) {
+          log_warn("DynaMo deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
+          log_warn("Retained {n_after_dedup} unique DynaMo records for export")
+        } else {
+          log_info("DynaMo deduplication: All {n_after_dedup} test_IDs are unique")
+        }
+        
+        bq_upsert(dynamo_export, "vald_dynamo", key = "test_ID", mode = "MERGE",
+                  partition_field = "date", cluster_fields = c("vald_id"))
+        update_status("dynamo_processed", TRUE)
+        log_and_store("Exported {nrow(dynamo_export)} DynaMo records with {ncol(dynamo_export)} columns")
+      } else {
+        log_warn("No DynaMo records after processing")
+      }
+    }
+    
+    log_and_store("=== DYNAMO BRANCH COMPLETE ===")
+    
+  }, error = function(e) {
+    log_error("DynaMo branch failed: {e$message}")
+    record_error("DynaMo_Branch", e$message)
+  })
+} else {
+  log_and_store("DynaMo: No changes detected or not configured - skipping")
+}
+
+# ============================================================================
 # Finalization
 # ============================================================================
 
@@ -4068,6 +4715,7 @@ log_and_store("=== EXECUTION SUMMARY ===")
 status <- .GlobalEnv$execution_status
 log_and_store("FD Fetch: {if(status$fd_fetch_complete) 'COMPLETE' else if(status$fd_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
 log_and_store("Nord Fetch: {if(status$nord_fetch_complete) 'COMPLETE' else if(status$nord_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
+log_and_store("DynaMo Fetch: {if(status$dynamo_fetch_complete) 'COMPLETE' else if(status$dynamo_fetch_timeout) 'TIMEOUT/PARTIAL' else 'SKIPPED/FAILED'}")
 log_and_store("FD CMJ: {if(status$fd_cmj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("FD DJ: {if(status$fd_dj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("FD RSI: {if(status$fd_rsi_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
@@ -4075,6 +4723,7 @@ log_and_store("FD Rebound: {if(status$fd_rebound_processed) 'SUCCESS' else 'SKIP
 log_and_store("FD SLJ: {if(status$fd_slj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("FD IMTP: {if(status$fd_imtp_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 log_and_store("NordBord: {if(status$nord_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+log_and_store("DynaMo: {if(status$dynamo_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
 errors <- .GlobalEnv$execution_errors
 log_and_store("Errors: {length(errors)}")
 
