@@ -47,8 +47,27 @@ CONFIG <- list(
   
   # Limits for safety
   max_test_ids_per_run = 100L,  # Don't process too many at once
-  batch_size = 10L              # Process in small batches
+  batch_size = 10L,             # Process in small batches
+  
+  # Configurable lookback period (days) for ForceDecks API queries
+  lookback_days = as.integer(Sys.getenv("RECOVERY_LOOKBACK_DAYS", "30"))
 )
+
+#' Sanitize a string for safe SQL inclusion
+#' Escapes single quotes to prevent SQL injection
+#' @param s Character string to sanitize
+#' @return Sanitized string safe for SQL inclusion
+sanitize_sql_string <- function(s) {
+  gsub("'", "''", as.character(s), fixed = TRUE)
+}
+
+#' Validate column name for safe SQL inclusion
+#' Only allows alphanumeric characters and underscores
+#' @param col_name Column name to validate
+#' @return TRUE if valid, FALSE otherwise
+is_valid_column_name <- function(col_name) {
+  grepl("^[a-zA-Z_][a-zA-Z0-9_]*$", col_name)
+}
 
 # ============================================================================
 # Logging Functions
@@ -178,9 +197,9 @@ fetch_forcedecks_by_ids <- function(test_ids) {
   log_info("Fetching ForceDecks data for {length(test_ids)} test_IDs...")
   
   tryCatch({
-    # Use start_date to limit API response - look back 30 days max for efficiency
-    # This reduces API load while still catching recent unaccounted tests
-    start_date <- format(Sys.Date() - 30, "%Y-%m-%dT00:00:00Z")
+    # Use configurable start_date to limit API response for efficiency
+    lookback <- CONFIG$lookback_days
+    start_date <- format(Sys.Date() - lookback, "%Y-%m-%dT00:00:00Z")
     
     # Get tests with date filter
     # Note: valdr doesn't have a direct "get by ID" for ForceDecks, 
@@ -188,11 +207,11 @@ fetch_forcedecks_by_ids <- function(test_ids) {
     all_tests <- valdr::get_forcedecks_tests_only(start_date = start_date)
     
     if (is.null(all_tests) || nrow(all_tests) == 0) {
-      log_warn("No ForceDecks tests returned from API (last 30 days)")
+      log_warn("No ForceDecks tests returned from API (last {lookback} days)")
       return(list(tests = data.table::data.table(), trials = data.table::data.table()))
     }
     
-    log_info("API returned {nrow(all_tests)} tests from last 30 days")
+    log_info("API returned {nrow(all_tests)} tests from last {lookback} days")
     
     # Filter to our specific test IDs
     tests_dt <- data.table::as.data.table(all_tests)
@@ -364,8 +383,17 @@ upload_recovered_data <- function(dt, table_name, key_col = "test_ID") {
     # Upload to temp table
     bigrquery::bq_table_upload(temp_tbl, dt, write_disposition = "WRITE_TRUNCATE")
     
-    # Build column list for merge
+    # Build column list for merge with validated column names
     cols <- names(dt)
+    
+    # Validate column names to prevent SQL injection
+    invalid_cols <- cols[!sapply(cols, is_valid_column_name)]
+    if (length(invalid_cols) > 0) {
+      log_error("Invalid column names detected: {paste(invalid_cols, collapse = ', ')}")
+      bigrquery::bq_table_delete(temp_tbl)
+      return(FALSE)
+    }
+    
     update_assignments <- paste(sapply(cols, function(c) glue::glue("T.`{c}` = S.`{c}`")), collapse = ", ")
     insert_cols <- paste0("`", cols, "`", collapse = ", ")
     insert_vals <- paste0("S.`", cols, "`", collapse = ", ")
@@ -404,8 +432,9 @@ purge_processed_test_ids <- function(test_ids) {
   }
   
   tryCatch({
-    # Build the DELETE query
-    test_ids_quoted <- paste0("'", test_ids, "'", collapse = ", ")
+    # Sanitize test_IDs to prevent SQL injection
+    test_ids_sanitized <- sapply(test_ids, sanitize_sql_string)
+    test_ids_quoted <- paste0("'", test_ids_sanitized, "'", collapse = ", ")
     
     sql <- glue::glue("
       DELETE FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.filtered_test_ids_log`
@@ -449,7 +478,9 @@ verify_test_ids_saved <- function(test_ids, data_source) {
       
       if (!safe_table_exists(tbl)) next
       
-      test_ids_quoted <- paste0("'", test_ids, "'", collapse = ", ")
+      # Sanitize test_IDs to prevent SQL injection
+      test_ids_sanitized <- sapply(test_ids, sanitize_sql_string)
+      test_ids_quoted <- paste0("'", test_ids_sanitized, "'", collapse = ", ")
       sql <- glue::glue("
         SELECT DISTINCT test_ID 
         FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}`

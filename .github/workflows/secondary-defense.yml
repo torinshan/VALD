@@ -86,11 +86,12 @@ jobs:
           VALD_CLIENT_ID: ${{ secrets.VALD_CLIENT_ID }}
           VALD_CLIENT_SECRET: ${{ secrets.VALD_CLIENT_SECRET }}
           VALD_TENANT_ID: ${{ secrets.VALD_TENANT_ID }}
-          VALD_REGION: use
+          VALD_REGION: ${{ secrets.VALD_REGION || 'use' }}
           KEYRING_BACKEND: env
           GCP_PROJECT: ${{ env.GCP_PROJECT }}
           BQ_DATASET: ${{ env.BQ_DATASET }}
           BQ_LOCATION: ${{ env.BQ_LOCATION }}
+          RECOVERY_LOOKBACK_DAYS: "30"
         run: |
           set -e
           Rscript .github/scripts/vald_2.4.3_secondary_defense.R
