@@ -178,15 +178,21 @@ fetch_forcedecks_by_ids <- function(test_ids) {
   log_info("Fetching ForceDecks data for {length(test_ids)} test_IDs...")
   
   tryCatch({
-    # Get all tests first - we'll filter to our specific IDs
+    # Use start_date to limit API response - look back 30 days max for efficiency
+    # This reduces API load while still catching recent unaccounted tests
+    start_date <- format(Sys.Date() - 30, "%Y-%m-%dT00:00:00Z")
+    
+    # Get tests with date filter
     # Note: valdr doesn't have a direct "get by ID" for ForceDecks, 
-    # so we fetch all tests and filter
-    all_tests <- valdr::get_forcedecks_tests_only()
+    # so we fetch tests from recent period and filter to our specific IDs
+    all_tests <- valdr::get_forcedecks_tests_only(start_date = start_date)
     
     if (is.null(all_tests) || nrow(all_tests) == 0) {
-      log_warn("No ForceDecks tests returned from API")
+      log_warn("No ForceDecks tests returned from API (last 30 days)")
       return(list(tests = data.table::data.table(), trials = data.table::data.table()))
     }
+    
+    log_info("API returned {nrow(all_tests)} tests from last 30 days")
     
     # Filter to our specific test IDs
     tests_dt <- data.table::as.data.table(all_tests)
@@ -198,6 +204,7 @@ fetch_forcedecks_by_ids <- function(test_ids) {
     
     if (nrow(tests_dt) == 0) {
       log_warn("None of the requested test_IDs found in ForceDecks API response")
+      log_info("These tests may be older than 30 days - consider extending lookback period")
       return(list(tests = data.table::data.table(), trials = data.table::data.table()))
     }
     
@@ -329,8 +336,9 @@ process_recovered_nordbord <- function(nord_dt) {
 #' Upload recovered data to BigQuery
 #' @param dt data.table to upload
 #' @param table_name Target table name
+#' @param key_col Column to use as key for upsert (default: "test_ID")
 #' @return TRUE if successful, FALSE otherwise
-upload_recovered_data <- function(dt, table_name) {
+upload_recovered_data <- function(dt, table_name, key_col = "test_ID") {
   if (nrow(dt) == 0) {
     log_info("No data to upload for {table_name}")
     return(FALSE)
@@ -340,10 +348,46 @@ upload_recovered_data <- function(dt, table_name) {
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
     tbl <- bigrquery::bq_table(ds, table_name)
     
-    # Use MERGE mode to upsert
-    bigrquery::bq_table_upload(tbl, dt, write_disposition = "WRITE_APPEND")
+    # Check if table exists - if not, create and upload
+    if (!safe_table_exists(tbl)) {
+      log_info("Creating new table {table_name}...")
+      bigrquery::bq_table_upload(tbl, dt, write_disposition = "WRITE_TRUNCATE")
+      log_info("Created and uploaded {nrow(dt)} records to {table_name}")
+      return(TRUE)
+    }
     
-    log_info("Uploaded {nrow(dt)} records to {table_name}")
+    # For existing tables, use MERGE via SQL to upsert
+    # First, upload to a temp table, then merge
+    temp_table_name <- paste0(table_name, "_recovery_temp")
+    temp_tbl <- bigrquery::bq_table(ds, temp_table_name)
+    
+    # Upload to temp table
+    bigrquery::bq_table_upload(temp_tbl, dt, write_disposition = "WRITE_TRUNCATE")
+    
+    # Build column list for merge
+    cols <- names(dt)
+    update_assignments <- paste(sapply(cols, function(c) glue::glue("T.`{c}` = S.`{c}`")), collapse = ", ")
+    insert_cols <- paste0("`", cols, "`", collapse = ", ")
+    insert_vals <- paste0("S.`", cols, "`", collapse = ", ")
+    
+    # Execute merge
+    merge_sql <- glue::glue("
+      MERGE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}` T
+      USING `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{temp_table_name}` S
+      ON T.`{key_col}` = S.`{key_col}`
+      WHEN MATCHED THEN
+        UPDATE SET {update_assignments}
+      WHEN NOT MATCHED THEN
+        INSERT ({insert_cols})
+        VALUES ({insert_vals})
+    ")
+    
+    bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+    
+    # Clean up temp table
+    bigrquery::bq_table_delete(temp_tbl)
+    
+    log_info("Merged {nrow(dt)} records into {table_name}")
     return(TRUE)
     
   }, error = function(e) {
@@ -462,11 +506,53 @@ if (length(fd_test_ids) > 0) {
     fd_processed <- process_recovered_forcedecks(fd_data$tests, fd_data$trials)
     
     if (nrow(fd_processed) > 0) {
-      # Note: For full processing, this would call the same functions as the main script
-      # For now, we just log what we would do
-      log_info("Would process {nrow(fd_processed)} ForceDecks tests")
+      # Determine the appropriate table based on test type
+      # For CMJ/SJ tests, use vald_fd_jumps
+      if ("test_type" %in% names(fd_processed)) {
+        cmj_types <- c("CMJ", "LCMJ", "SJ", "ABCMJ")
+        cmj_data <- fd_processed[test_type %in% cmj_types]
+        if (nrow(cmj_data) > 0) {
+          upload_success <- upload_recovered_data(cmj_data, "vald_fd_jumps", "test_ID")
+          if (upload_success) {
+            log_info("Saved {nrow(cmj_data)} CMJ/SJ tests to vald_fd_jumps")
+          }
+        }
+        
+        # DJ tests
+        dj_data <- fd_processed[test_type == "DJ"]
+        if (nrow(dj_data) > 0) {
+          upload_success <- upload_recovered_data(dj_data, "vald_fd_dj", "test_ID")
+          if (upload_success) {
+            log_info("Saved {nrow(dj_data)} DJ tests to vald_fd_dj")
+          }
+        }
+        
+        # RSI tests
+        rsi_data <- fd_processed[test_type == "RSI"]
+        if (nrow(rsi_data) > 0) {
+          upload_success <- upload_recovered_data(rsi_data, "vald_fd_rsi", "test_ID")
+          if (upload_success) {
+            log_info("Saved {nrow(rsi_data)} RSI tests to vald_fd_rsi")
+          }
+        }
+        
+        # IMTP tests
+        imtp_data <- fd_processed[test_type == "IMTP"]
+        if (nrow(imtp_data) > 0) {
+          upload_success <- upload_recovered_data(imtp_data, "vald_fd_imtp", "test_ID")
+          if (upload_success) {
+            log_info("Saved {nrow(imtp_data)} IMTP tests to vald_fd_imtp")
+          }
+        }
+      } else {
+        # Default to vald_fd_jumps if test_type not available
+        upload_success <- upload_recovered_data(fd_processed, "vald_fd_jumps", "test_ID")
+        if (upload_success) {
+          log_info("Saved {nrow(fd_processed)} ForceDecks tests to vald_fd_jumps")
+        }
+      }
       
-      # Verify which test_IDs are now present (they might have been saved by main script already)
+      # Verify which test_IDs are now present
       verified_fd <- verify_test_ids_saved(fd_test_ids, "ForceDecks")
       processed_ids <- c(processed_ids, verified_fd)
     }
@@ -490,7 +576,11 @@ if (length(nord_test_ids) > 0) {
     nord_processed <- process_recovered_nordbord(nord_data)
     
     if (nrow(nord_processed) > 0) {
-      log_info("Would process {nrow(nord_processed)} NordBord tests")
+      # Upload NordBord data
+      upload_success <- upload_recovered_data(nord_processed, "vald_nord_all", "test_ID")
+      if (upload_success) {
+        log_info("Saved {nrow(nord_processed)} NordBord tests to vald_nord_all")
+      }
       
       verified_nord <- verify_test_ids_saved(nord_test_ids, "NordBord")
       processed_ids <- c(processed_ids, verified_nord)
