@@ -108,6 +108,36 @@ record_filtered_tests <- function(test_ids, stage, reason, source = "ForceDecks"
   }
 }
 
+#' Helper function to detect and track duplicates in test_ID column
+#' @param dt data.table with test_ID column
+#' @param stage Filter stage name for logging
+#' @param source Data source (ForceDecks or NordBord)
+#' @param id_col Column name containing test IDs (default: "test_ID")
+#' @return List with has_duplicates (logical), dup_ids (unique duplicate IDs), n_duplicates (count)
+detect_and_track_duplicates <- function(dt, stage, source, id_col = "test_ID") {
+  if (!id_col %in% names(dt)) {
+    return(list(has_duplicates = FALSE, dup_ids = character(0), n_duplicates = 0L))
+  }
+  
+  all_ids <- dt[[id_col]]
+  
+  # Fast check for any duplicates
+  if (!anyDuplicated(all_ids)) {
+    return(list(has_duplicates = FALSE, dup_ids = character(0), n_duplicates = 0L))
+  }
+  
+  # Get unique duplicate IDs
+  dup_ids <- unique(all_ids[duplicated(all_ids)])
+  n_duplicates <- length(dup_ids)
+  
+  # Record in filter log
+  if (n_duplicates > 0) {
+    record_filtered_tests(dup_ids, stage, "Duplicate test_ID", source)
+  }
+  
+  return(list(has_duplicates = TRUE, dup_ids = dup_ids, n_duplicates = n_duplicates))
+}
+
 # Safe update functions
 update_status <- function(field, value) {
   .GlobalEnv$execution_status[[field]] <- value
@@ -3670,9 +3700,8 @@ if (fd_changed) {
           
             log_info("Export schema: {ncol(cmj_export)} columns, {nrow(cmj_export)} rows")
           
-            # V2.4.3: Track duplicate test_IDs BEFORE deduplication
-            all_cmj_ids <- cmj_export$test_ID
-            dup_cmj_ids <- unique(all_cmj_ids[duplicated(all_cmj_ids)])
+            # V2.4.3: Track duplicate test_IDs BEFORE deduplication using helper
+            dup_info <- detect_and_track_duplicates(cmj_export, "CMJ_DEDUP", "ForceDecks")
           
             # V2.4.3: Deduplication prioritizing old data
             # Since we're only exporting new data, dedup within new data only
@@ -3682,11 +3711,6 @@ if (fd_changed) {
             n_after_dedup <- nrow(cmj_export)
           
             if (n_before_dedup > n_after_dedup) {
-              # Track duplicates that were removed
-              if (length(dup_cmj_ids) > 0) {
-                record_filtered_tests(dup_cmj_ids, "CMJ_DEDUP", "Duplicate test_ID in new data", "ForceDecks")
-              }
-              
               log_warn("Deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
               log_warn("Retained {n_after_dedup} unique CMJ records for export")
             } else {
@@ -3962,21 +3986,15 @@ if (nord_changed) {
       }
       
       # Deduplicate API response (valdr pagination returns overlapping records)
-      # V2.4.3: Track API pagination duplicates for complete audit trail
-      all_api_ids <- nord_raw$testId
-      api_dup_ids <- unique(all_api_ids[duplicated(all_api_ids)])
+      # V2.4.3: Track API pagination duplicates using helper (with testId column)
+      dup_info_api <- detect_and_track_duplicates(nord_raw, "NORDBORD_API_PAGINATION", "NordBord", id_col = "testId")
       
       n_raw <- nrow(nord_raw)
       nord_raw <- unique(nord_raw, by = "testId")
       n_deduped <- nrow(nord_raw)
       
       if (n_raw > n_deduped) {
-        log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed")
-        # Track these for complete audit trail (expected behavior, not a data issue)
-        if (length(api_dup_ids) > 0) {
-          record_filtered_tests(api_dup_ids, "NORDBORD_API_PAGINATION", 
-                               "Duplicate from API pagination (expected behavior)", "NordBord")
-        }
+        log_warn("API pagination overlap: {n_raw - n_deduped} duplicate testIds removed (expected behavior)")
       }
       
       update_status("nord_fetched", TRUE)
@@ -3997,9 +4015,8 @@ if (nord_changed) {
         }
       }
       
-      # V2.4.3: Track duplicate test_IDs BEFORE deduplication
-      all_nord_ids <- nord_export$test_ID
-      dup_nord_ids <- unique(all_nord_ids[duplicated(all_nord_ids)])
+      # V2.4.3: Track duplicate test_IDs BEFORE deduplication using helper
+      dup_info_nord <- detect_and_track_duplicates(nord_export, "NORDBORD_DEDUP", "NordBord")
       
       # Deduplication: Ensure unique test_IDs before export
       n_before_dedup <- nrow(nord_export)
@@ -4007,10 +4024,6 @@ if (nord_changed) {
       n_after_dedup <- nrow(nord_export)
       
       if (n_before_dedup > n_after_dedup) {
-        # V2.4.3: Track duplicates that were removed
-        if (length(dup_nord_ids) > 0) {
-          record_filtered_tests(dup_nord_ids, "NORDBORD_DEDUP", "Duplicate test_ID in data", "NordBord")
-        }
         log_warn("NordBord deduplication: Removed {n_before_dedup - n_after_dedup} duplicate test_IDs")
         log_warn("Retained {n_after_dedup} unique NordBord records for export")
       } else {
