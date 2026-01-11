@@ -1,9 +1,9 @@
 name: R → BigQuery every 15m (WIF)
 
 on:
-  # TEMPORARILY DISABLED: Experiencing VALD API timeouts (2026-01-05)
-  # schedule:
-  #   - cron: "*/15 * * * *" # UTC; gate by Pacific hours below
+  #TEMPORARILY DISABLED: Experiencing VALD API timeouts (2026-01-05)
+  schedule:
+  - cron: "*/15 * * * *" # UTC; gate by Pacific hours below
   workflow_dispatch:
 
 jobs:
