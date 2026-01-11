@@ -213,8 +213,10 @@ tryCatch({
   quit(status = 1)
 })
 
-# Null coalescing operator (also provided by rlang, but defined here for clarity)
-`%||%` <- function(a, b) if (is.null(a)) b else a
+# Null coalescing operator - use rlang version if available, otherwise define
+if (!exists("%||%", mode = "function")) {
+  `%||%` <- function(a, b) if (is.null(a)) b else a
+}
 
 # ============================================================================
 # Environment Detection
@@ -1902,6 +1904,11 @@ DYNAMO_BODY_REGION_MAP <- c(
 )
 
 #' Apply standardization mapping with fallback to auto snake_case
+#' Standardizes DynaMo API values using a predefined mapping table.
+#' For unmapped values, automatically converts from CamelCase to snake_case.
+#' @param x Character vector of values to standardize
+#' @param map Named character vector mapping API values to standardized values
+#' @return Character vector of standardized values
 dynamo_std_map <- function(x, map) {
   result <- map[x]
   result[is.na(result)] <- tolower(gsub("([a-z])([A-Z])", "\\1_\\2", x[is.na(result)]))
@@ -3126,18 +3133,51 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
   # Calculate bilateral and asymmetry columns
   log_info("Calculating bilateral and asymmetry metrics...")
   
-  # repCount = SUM, everything else = MEAN
+  # Bilateral calculations: Only calculate when both sides have data, otherwise use available side
+  # repCount = SUM (NA treated as 0 for sum)
+  # Force/impulse/ROM = MEAN of available sides (not 0, which would be misleading)
   dynamo_reps_wide[, `:=`(
-    repCount_bilateral = data.table::fcoalesce(repCount_left, 0) + data.table::fcoalesce(repCount_right, 0),
-    maxForceNewtons_bilateral = (data.table::fcoalesce(maxForceNewtons_left, 0) + data.table::fcoalesce(maxForceNewtons_right, 0)) / 2,
-    avgForceNewtons_bilateral = (data.table::fcoalesce(avgForceNewtons_left, 0) + data.table::fcoalesce(avgForceNewtons_right, 0)) / 2,
-    maxImpulseNewtonSec_bilateral = (data.table::fcoalesce(maxImpulseNewtonSec_left, 0) + data.table::fcoalesce(maxImpulseNewtonSec_right, 0)) / 2,
-    avgImpulseNewtonSec_bilateral = (data.table::fcoalesce(avgImpulseNewtonSec_left, 0) + data.table::fcoalesce(avgImpulseNewtonSec_right, 0)) / 2,
-    maxRomDegrees_bilateral = (data.table::fcoalesce(maxRomDegrees_left, 0) + data.table::fcoalesce(maxRomDegrees_right, 0)) / 2,
-    avgRomDegrees_bilateral = (data.table::fcoalesce(avgRomDegrees_left, 0) + data.table::fcoalesce(avgRomDegrees_right, 0)) / 2
+    repCount_bilateral = data.table::fcoalesce(repCount_left, 0L) + data.table::fcoalesce(repCount_right, 0L),
+    maxForceNewtons_bilateral = data.table::fcase(
+      !is.na(maxForceNewtons_left) & !is.na(maxForceNewtons_right), (maxForceNewtons_left + maxForceNewtons_right) / 2,
+      !is.na(maxForceNewtons_left), maxForceNewtons_left,
+      !is.na(maxForceNewtons_right), maxForceNewtons_right,
+      default = NA_real_
+    ),
+    avgForceNewtons_bilateral = data.table::fcase(
+      !is.na(avgForceNewtons_left) & !is.na(avgForceNewtons_right), (avgForceNewtons_left + avgForceNewtons_right) / 2,
+      !is.na(avgForceNewtons_left), avgForceNewtons_left,
+      !is.na(avgForceNewtons_right), avgForceNewtons_right,
+      default = NA_real_
+    ),
+    maxImpulseNewtonSec_bilateral = data.table::fcase(
+      !is.na(maxImpulseNewtonSec_left) & !is.na(maxImpulseNewtonSec_right), (maxImpulseNewtonSec_left + maxImpulseNewtonSec_right) / 2,
+      !is.na(maxImpulseNewtonSec_left), maxImpulseNewtonSec_left,
+      !is.na(maxImpulseNewtonSec_right), maxImpulseNewtonSec_right,
+      default = NA_real_
+    ),
+    avgImpulseNewtonSec_bilateral = data.table::fcase(
+      !is.na(avgImpulseNewtonSec_left) & !is.na(avgImpulseNewtonSec_right), (avgImpulseNewtonSec_left + avgImpulseNewtonSec_right) / 2,
+      !is.na(avgImpulseNewtonSec_left), avgImpulseNewtonSec_left,
+      !is.na(avgImpulseNewtonSec_right), avgImpulseNewtonSec_right,
+      default = NA_real_
+    ),
+    maxRomDegrees_bilateral = data.table::fcase(
+      !is.na(maxRomDegrees_left) & !is.na(maxRomDegrees_right), (maxRomDegrees_left + maxRomDegrees_right) / 2,
+      !is.na(maxRomDegrees_left), maxRomDegrees_left,
+      !is.na(maxRomDegrees_right), maxRomDegrees_right,
+      default = NA_real_
+    ),
+    avgRomDegrees_bilateral = data.table::fcase(
+      !is.na(avgRomDegrees_left) & !is.na(avgRomDegrees_right), (avgRomDegrees_left + avgRomDegrees_right) / 2,
+      !is.na(avgRomDegrees_left), avgRomDegrees_left,
+      !is.na(avgRomDegrees_right), avgRomDegrees_right,
+      default = NA_real_
+    )
   )]
   
   # Asymmetry: (Right - Left) / ((Right + Left) / 2) * 100
+  # Only calculate when both sides have data
   dynamo_reps_wide[, `:=`(
     maxForceNewtons_asymmetry = data.table::fifelse(
       is.na(maxForceNewtons_right) | is.na(maxForceNewtons_left) | 
@@ -3188,7 +3228,7 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
     max_force_right = maxForceNewtons_right,
     max_force_left = maxForceNewtons_left,
     max_force_bilateral = maxForceNewtons_bilateral,
-    max_force_asymmetry = avgForceNewtons_asymmetry,
+    max_force_asymmetry = maxForceNewtons_asymmetry,
     impulse_bilateral = avgImpulseNewtonSec_bilateral,
     impulse_left = avgImpulseNewtonSec_left,
     impulse_right = avgImpulseNewtonSec_right,
