@@ -1019,8 +1019,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       # Create staging table with 1-hour expiration as safety net
       # This ensures it auto-deletes even if manual cleanup fails
-      # FIX: BigQuery expects expiration_time in MILLISECONDS since epoch
-      staging_expiration_ms <- as.numeric(Sys.time() + 3600) * 1000
+      # FIX: BigQuery expects expiration_time in MILLISECONDS since epoch as INTEGER
+      staging_expiration_ms <- as.integer(as.numeric(Sys.time() + 3600) * 1000)
       
       log_info("Creating temporary staging table: {staging_name} (1-hour expiration)")
       tryCatch({
