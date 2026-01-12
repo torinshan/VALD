@@ -1522,32 +1522,33 @@ reconcile_test_ids <- function() {
                                              "vald_fd_rebound")]))
   all_saved_nord <- unique(unlist(saved_ids["vald_nord_all"]))
   all_saved_dynamo <- unique(unlist(saved_ids["vald_dynamo"]))
+  global_filtered_ids <- unique(.GlobalEnv$filtered_test_ids$test_ID)
   
   # ForceDecks reconciliation
   if (length(api_ids$forcedecks) > 0) {
-    missing_fd <- setdiff(api_ids$forcedecks, all_saved_fd)
+    missing_fd <- setdiff(api_ids$forcedecks, union(all_saved_fd, global_filtered_ids))
     
     if (length(missing_fd) > 0) {
       log_warn("RECONCILIATION: {length(missing_fd)} ForceDecks test_IDs not in any data table")
       log_warn("Missing test_IDs (first 10): {paste(head(missing_fd, 10), collapse = ', ')}")
       
       # Check if these are in the filtered log
-      filtered_ids <- .GlobalEnv$filtered_test_ids
-      if (nrow(filtered_ids) > 0) {
-        in_filtered <- missing_fd[missing_fd %in% filtered_ids$test_ID]
-        not_in_filtered <- setdiff(missing_fd, filtered_ids$test_ID)
-        
-        log_info("  - {length(in_filtered)} are in filtered log (intentionally excluded)")
-        log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR (investigate)")
-        
-        # Record unaccounted test_IDs
-        if (length(not_in_filtered) > 0) {
-          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in any table or filter log", "ForceDecks")
-        }
-      } else {
-        log_warn("  - All {length(missing_fd)} are UNACCOUNTED FOR (no filter log)")
-        record_filtered_tests(missing_fd, "RECONCILIATION", "Unaccounted - no filter log", "ForceDecks")
-      }
+       filtered_log <- .GlobalEnv$filtered_test_ids
+       if (nrow(filtered_log) > 0) {
+         in_filtered <- missing_fd[missing_fd %in% filtered_log$test_ID]
+         not_in_filtered <- setdiff(missing_fd, filtered_log$test_ID)
+         
+         log_info("  - {length(in_filtered)} are in filtered log (intentionally excluded)")
+         log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR (investigate)")
+         
+         # Record unaccounted test_IDs
+         if (length(not_in_filtered) > 0) {
+           record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in any table or filter log", "ForceDecks")
+         }
+       } else {
+         log_warn("  - All {length(missing_fd)} are UNACCOUNTED FOR (no filter log)")
+         record_filtered_tests(missing_fd, "RECONCILIATION", "Unaccounted - no filter log", "ForceDecks")
+       }
     } else {
       log_info("RECONCILIATION: All {length(api_ids$forcedecks)} ForceDecks test_IDs accounted for")
     }
@@ -1557,24 +1558,24 @@ reconcile_test_ids <- function() {
   
   # NordBord reconciliation
   if (length(api_ids$nordbord) > 0) {
-    missing_nord <- setdiff(api_ids$nordbord, all_saved_nord)
+    missing_nord <- setdiff(api_ids$nordbord, union(all_saved_nord, global_filtered_ids))
     
     if (length(missing_nord) > 0) {
       log_warn("RECONCILIATION: {length(missing_nord)} NordBord test_IDs not in data table")
       
-      filtered_ids <- .GlobalEnv$filtered_test_ids
-      if (nrow(filtered_ids) > 0) {
-        in_filtered <- missing_nord[missing_nord %in% filtered_ids$test_ID]
-        not_in_filtered <- setdiff(missing_nord, filtered_ids$test_ID)
-        
-        log_info("  - {length(in_filtered)} are in filtered log")
-        if (length(not_in_filtered) > 0) {
-          log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
-          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "NordBord")
-        }
-      } else {
-        record_filtered_tests(missing_nord, "RECONCILIATION", "Unaccounted - no filter log", "NordBord")
-      }
+       filtered_log <- .GlobalEnv$filtered_test_ids
+       if (nrow(filtered_log) > 0) {
+         in_filtered <- missing_nord[missing_nord %in% filtered_log$test_ID]
+         not_in_filtered <- setdiff(missing_nord, filtered_log$test_ID)
+         
+         log_info("  - {length(in_filtered)} are in filtered log")
+         if (length(not_in_filtered) > 0) {
+           log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
+           record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "NordBord")
+         }
+       } else {
+         record_filtered_tests(missing_nord, "RECONCILIATION", "Unaccounted - no filter log", "NordBord")
+       }
     } else {
       log_info("RECONCILIATION: All {length(api_ids$nordbord)} NordBord test_IDs accounted for")
     }
@@ -1584,24 +1585,24 @@ reconcile_test_ids <- function() {
   
   # DynaMo reconciliation
   if (length(api_ids$dynamo) > 0) {
-    missing_dynamo <- setdiff(api_ids$dynamo, all_saved_dynamo)
+    missing_dynamo <- setdiff(api_ids$dynamo, union(all_saved_dynamo, global_filtered_ids))
     
     if (length(missing_dynamo) > 0) {
       log_warn("RECONCILIATION: {length(missing_dynamo)} DynaMo test_IDs not in data table")
       
-      filtered_ids <- .GlobalEnv$filtered_test_ids
-      if (nrow(filtered_ids) > 0) {
-        in_filtered <- missing_dynamo[missing_dynamo %in% filtered_ids$test_ID]
-        not_in_filtered <- setdiff(missing_dynamo, filtered_ids$test_ID)
-        
-        log_info("  - {length(in_filtered)} are in filtered log")
-        if (length(not_in_filtered) > 0) {
-          log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
-          record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "DynaMo")
-        }
-      } else {
-        record_filtered_tests(missing_dynamo, "RECONCILIATION", "Unaccounted - no filter log", "DynaMo")
-      }
+       filtered_log <- .GlobalEnv$filtered_test_ids
+       if (nrow(filtered_log) > 0) {
+         in_filtered <- missing_dynamo[missing_dynamo %in% filtered_log$test_ID]
+         not_in_filtered <- setdiff(missing_dynamo, filtered_log$test_ID)
+         
+         log_info("  - {length(in_filtered)} are in filtered log")
+         if (length(not_in_filtered) > 0) {
+           log_warn("  - {length(not_in_filtered)} are UNACCOUNTED FOR")
+           record_filtered_tests(not_in_filtered, "RECONCILIATION", "Unaccounted - not in table or filter log", "DynaMo")
+         }
+       } else {
+         record_filtered_tests(missing_dynamo, "RECONCILIATION", "Unaccounted - no filter log", "DynaMo")
+       }
     } else {
       log_info("RECONCILIATION: All {length(api_ids$dynamo)} DynaMo test_IDs accounted for")
     }
