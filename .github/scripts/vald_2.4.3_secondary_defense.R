@@ -199,7 +199,7 @@ query_unaccounted_test_ids <- function() {
 }
 
 #' Query all filtered test_IDs from filtered_test_ids_log
-#' @return Character vector of filtered test_IDs
+#' @return Character vector of filtered test_IDs (empty if table missing or on error)
 query_filtered_test_ids <- function() {
   tryCatch({
     ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
@@ -793,7 +793,7 @@ reconcile_tests_table <- function() {
     return(0L)
   }
   
-  sanitized_ids <- sapply(to_remove, sanitize_sql_string)
+  sanitized_ids <- sanitize_sql_string(to_remove)
   id_list <- paste0("'", sanitized_ids, "'", collapse = ", ")
   
   delete_sql <- glue::glue("
@@ -803,9 +803,9 @@ reconcile_tests_table <- function() {
   
   tryCatch({
     bigrquery::bq_project_query(CONFIG$gcp_project, delete_sql)
-    log_warn("Removed {length(to_remove)} test_IDs from tests table (not in data tables or filtered)")
+    log_warn(glue::glue("Removed {length(to_remove)} test_IDs from tests table (not in data tables or filtered)"))
   }, error = function(e) {
-    log_warn("Failed to delete stale test_IDs: {e$message}")
+    log_warn(glue::glue("Failed to delete stale test_IDs: {e$message}"))
   })
   
   return(length(to_remove))
@@ -1019,9 +1019,9 @@ reconcile_dates_table <- function() {
   
   tryCatch({
     bigrquery::bq_project_query(CONFIG$gcp_project, delete_sql)
-    log_warn("Removed {length(to_remove)} dates from dates table (not present in data tables)")
+    log_warn(glue::glue("Removed {length(to_remove)} dates from dates table (not present in data tables)"))
   }, error = function(e) {
-    log_warn("Failed to delete stale dates: {e$message}")
+    log_warn(glue::glue("Failed to delete stale dates: {e$message}"))
   })
   
   return(length(to_remove))
@@ -1043,7 +1043,7 @@ if (n_tests_synced > 0) {
 }
 reconciled_tests <- reconcile_tests_table()
 if (reconciled_tests > 0) {
-  log_info("Tests table reconciliation removed {reconciled_tests} test_IDs")
+  log_info(glue::glue("Tests table reconciliation removed {reconciled_tests} test_IDs"))
 } else {
   log_info("Tests table reconciliation: no removals needed")
 }
@@ -1059,7 +1059,7 @@ if (n_dates_synced > 0) {
 }
 reconciled_dates <- reconcile_dates_table()
 if (reconciled_dates > 0) {
-  log_info("Dates table reconciliation removed {reconciled_dates} dates")
+  log_info(glue::glue("Dates table reconciliation removed {reconciled_dates} dates"))
 } else {
   log_info("Dates table reconciliation: no removals needed")
 }
