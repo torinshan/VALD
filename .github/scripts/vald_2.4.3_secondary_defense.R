@@ -624,7 +624,7 @@ sync_tests_table <- function() {
   # Combine all data table results
   combined <- data.table::rbindlist(all_data_test_ids, use.names = TRUE, fill = TRUE)
   
-  # Get unique test_IDs by taking first occurrence (prioritize keeping first seen)
+  # Get unique test_IDs (keeps first occurrence when duplicates exist across tables)
   combined <- unique(combined, by = "test_ID")
   
   total_data_test_ids <- nrow(combined)
@@ -642,28 +642,32 @@ sync_tests_table <- function() {
   
   log_warn("Found {n_missing} test_IDs in data tables that are missing from tests table")
   
-  # Prepare data for tests table insert
+  # Prepare data for tests table insert using efficient column selection
   # Required columns: test_ID, vald_id, date, test_type
-  tests_to_add <- missing_test_ids[, .(test_ID)]
+  cols_to_include <- "test_ID"
   
-  # Add vald_id if available
+  # Build list of available columns
   if ("vald_id" %in% names(missing_test_ids)) {
-    tests_to_add[, vald_id := missing_test_ids$vald_id]
-  } else {
+    cols_to_include <- c(cols_to_include, "vald_id")
+  }
+  if ("date" %in% names(missing_test_ids)) {
+    cols_to_include <- c(cols_to_include, "date")
+  }
+  if ("test_type" %in% names(missing_test_ids)) {
+    cols_to_include <- c(cols_to_include, "test_type")
+  }
+  
+  # Create the data.table with available columns
+  tests_to_add <- missing_test_ids[, ..cols_to_include]
+  
+  # Add missing columns with NA values
+  if (!"vald_id" %in% names(tests_to_add)) {
     tests_to_add[, vald_id := NA_character_]
   }
-  
-  # Add date if available
-  if ("date" %in% names(missing_test_ids)) {
-    tests_to_add[, date := missing_test_ids$date]
-  } else {
+  if (!"date" %in% names(tests_to_add)) {
     tests_to_add[, date := as.Date(NA)]
   }
-  
-  # Add test_type if available
-  if ("test_type" %in% names(missing_test_ids)) {
-    tests_to_add[, test_type := missing_test_ids$test_type]
-  } else {
+  if (!"test_type" %in% names(tests_to_add)) {
     tests_to_add[, test_type := NA_character_]
   }
   
@@ -796,19 +800,21 @@ sync_dates_table <- function() {
   # Query existing dates from dates table
   existing_dates <- query_dates_table()
   
-  # Collect all dates from data tables
-  all_data_dates <- as.Date(character(0))
+  # Collect all dates from data tables using a list for efficiency
+  date_list <- vector("list", length(data_tables))
   
-  for (table_name in data_tables) {
-    dates <- query_data_table_dates(table_name)
+  for (i in seq_along(data_tables)) {
+    dates <- query_data_table_dates(data_tables[i])
     if (length(dates) > 0) {
-      all_data_dates <- c(all_data_dates, dates)
+      date_list[[i]] <- dates
     }
   }
   
-  # Get unique dates
-  all_data_dates <- unique(all_data_dates)
+  # Flatten the list and get unique dates
+  all_data_dates <- unique(unlist(date_list))
   all_data_dates <- all_data_dates[!is.na(all_data_dates)]
+  # Convert from numeric (which unlist produces for Dates) back to Date
+  all_data_dates <- as.Date(all_data_dates, origin = "1970-01-01")
   
   if (length(all_data_dates) == 0) {
     log_info("No dates found in any data tables - nothing to sync")
