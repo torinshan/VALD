@@ -784,10 +784,9 @@ reconcile_tests_table <- function() {
   filtered_ids <- query_filtered_test_ids()
   
   current_ids <- as.character(current_tests$test_ID)
-  to_remove <- unique(c(
-    setdiff(current_ids, valid_ids),
-    intersect(current_ids, filtered_ids)
-  ))
+  invalid_ids <- setdiff(current_ids, valid_ids)
+  filtered_matches <- intersect(current_ids, filtered_ids)
+  to_remove <- unique(c(invalid_ids, filtered_matches))
   
   if (length(to_remove) == 0) {
     log_info("Tests table reconciliation complete: no rows to remove")
@@ -997,8 +996,13 @@ reconcile_dates_table <- function() {
     date_list[[i]] <- query_data_table_dates(DATA_TABLES[i])
   }
   
-  valid_dates <- unique(as.Date(unlist(date_list), origin = "1970-01-01"))
-  valid_dates <- valid_dates[!is.na(valid_dates)]
+  combined_dates <- do.call(c, date_list)
+  if (length(combined_dates) == 0) {
+    valid_dates <- as.Date(character(0))
+  } else {
+    valid_dates <- unique(as.Date(combined_dates))
+    valid_dates <- valid_dates[!is.na(valid_dates)]
+  }
   
   to_remove <- setdiff(existing_dates, valid_dates)
   
