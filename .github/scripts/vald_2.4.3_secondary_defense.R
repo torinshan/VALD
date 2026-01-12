@@ -580,7 +580,7 @@ query_tests_table_ids <- function() {
     return(test_ids)
     
   }, error = function(e) {
-    log_warn("Could not query tests table: {e$message}")
+    log_warn(paste0("Could not query tests table: ", conditionMessage(e)))
     return(character(0))
   })
 }
