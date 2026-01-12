@@ -281,8 +281,12 @@ copy_table_bq <- function() {
       SELECT * FROM `{SOURCE_PROJECT}.{SOURCE_DATASET}.{SOURCE_TABLE}`
     ")
     
-    job <- bq_project_query(DEST_PROJECT, sql)
-    bq_job_wait(job)
+    # Note: bq_project_query() may return a bq_job (older bigrquery) or bq_table (bigrquery >= 1.4.0)
+    query_result <- bq_project_query(DEST_PROJECT, sql)
+    # Only call bq_job_wait() if we got a bq_job object
+    if (inherits(query_result, "bq_job")) {
+      bq_job_wait(query_result)
+    }
     
     log_msg("Table copy completed successfully", "SUCCESS")
     return(TRUE)

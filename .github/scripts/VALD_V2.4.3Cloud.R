@@ -1115,37 +1115,47 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       log_info("Executing MERGE for {table_name}...")
       
       # Execute merge and capture job details
-      job <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      # Note: bq_project_query() may return a bq_job (older bigrquery) or bq_table (bigrquery >= 1.4.0)
+      query_result <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
       
-      # Wait for job completion and get detailed status
-      job_result <- bigrquery::bq_job_wait(job, quiet = FALSE)
-      
-      # Check if job succeeded
-      job_status <- bigrquery::bq_job_status(job)
-      if (!is.null(job_status$errorResult)) {
-        # Job failed - extract detailed error information
-        error_msg <- job_status$errorResult$message
-        error_reason <- job_status$errorResult$reason
-        error_location <- job_status$errorResult$location
+      # Check if we got a bq_job or bq_table
+      # In bigrquery >= 1.4.0, bq_project_query() returns a bq_table by default
+      # and waits for completion internally, so no need to call bq_job_wait()
+      if (inherits(query_result, "bq_job")) {
+        # Legacy behavior: got a bq_job, need to wait and check status
+        job_result <- bigrquery::bq_job_wait(query_result, quiet = FALSE)
         
-        log_error("MERGE job failed with reason: {error_reason}")
-        log_error("Error message: {error_msg}")
-        if (!is.null(error_location)) {
-          log_error("Error location: {error_location}")
-        }
-        
-        # Try to drop staging table even on failure
-        tryCatch({
-          staging_exists <- safe_table_exists(staging_tbl)
-          if (staging_exists) {
-            bigrquery::bq_table_delete(staging_tbl)
-            log_info("Cleaned up staging table after failure")
+        # Check if job succeeded
+        job_status <- bigrquery::bq_job_status(query_result)
+        if (!is.null(job_status$errorResult)) {
+          # Job failed - extract detailed error information
+          error_msg <- job_status$errorResult$message
+          error_reason <- job_status$errorResult$reason
+          error_location <- job_status$errorResult$location
+          
+          log_error("MERGE job failed with reason: {error_reason}")
+          log_error("Error message: {error_msg}")
+          if (!is.null(error_location)) {
+            log_error("Error location: {error_location}")
           }
-        }, error = function(cleanup_err) {
-          log_warn("Could not clean up staging table: {cleanup_err$message}")
-        })
-        
-        stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
+          
+          # Try to drop staging table even on failure
+          tryCatch({
+            staging_exists <- safe_table_exists(staging_tbl)
+            if (staging_exists) {
+              bigrquery::bq_table_delete(staging_tbl)
+              log_info("Cleaned up staging table after failure")
+            }
+          }, error = function(cleanup_err) {
+            log_warn("Could not clean up staging table: {cleanup_err$message}")
+          })
+          
+          stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
+        }
+      } else {
+        # Modern behavior: got a bq_table, query already completed successfully
+        # bq_project_query() waits for completion and throws on error
+        log_info("MERGE query completed (bq_table returned)")
       }
       
       # Success - drop staging table immediately
