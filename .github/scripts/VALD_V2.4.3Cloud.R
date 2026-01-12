@@ -162,6 +162,117 @@ detect_and_track_duplicates <- function(dt, stage, source, id_col = "test_ID") {
   return(list(has_duplicates = TRUE, dup_ids = dup_ids, n_duplicates = n_duplicates))
 }
 
+# ============================================================================
+# VALD Roster Processing Function
+# ============================================================================
+# Processes raw VALD profile data to extract team, position, sport, and other metadata
+# Category 1 = team, Group 1-4 = position hierarchy (with football-specific logic)
+process_vald_roster_detailed <- function(roster_data) {
+  # Convert to data.table if needed
+  if (!data.table::is.data.table(roster_data)) {
+    roster_data <- data.table::as.data.table(roster_data)
+  }
+  
+  # Standardize column names for category/group fields
+  col_mapping <- c(
+    "Category 1" = "category_1", "category_1" = "category_1", "category1" = "category_1",
+    "Group 1" = "group_1", "group_1" = "group_1", "group1" = "group_1",
+    "Group 2" = "group_2", "group_2" = "group_2", "group2" = "group_2",
+    "Group 3" = "group_3", "group_3" = "group_3", "group3" = "group_3",
+    "Group 4" = "group_4", "group_4" = "group_4", "group4" = "group_4"
+  )
+  
+  for (old_name in names(col_mapping)) {
+    if (old_name %in% names(roster_data) && old_name != col_mapping[old_name]) {
+      data.table::setnames(roster_data, old_name, col_mapping[old_name], skip_absent = TRUE)
+    }
+  }
+  
+  # Ensure required columns exist
+  required_cols <- c("category_1", "group_1", "group_2", "group_3", "group_4")
+  for (col in required_cols) {
+    if (!col %in% names(roster_data)) {
+      roster_data[, (col) := NA_character_]
+    }
+  }
+  
+  # Filter to rows with at least some category/group info
+  roster_data <- roster_data[!is.na(category_1) | !is.na(group_1)]
+  
+  if (nrow(roster_data) == 0) {
+    return(roster_data)
+  }
+  
+  # Extract team from Category 1
+  roster_data[, team := category_1]
+  
+  # Detect sport based on team name
+  roster_data[, sport := data.table::fcase(
+    grepl("Football", team, ignore.case = TRUE), "Football",
+    grepl("Soccer", team, ignore.case = TRUE), "Soccer",
+    grepl("Basketball", team, ignore.case = TRUE), "Basketball",
+    grepl("Softball", team, ignore.case = TRUE), "Softball",
+    grepl("Gymnastics", team, ignore.case = TRUE), "Gymnastics",
+    grepl("Track", team, ignore.case = TRUE), "Track & Field",
+    grepl("Volleyball", team, ignore.case = TRUE), "Volleyball",
+    default = "Other"
+  )]
+  
+  # Football position codes
+  football_positions <- c("WR", "RB", "TE", "QB", "DB", "LB", "DL", "OL", "SPEC")
+  
+  # Extract position with priority: Group 4 -> Group 3 -> Group 2 -> Group 1 for Football
+  roster_data[, position := data.table::fcase(
+    sport == "Football" & !is.na(group_4) & group_4 %in% football_positions, group_4,
+    sport == "Football" & !is.na(group_3) & group_3 %in% football_positions, group_3,
+    sport == "Football" & !is.na(group_2) & group_2 %in% football_positions, group_2,
+    sport == "Football" & !is.na(group_1) & group_1 %in% football_positions, group_1,
+    sport != "Football" & !is.na(group_1), group_1,
+    default = "Unspecified"
+  )]
+  
+  # Position class for football
+  roster_data[, position_class := data.table::fcase(
+    sport == "Football" & position %in% c("TE", "LB"), "Combo",
+    sport == "Football" & position %in% c("DB", "WR"), "Skill",
+    sport == "Football" & position %in% c("DL", "OL"), "Line",
+    sport == "Football" & position %in% c("RB", "QB"), "Offense",
+    sport == "Football" & (group_1 == "Skill" | group_2 == "Skill" | group_3 == "Skill"), "Skill",
+    sport == "Football" & (group_1 == "Combo" | group_2 == "Combo" | group_3 == "Combo"), "Combo",
+    sport == "Football" & (group_1 == "Line" | group_2 == "Line" | group_3 == "Line"), "Line",
+    sport == "Football" & (group_1 == "SPEC" | group_2 == "SPEC" | group_3 == "SPEC"), "Special Teams",
+    default = NA_character_
+  )]
+  
+  # Unit (Offense/Defense) for football
+  roster_data[, unit := data.table::fcase(
+    sport == "Football" & (group_1 == "Offense" | group_2 == "Offense" | group_3 == "Offense"), "Offense",
+    sport == "Football" & (group_1 == "Defense" | group_2 == "Defense" | group_3 == "Defense"), "Defense",
+    sport == "Football" & position %in% c("QB", "RB", "WR", "TE", "OL"), "Offense",
+    sport == "Football" & position %in% c("DB", "LB", "DL"), "Defense",
+    default = NA_character_
+  )]
+  
+  # Athlete status
+  roster_data[, athlete_status := data.table::fcase(
+    group_1 %in% c("Staff", "Archive"), "Staff/Archive",
+    group_1 == "Alum", "Alumni",
+    team == "Uncategorised", "Research/Intern",
+    default = "Active Athlete"
+  )]
+  
+  # Gender detection
+  roster_data[, gender := data.table::fcase(
+    grepl("Women|W's", team, ignore.case = TRUE), "Women",
+    grepl("Men", team, ignore.case = TRUE), "Men",
+    grepl("Women's", group_1, ignore.case = TRUE), "Women",
+    grepl("Men's", group_1, ignore.case = TRUE), "Men",
+    default = "Mixed/Unknown"
+  )]
+  
+  return(roster_data)
+}
+
 # Safe update functions
 update_status <- function(field, value) {
   .GlobalEnv$execution_status[[field]] <- value
@@ -3748,6 +3859,7 @@ if (fd_changed) {
       # Build Roster from API Profiles
       # ========================================================================
       if (nrow(profiles) > 0 && "profileId" %in% names(profiles)) {
+        # First, create base roster with vald_id and full_name from profiles
         roster_from_api <- profiles[, .(
           vald_id = profileId,
           full_name = paste(trimws(givenName), trimws(familyName)),
@@ -3755,14 +3867,92 @@ if (fd_changed) {
           last_name = familyName
         )]
         
-        if (nrow(Vald_roster) > 0 && "vald_id" %in% names(Vald_roster)) {
-          roster_cols <- intersect(names(Vald_roster), c("vald_id", "team", "position"))
-          if (length(roster_cols) > 1) {
-            roster_from_api <- merge(roster_from_api, Vald_roster[, ..roster_cols], 
-                                      by = "vald_id", all.x = TRUE)
+        # Check if profiles have category/group columns for processing
+        has_category <- any(c("Category 1", "category_1", "category1") %in% names(profiles))
+        has_group <- any(c("Group 1", "group_1", "group1") %in% names(profiles))
+        
+        if (has_category || has_group) {
+          # Process profiles using the detailed roster function
+          log_info("Processing profiles with category/group data using process_vald_roster_detailed...")
+          
+          # Create a copy of profiles with vald_id for processing
+          profiles_for_processing <- data.table::copy(profiles)
+          profiles_for_processing[, vald_id := profileId]
+          
+          # Apply the detailed roster processing
+          processed_roster <- process_vald_roster_detailed(profiles_for_processing)
+          
+          if (nrow(processed_roster) > 0 && "vald_id" %in% names(processed_roster)) {
+            # Merge processed team/position back to roster_from_api
+            processed_cols <- intersect(names(processed_roster), 
+                                         c("vald_id", "team", "position", "sport", "position_class", 
+                                           "unit", "athlete_status", "gender"))
+            if (length(processed_cols) > 1) {
+              roster_from_api <- merge(roster_from_api, 
+                                        processed_roster[, ..processed_cols], 
+                                        by = "vald_id", all.x = TRUE)
+              log_info("Merged processed roster data: team, position, sport from profiles")
+            }
+          }
+        } else {
+          log_info("Profiles do not have category/group columns, checking local roster...")
+        }
+        
+        # Fallback: merge team/position from local Vald_roster if not found in profiles
+        if (!"team" %in% names(roster_from_api) || !"position" %in% names(roster_from_api)) {
+          if (nrow(Vald_roster) > 0 && "vald_id" %in% names(Vald_roster)) {
+            roster_cols <- intersect(names(Vald_roster), c("vald_id", "team", "position"))
+            missing_cols <- setdiff(c("team", "position"), names(roster_from_api))
+            cols_to_merge <- intersect(roster_cols, c("vald_id", missing_cols))
+            if (length(cols_to_merge) > 1) {
+              roster_from_api <- merge(roster_from_api, Vald_roster[, ..cols_to_merge], 
+                                        by = "vald_id", all.x = TRUE)
+              log_info("Merged missing team/position from local roster file")
+            }
           }
         }
+        
         log_and_store("Built merged roster: {nrow(roster_from_api)} athletes")
+        
+        # ======================================================================
+        # Save Roster to BigQuery as vald_roster
+        # ======================================================================
+        tryCatch({
+          # Select the required columns for vald_roster: vald_id, team, position, full_name
+          export_cols <- c("vald_id", "team", "position", "full_name")
+          
+          # Add optional columns if they exist
+          optional_cols <- c("sport", "position_class", "unit", "athlete_status", "gender")
+          for (col in optional_cols) {
+            if (col %in% names(roster_from_api)) {
+              export_cols <- c(export_cols, col)
+            }
+          }
+          
+          # Ensure required columns exist
+          if (!"team" %in% names(roster_from_api)) roster_from_api[, team := NA_character_]
+          if (!"position" %in% names(roster_from_api)) roster_from_api[, position := NA_character_]
+          
+          vald_roster_export <- roster_from_api[, ..export_cols]
+          
+          # Deduplicate by vald_id
+          vald_roster_export <- unique(vald_roster_export, by = "vald_id")
+          
+          if (nrow(vald_roster_export) > 0) {
+            upload_success <- bq_upsert(vald_roster_export, "vald_roster", key = "vald_id", mode = "MERGE")
+            if (isTRUE(upload_success)) {
+              log_and_store("Saved vald_roster to BigQuery: {nrow(vald_roster_export)} athletes with columns: {paste(export_cols, collapse = ', ')}")
+            } else {
+              log_error("Failed to save vald_roster to BigQuery")
+            }
+          } else {
+            log_warn("No roster data to save to BigQuery")
+          }
+        }, error = function(e) {
+          log_error("Error saving vald_roster to BigQuery: {e$message}")
+          record_error("ValdRoster_Save", e$message)
+        })
+        
       } else {
         log_warn("No profiles with profileId, using local roster")
         roster_from_api <- Vald_roster
