@@ -225,6 +225,7 @@ tryCatch({
     library(glue); library(slider); library(R.utils)
     library(logger)
     library(readxl)
+    library(bit64)  # Required for 64-bit integer timestamps (expiration_time)
   })
   update_status("packages_loaded", TRUE)
 }, error = function(e) {
@@ -1059,10 +1060,10 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       # Create staging table with 2-minute expiration as safety net
       # This ensures it auto-deletes even if manual cleanup fails
-      # FIX: BigQuery expects expiration_time as INTEGER milliseconds since epoch
+      # FIX V2.4.3: BigQuery expects expiration_time as INTEGER64 milliseconds since epoch
+      # Using bit64::as.integer64() to avoid 32-bit integer overflow (Unix timestamps in ms exceed 2^31)
       # Using 2 minutes (120 seconds) as expiration window per V2.4.3 requirements
-      # Using round() to avoid truncation that could cause premature expiration
-      staging_expiration_ms <- as.integer(round(as.numeric(Sys.time() + 120) * 1000))
+      staging_expiration_ms <- bit64::as.integer64(round(as.numeric(Sys.time() + 120) * 1000))
       
       log_info("Creating temporary staging table: {staging_name} (2-minute expiration)")
       tryCatch({
