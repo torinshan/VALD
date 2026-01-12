@@ -50,24 +50,43 @@
   credentials_valid = FALSE,
   bq_authenticated = FALSE,
   roster_loaded = FALSE,
+  # ForceDecks status
   fd_fetched = FALSE,
-  fd_cmj_processed = FALSE,
-  fd_dj_processed = FALSE,
-  fd_rsi_processed = FALSE,
-  fd_rebound_processed = FALSE,
-  fd_slj_processed = FALSE,
-  fd_imtp_processed = FALSE,
-  nord_fetched = FALSE,
-  nord_processed = FALSE,
-  dynamo_fetched = FALSE,
-  dynamo_processed = FALSE,
-  refs_updated = FALSE,
   fd_fetch_complete = FALSE,
   fd_fetch_timeout = FALSE,
+  fd_fetch_skipped = FALSE,
+  fd_fetch_failed = FALSE,
+  # ForceDecks processing status (processed = ran successfully, upload_failed = ran but upload failed)
+  fd_cmj_processed = FALSE,
+  fd_cmj_upload_failed = FALSE,
+  fd_dj_processed = FALSE,
+  fd_dj_upload_failed = FALSE,
+  fd_rsi_processed = FALSE,
+  fd_rsi_upload_failed = FALSE,
+  fd_rebound_processed = FALSE,
+  fd_rebound_upload_failed = FALSE,
+  fd_slj_processed = FALSE,
+  fd_slj_upload_failed = FALSE,
+  fd_imtp_processed = FALSE,
+  fd_imtp_upload_failed = FALSE,
+  # NordBord status
+  nord_fetched = FALSE,
   nord_fetch_complete = FALSE,
   nord_fetch_timeout = FALSE,
+  nord_fetch_skipped = FALSE,
+  nord_fetch_failed = FALSE,
+  nord_processed = FALSE,
+  nord_upload_failed = FALSE,
+  # DynaMo status
+  dynamo_fetched = FALSE,
   dynamo_fetch_complete = FALSE,
-  dynamo_fetch_timeout = FALSE
+  dynamo_fetch_timeout = FALSE,
+  dynamo_fetch_skipped = FALSE,
+  dynamo_fetch_failed = FALSE,
+  dynamo_processed = FALSE,
+  dynamo_upload_failed = FALSE,
+  # Reference tables
+  refs_updated = FALSE
 )
 
 .GlobalEnv$execution_errors <- list()
@@ -1038,12 +1057,14 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       staging_name <- paste0(table_name, "_staging_", format(Sys.time(), "%Y%m%d%H%M%S"))
       staging_tbl <- bigrquery::bq_table(ds, staging_name)
       
-      # Create staging table with 1-hour expiration as safety net
+      # Create staging table with 2-minute expiration as safety net
       # This ensures it auto-deletes even if manual cleanup fails
-      # FIX: BigQuery expects expiration_time in MILLISECONDS since epoch
-      staging_expiration_ms <- as.numeric(Sys.time() + 3600) * 1000
+      # FIX: BigQuery expects expiration_time as INTEGER milliseconds since epoch
+      # Using 2 minutes (120 seconds) as expiration window per V2.4.3 requirements
+      # Using round() to avoid truncation that could cause premature expiration
+      staging_expiration_ms <- as.integer(round(as.numeric(Sys.time() + 120) * 1000))
       
-      log_info("Creating temporary staging table: {staging_name} (1-hour expiration)")
+      log_info("Creating temporary staging table: {staging_name} (2-minute expiration)")
       tryCatch({
         bigrquery::bq_table_create(
           staging_tbl,
@@ -1137,7 +1158,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         }
       }, error = function(e) {
         log_error("Failed to drop staging table {staging_name}: {e$message}")
-        log_warn("Staging table will auto-expire in 1 hour")
+        log_warn("Staging table will auto-expire in 2 minutes")
       })
       
       log_info("Merged {table_name}: {nrow(data)} rows (MERGE)")
@@ -1163,7 +1184,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         }
       }, error = function(cleanup_err) {
         log_warn("Could not clean up staging table {staging_name}: {cleanup_err$message}")
-        log_warn("Staging table will auto-expire in 1 hour")
+        log_warn("Staging table will auto-expire in 2 minutes")
       })
     }
     
@@ -3136,8 +3157,9 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
   # Bilateral calculations: Only calculate when both sides have data, otherwise use available side
   # repCount = SUM (NA treated as 0 for sum)
   # Force/impulse/ROM = MEAN of available sides (not 0, which would be misleading)
+  # FIX: Use 0.0 (explicit double) instead of 0L (integer) for fcoalesce to match repCount type (result of mean())
   dynamo_reps_wide[, `:=`(
-    repCount_bilateral = data.table::fcoalesce(repCount_left, 0L) + data.table::fcoalesce(repCount_right, 0L),
+    repCount_bilateral = data.table::fcoalesce(repCount_left, 0.0) + data.table::fcoalesce(repCount_right, 0.0),
     maxForceNewtons_bilateral = data.table::fcase(
       !is.na(maxForceNewtons_left) & !is.na(maxForceNewtons_right), (maxForceNewtons_left + maxForceNewtons_right) / 2,
       !is.na(maxForceNewtons_left), maxForceNewtons_left,
@@ -3651,10 +3673,12 @@ if (fd_changed) {
       log_error("adaptive_fetch_forcedecks returned NULL!")
       log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: NULL fetch result) ===")
       record_error("ForceDecks_Fetch", "Fetch function returned NULL")
+      update_status("fd_fetch_failed", TRUE)
     } else if (!is.list(fd_data)) {
       log_error("adaptive_fetch_forcedecks returned non-list: {class(fd_data)}")
       log_and_store("=== FORCEDECKS BRANCH COMPLETE (ERROR: Invalid fetch result type) ===")
       record_error("ForceDecks_Fetch", paste("Fetch returned:", class(fd_data)))
+      update_status("fd_fetch_failed", TRUE)
     } else {
       # Evaluate fetch result using four-scenario branching
       fetch_eval <- evaluate_fetch_result(fd_data)
@@ -4327,10 +4351,15 @@ if (fd_changed) {
               log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
             }
           
-            bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
+            upload_success <- bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
                       partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
-            update_status("fd_cmj_processed", TRUE)
-            log_and_store("Exported {nrow(cmj_export)} NEW CMJ records with {ncol(cmj_export)} columns (MERGE mode)")
+            if (isTRUE(upload_success)) {
+              update_status("fd_cmj_processed", TRUE)
+              log_and_store("Exported {nrow(cmj_export)} NEW CMJ records with {ncol(cmj_export)} columns (MERGE mode)")
+            } else {
+              update_status("fd_cmj_upload_failed", TRUE)
+              log_error("CMJ upload failed")
+            }
           }
         }
       } else {
@@ -4348,10 +4377,15 @@ if (fd_changed) {
         tryCatch({
           dj_all <- standardize_data_types(dj_all)
           dj_export <- process_dj(dj_all)
-          bq_upsert(dj_export, "vald_fd_dj", key = "test_ID", mode = "MERGE",
+          upload_success <- bq_upsert(dj_export, "vald_fd_dj", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          update_status("fd_dj_processed", TRUE)
-          log_and_store("Exported {nrow(dj_export)} DJ records with {ncol(dj_export)} columns")
+          if (isTRUE(upload_success)) {
+            update_status("fd_dj_processed", TRUE)
+            log_and_store("Exported {nrow(dj_export)} DJ records with {ncol(dj_export)} columns")
+          } else {
+            update_status("fd_dj_upload_failed", TRUE)
+            log_error("DJ upload failed")
+          }
         }, error = function(e) {
           record_error("DJ_Processing", e$message)
         })
@@ -4365,10 +4399,15 @@ if (fd_changed) {
         tryCatch({
           rsi_all <- standardize_data_types(rsi_all)
           rsi_export <- process_rsi(rsi_all)
-          bq_upsert(rsi_export, "vald_fd_rsi", key = "test_ID", mode = "MERGE",
+          upload_success <- bq_upsert(rsi_export, "vald_fd_rsi", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          update_status("fd_rsi_processed", TRUE)
-          log_and_store("Exported {nrow(rsi_export)} RSI records with {ncol(rsi_export)} columns")
+          if (isTRUE(upload_success)) {
+            update_status("fd_rsi_processed", TRUE)
+            log_and_store("Exported {nrow(rsi_export)} RSI records with {ncol(rsi_export)} columns")
+          } else {
+            update_status("fd_rsi_upload_failed", TRUE)
+            log_error("RSI upload failed")
+          }
         }, error = function(e) {
           record_error("RSI_Processing", e$message)
         })
@@ -4381,10 +4420,15 @@ if (fd_changed) {
       if (nrow(rebound_all) > 0) {
         tryCatch({
           rebound_all <- standardize_data_types(rebound_all)
-          bq_upsert(rebound_all, "vald_fd_rebound", key = "test_ID", mode = "MERGE",
+          upload_success <- bq_upsert(rebound_all, "vald_fd_rebound", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          update_status("fd_rebound_processed", TRUE)
-          log_and_store("Exported {nrow(rebound_all)} Rebound records")
+          if (isTRUE(upload_success)) {
+            update_status("fd_rebound_processed", TRUE)
+            log_and_store("Exported {nrow(rebound_all)} Rebound records")
+          } else {
+            update_status("fd_rebound_upload_failed", TRUE)
+            log_error("Rebound upload failed")
+          }
         }, error = function(e) {
           record_error("Rebound_Processing", e$message)
         })
@@ -4398,10 +4442,15 @@ if (fd_changed) {
         tryCatch({
           slj_all <- standardize_data_types(slj_all)
           slj_export <- process_sl_jumps(slj_all)
-          bq_upsert(slj_export, "vald_fd_sl_jumps", key = "test_ID", mode = "MERGE",
+          upload_success <- bq_upsert(slj_export, "vald_fd_sl_jumps", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          update_status("fd_slj_processed", TRUE)
-          log_and_store("Exported {nrow(slj_export)} SLJ records with {ncol(slj_export)} columns")
+          if (isTRUE(upload_success)) {
+            update_status("fd_slj_processed", TRUE)
+            log_and_store("Exported {nrow(slj_export)} SLJ records with {ncol(slj_export)} columns")
+          } else {
+            update_status("fd_slj_upload_failed", TRUE)
+            log_error("SLJ upload failed")
+          }
         }, error = function(e) {
           record_error("SLJ_Processing", e$message)
         })
@@ -4415,10 +4464,15 @@ if (fd_changed) {
         tryCatch({
           imtp_all <- standardize_data_types(imtp_all)
           imtp_export <- process_imtp(imtp_all)
-          bq_upsert(imtp_export, "vald_fd_imtp", key = "test_ID", mode = "MERGE",
+          upload_success <- bq_upsert(imtp_export, "vald_fd_imtp", key = "test_ID", mode = "MERGE",
                     partition_field = "date", cluster_fields = c("vald_id"))
-          update_status("fd_imtp_processed", TRUE)
-          log_and_store("Exported {nrow(imtp_export)} IMTP records with {ncol(imtp_export)} columns")
+          if (isTRUE(upload_success)) {
+            update_status("fd_imtp_processed", TRUE)
+            log_and_store("Exported {nrow(imtp_export)} IMTP records with {ncol(imtp_export)} columns")
+          } else {
+            update_status("fd_imtp_upload_failed", TRUE)
+            log_error("IMTP upload failed")
+          }
         }, error = function(e) {
           record_error("IMTP_Processing", e$message)
         })
@@ -4533,6 +4587,7 @@ if (fd_changed) {
   })
 } else {
   log_and_store("ForceDecks: No changes detected - skipping")
+  update_status("fd_fetch_skipped", TRUE)
 }
 
 # ============================================================================
@@ -4586,6 +4641,7 @@ if (nord_changed) {
     
     if (tests_count == 0) {
       log_warn("No Nordbord tests returned")
+      update_status("nord_fetch_failed", TRUE)
     } else {
       nord_raw <- nord_data$tests
       
@@ -4640,10 +4696,15 @@ if (nord_changed) {
         log_info("NordBord deduplication: All {n_after_dedup} test_IDs are unique")
       }
       
-      bq_upsert(nord_export, "vald_nord_all", key = "test_ID", mode = "MERGE",
+      upload_success <- bq_upsert(nord_export, "vald_nord_all", key = "test_ID", mode = "MERGE",
                 partition_field = "date", cluster_fields = c("vald_id"))
-      update_status("nord_processed", TRUE)
-      log_and_store("Exported {nrow(nord_export)} Nordbord records with {ncol(nord_export)} columns")
+      if (isTRUE(upload_success)) {
+        update_status("nord_processed", TRUE)
+        log_and_store("Exported {nrow(nord_export)} Nordbord records with {ncol(nord_export)} columns")
+      } else {
+        update_status("nord_upload_failed", TRUE)
+        log_error("NordBord upload failed")
+      }
     }
     
     log_and_store("=== NORDBORD BRANCH COMPLETE ===")
@@ -4654,6 +4715,7 @@ if (nord_changed) {
   })
 } else {
   log_and_store("NordBord: No changes detected - skipping")
+  update_status("nord_fetch_skipped", TRUE)
 }
 
 # ============================================================================
@@ -4676,6 +4738,7 @@ if (dynamo_changed) {
     
     if (tests_count == 0) {
       log_warn("No DynaMo tests returned")
+      update_status("dynamo_fetch_failed", TRUE)
     } else {
       update_status("dynamo_fetched", TRUE)
       log_and_store("Fetched {tests_count} DynaMo tests, {details_count} details")
@@ -4714,10 +4777,15 @@ if (dynamo_changed) {
           log_info("DynaMo deduplication: All {n_after_dedup} test_IDs are unique")
         }
         
-        bq_upsert(dynamo_export, "vald_dynamo", key = "test_ID", mode = "MERGE",
+        upload_success <- bq_upsert(dynamo_export, "vald_dynamo", key = "test_ID", mode = "MERGE",
                   partition_field = "date", cluster_fields = c("vald_id"))
-        update_status("dynamo_processed", TRUE)
-        log_and_store("Exported {nrow(dynamo_export)} DynaMo records with {ncol(dynamo_export)} columns")
+        if (isTRUE(upload_success)) {
+          update_status("dynamo_processed", TRUE)
+          log_and_store("Exported {nrow(dynamo_export)} DynaMo records with {ncol(dynamo_export)} columns")
+        } else {
+          update_status("dynamo_upload_failed", TRUE)
+          log_error("DynaMo upload failed")
+        }
       } else {
         log_warn("No DynaMo records after processing")
       }
@@ -4731,6 +4799,7 @@ if (dynamo_changed) {
   })
 } else {
   log_and_store("DynaMo: No changes detected or not configured - skipping")
+  update_status("dynamo_fetch_skipped", TRUE)
 }
 
 # ============================================================================
@@ -4750,20 +4819,46 @@ tryCatch({
   log_error("Test ID reconciliation failed: {e$message}")
 })
 
+# Helper function to determine status text based on flags
+# Status priority: SUCCESS > TIMEOUT/PARTIAL > FAILED > SKIPPED
+get_fetch_status <- function(complete, timeout, skipped, failed = FALSE) {
+  if (isTRUE(complete)) return("SUCCESS")
+  if (isTRUE(timeout)) return("TIMEOUT/PARTIAL")
+  if (isTRUE(failed)) return("FAILED")
+  if (isTRUE(skipped)) return("SKIPPED")
+  return("FAILED")  # Default for unhandled cases
+}
+
+get_process_status <- function(processed, upload_failed, skipped = FALSE) {
+  if (isTRUE(processed)) return("SUCCESS")
+  if (isTRUE(upload_failed)) return("ERROR: Upload issue")
+  if (isTRUE(skipped)) return("SKIPPED")
+  return("FAILED")
+}
+
 # Execution summary
 log_and_store("=== EXECUTION SUMMARY ===")
 status <- .GlobalEnv$execution_status
-log_and_store("FD Fetch: {if(status$fd_fetch_complete) 'COMPLETE' else if(status$fd_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
-log_and_store("Nord Fetch: {if(status$nord_fetch_complete) 'COMPLETE' else if(status$nord_fetch_timeout) 'TIMEOUT/PARTIAL' else 'FAILED'}")
-log_and_store("DynaMo Fetch: {if(status$dynamo_fetch_complete) 'COMPLETE' else if(status$dynamo_fetch_timeout) 'TIMEOUT/PARTIAL' else 'SKIPPED/FAILED'}")
-log_and_store("FD CMJ: {if(status$fd_cmj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD DJ: {if(status$fd_dj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD RSI: {if(status$fd_rsi_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD Rebound: {if(status$fd_rebound_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD SLJ: {if(status$fd_slj_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("FD IMTP: {if(status$fd_imtp_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("NordBord: {if(status$nord_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
-log_and_store("DynaMo: {if(status$dynamo_processed) 'SUCCESS' else 'SKIPPED/FAILED'}")
+
+# Fetch status (SUCCESS, TIMEOUT/PARTIAL, SKIPPED, or FAILED)
+log_and_store("FD Fetch: {get_fetch_status(status$fd_fetch_complete, status$fd_fetch_timeout, status$fd_fetch_skipped, status$fd_fetch_failed)}")
+log_and_store("Nord Fetch: {get_fetch_status(status$nord_fetch_complete, status$nord_fetch_timeout, status$nord_fetch_skipped, status$nord_fetch_failed)}")
+log_and_store("DynaMo Fetch: {get_fetch_status(status$dynamo_fetch_complete, status$dynamo_fetch_timeout, status$dynamo_fetch_skipped, status$dynamo_fetch_failed)}")
+
+# Processing status (SUCCESS, ERROR: Upload issue, SKIPPED, or FAILED)
+# For FD components, check if parent fetch was skipped
+fd_skipped <- isTRUE(status$fd_fetch_skipped)
+log_and_store("FD CMJ: {get_process_status(status$fd_cmj_processed, status$fd_cmj_upload_failed, fd_skipped)}")
+log_and_store("FD DJ: {get_process_status(status$fd_dj_processed, status$fd_dj_upload_failed, fd_skipped)}")
+log_and_store("FD RSI: {get_process_status(status$fd_rsi_processed, status$fd_rsi_upload_failed, fd_skipped)}")
+log_and_store("FD Rebound: {get_process_status(status$fd_rebound_processed, status$fd_rebound_upload_failed, fd_skipped)}")
+log_and_store("FD SLJ: {get_process_status(status$fd_slj_processed, status$fd_slj_upload_failed, fd_skipped)}")
+log_and_store("FD IMTP: {get_process_status(status$fd_imtp_processed, status$fd_imtp_upload_failed, fd_skipped)}")
+
+# NordBord and DynaMo processing status
+log_and_store("NordBord: {get_process_status(status$nord_processed, status$nord_upload_failed, status$nord_fetch_skipped)}")
+log_and_store("DynaMo: {get_process_status(status$dynamo_processed, status$dynamo_upload_failed, status$dynamo_fetch_skipped)}")
+
 errors <- .GlobalEnv$execution_errors
 log_and_store("Errors: {length(errors)}")
 
