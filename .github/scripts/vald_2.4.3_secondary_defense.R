@@ -187,6 +187,33 @@ query_unaccounted_test_ids <- function() {
   })
 }
 
+#' Query all filtered test_IDs from filtered_test_ids_log
+#' @return Character vector of filtered test_IDs
+query_filtered_test_ids <- function() {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "filtered_test_ids_log")
+    
+    if (!safe_table_exists(tbl)) {
+      return(character(0))
+    }
+    
+    sql <- glue::glue("
+      SELECT DISTINCT test_ID
+      FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.filtered_test_ids_log`
+    ")
+    
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% 
+      bigrquery::bq_table_download()
+    
+    return(as.character(result$test_ID))
+    
+  }, error = function(e) {
+    log_warn("Failed to query filtered_test_ids_log: {e$message}")
+    return(character(0))
+  })
+}
+
 #' Fetch ForceDecks data for specific test IDs
 #' Uses get_forcedecks_tests_only() and get_forcedecks_trials_only()
 #' @param test_ids Vector of test_IDs to fetch
@@ -716,6 +743,86 @@ sync_tests_table <- function() {
   })
 }
 
+#' Remove test_IDs from tests table that are not present in data tables
+#' or are present in filtered_test_ids_log
+reconcile_tests_table <- function() {
+  log_info("=== RECONCILING TESTS TABLE ===")
+  
+  ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+  tbl <- bigrquery::bq_table(ds, "tests")
+  
+  if (!safe_table_exists(tbl)) {
+    log_info("Tests table does not exist - nothing to reconcile")
+    return(0L)
+  }
+  
+  current_tests <- tryCatch({
+    bigrquery::bq_project_query(
+      CONFIG$gcp_project,
+      glue::glue("SELECT DISTINCT test_ID FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.tests`")
+    ) %>% bigrquery::bq_table_download()
+  }, error = function(e) {
+    log_warn("Could not read tests table: {e$message}")
+    return(data.table::data.table())
+  })
+  
+  if (nrow(current_tests) == 0) {
+    log_info("Tests table is empty - nothing to reconcile")
+    return(0L)
+  }
+  
+  # Collect valid test_IDs from data tables
+  data_tables <- c(
+    "vald_fd_jumps", 
+    "vald_fd_dj", 
+    "vald_fd_rsi", 
+    "vald_fd_sl_jumps", 
+    "vald_fd_imtp",
+    "vald_fd_rebound", 
+    "vald_nord_all", 
+    "vald_dynamo"
+  )
+  
+  all_data_test_ids <- list()
+  for (table_name in data_tables) {
+    dt <- query_data_table_test_ids(table_name)
+    if (nrow(dt) > 0) {
+      all_data_test_ids[[table_name]] <- dt$test_ID
+    }
+  }
+  valid_ids <- unique(unlist(all_data_test_ids))
+  
+  filtered_ids <- query_filtered_test_ids()
+  
+  current_ids <- as.character(current_tests$test_ID)
+  to_remove <- unique(c(
+    setdiff(current_ids, valid_ids),
+    intersect(current_ids, filtered_ids)
+  ))
+  
+  if (length(to_remove) == 0) {
+    log_info("Tests table reconciliation complete: no rows to remove")
+    return(0L)
+  }
+  
+  sanitized_ids <- sapply(to_remove, sanitize_sql_string)
+  id_list <- paste0("'", sanitized_ids, "'", collapse = ", ")
+  
+  delete_sql <- glue::glue("
+    DELETE FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.tests`
+    WHERE test_ID IN ({id_list})
+  ")
+  
+  tryCatch({
+    bigrquery::bq_project_query(CONFIG$gcp_project, delete_sql)
+    log_warn("Removed {length(to_remove)} test_IDs from tests table (not in data tables or filtered)")
+  }, error = function(e) {
+    log_warn("Failed to delete stale test_IDs: {e$message}")
+  })
+  
+  return(length(to_remove))
+}
+
 #' Query existing dates from the dates reference table
 #' @return Vector of dates in the dates table
 query_dates_table <- function() {
@@ -887,6 +994,68 @@ sync_dates_table <- function() {
   })
 }
 
+#' Remove dates from dates table that are not present in any data table
+reconcile_dates_table <- function() {
+  log_info("=== RECONCILING DATES TABLE ===")
+  
+  ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+  tbl <- bigrquery::bq_table(ds, "dates")
+  
+  if (!safe_table_exists(tbl)) {
+    log_info("Dates table does not exist - nothing to reconcile")
+    return(0L)
+  }
+  
+  existing_dates <- query_dates_table()
+  
+  if (length(existing_dates) == 0) {
+    log_info("Dates table is empty - nothing to reconcile")
+    return(0L)
+  }
+  
+  # Gather all dates present in data tables
+  data_tables <- c(
+    "vald_fd_jumps", 
+    "vald_fd_dj", 
+    "vald_fd_rsi", 
+    "vald_fd_sl_jumps", 
+    "vald_fd_imtp",
+    "vald_fd_rebound", 
+    "vald_nord_all", 
+    "vald_dynamo"
+  )
+  
+  date_list <- vector("list", length(data_tables))
+  for (i in seq_along(data_tables)) {
+    date_list[[i]] <- query_data_table_dates(data_tables[i])
+  }
+  
+  valid_dates <- unique(as.Date(unlist(date_list), origin = "1970-01-01"))
+  valid_dates <- valid_dates[!is.na(valid_dates)]
+  
+  to_remove <- setdiff(existing_dates, valid_dates)
+  
+  if (length(to_remove) == 0) {
+    log_info("Dates table reconciliation complete: no rows to remove")
+    return(0L)
+  }
+  
+  date_strings <- paste0("'", format(to_remove, "%Y-%m-%d"), "'", collapse = ", ")
+  delete_sql <- glue::glue("
+    DELETE FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.dates`
+    WHERE date IN ({date_strings})
+  ")
+  
+  tryCatch({
+    bigrquery::bq_project_query(CONFIG$gcp_project, delete_sql)
+    log_warn("Removed {length(to_remove)} dates from dates table (not present in data tables)")
+  }, error = function(e) {
+    log_warn("Failed to delete stale dates: {e$message}")
+  })
+  
+  return(length(to_remove))
+}
+
 # ============================================================================
 # Main Execution
 # ============================================================================
@@ -901,6 +1070,12 @@ if (n_tests_synced > 0) {
 } else {
   log_info("Tests table sync complete: no missing test_IDs")
 }
+reconciled_tests <- reconcile_tests_table()
+if (reconciled_tests > 0) {
+  log_info("Tests table reconciliation removed {reconciled_tests} test_IDs")
+} else {
+  log_info("Tests table reconciliation: no removals needed")
+}
 
 # Step 2: Sync dates table from data tables
 # This ensures the dates table contains all dates from actual data tables
@@ -910,6 +1085,12 @@ if (n_dates_synced > 0) {
   log_info("Dates table sync complete: added {n_dates_synced} missing dates")
 } else {
   log_info("Dates table sync complete: no missing dates")
+}
+reconciled_dates <- reconcile_dates_table()
+if (reconciled_dates > 0) {
+  log_info("Dates table reconciliation removed {reconciled_dates} dates")
+} else {
+  log_info("Dates table reconciliation: no removals needed")
 }
 
 # Step 3: Query unaccounted test_IDs from filter log

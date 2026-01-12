@@ -1522,10 +1522,11 @@ reconcile_test_ids <- function() {
                                              "vald_fd_rebound")]))
   all_saved_nord <- unique(unlist(saved_ids["vald_nord_all"]))
   all_saved_dynamo <- unique(unlist(saved_ids["vald_dynamo"]))
+  filtered_ids <- unique(.GlobalEnv$filtered_test_ids$test_ID)
   
   # ForceDecks reconciliation
   if (length(api_ids$forcedecks) > 0) {
-    missing_fd <- setdiff(api_ids$forcedecks, all_saved_fd)
+    missing_fd <- setdiff(api_ids$forcedecks, union(all_saved_fd, filtered_ids))
     
     if (length(missing_fd) > 0) {
       log_warn("RECONCILIATION: {length(missing_fd)} ForceDecks test_IDs not in any data table")
@@ -1557,7 +1558,7 @@ reconcile_test_ids <- function() {
   
   # NordBord reconciliation
   if (length(api_ids$nordbord) > 0) {
-    missing_nord <- setdiff(api_ids$nordbord, all_saved_nord)
+    missing_nord <- setdiff(api_ids$nordbord, union(all_saved_nord, filtered_ids))
     
     if (length(missing_nord) > 0) {
       log_warn("RECONCILIATION: {length(missing_nord)} NordBord test_IDs not in data table")
@@ -1584,7 +1585,7 @@ reconcile_test_ids <- function() {
   
   # DynaMo reconciliation
   if (length(api_ids$dynamo) > 0) {
-    missing_dynamo <- setdiff(api_ids$dynamo, all_saved_dynamo)
+    missing_dynamo <- setdiff(api_ids$dynamo, union(all_saved_dynamo, filtered_ids))
     
     if (length(missing_dynamo) > 0) {
       log_warn("RECONCILIATION: {length(missing_dynamo)} DynaMo test_IDs not in data table")
