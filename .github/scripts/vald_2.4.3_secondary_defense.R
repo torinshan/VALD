@@ -55,6 +55,17 @@ CONFIG <- list(
   lookback_days = as.integer(Sys.getenv("RECOVERY_LOOKBACK_DAYS", "30"))
 )
 
+DATA_TABLES <- c(
+  "vald_fd_jumps",
+  "vald_fd_dj",
+  "vald_fd_rsi",
+  "vald_fd_sl_jumps",
+  "vald_fd_imtp",
+  "vald_fd_rebound",
+  "vald_nord_all",
+  "vald_dynamo"
+)
+
 #' Sanitize a string for safe SQL inclusion
 #' Escapes single quotes to prevent SQL injection
 #' @param s Character string to sanitize
@@ -619,24 +630,13 @@ sync_tests_table <- function() {
   log_info("=== SYNCING TESTS TABLE ===")
   
   # Define data tables to check
-  data_tables <- c(
-    "vald_fd_jumps", 
-    "vald_fd_dj", 
-    "vald_fd_rsi", 
-    "vald_fd_sl_jumps", 
-    "vald_fd_imtp",
-    "vald_fd_rebound", 
-    "vald_nord_all", 
-    "vald_dynamo"
-  )
-  
   # Query existing test_IDs from tests table
   existing_test_ids <- query_tests_table_ids()
   
   # Collect all test_IDs from data tables
   all_data_test_ids <- list()
   
-  for (table_name in data_tables) {
+  for (table_name in DATA_TABLES) {
     dt <- query_data_table_test_ids(table_name)
     if (nrow(dt) > 0) {
       all_data_test_ids[[table_name]] <- dt
@@ -772,19 +772,8 @@ reconcile_tests_table <- function() {
   }
   
   # Collect valid test_IDs from data tables
-  data_tables <- c(
-    "vald_fd_jumps", 
-    "vald_fd_dj", 
-    "vald_fd_rsi", 
-    "vald_fd_sl_jumps", 
-    "vald_fd_imtp",
-    "vald_fd_rebound", 
-    "vald_nord_all", 
-    "vald_dynamo"
-  )
-  
   all_data_test_ids <- list()
-  for (table_name in data_tables) {
+  for (table_name in DATA_TABLES) {
     dt <- query_data_table_test_ids(table_name)
     if (nrow(dt) > 0) {
       all_data_test_ids[[table_name]] <- dt$test_ID
@@ -893,25 +882,14 @@ sync_dates_table <- function() {
   log_info("=== SYNCING DATES TABLE ===")
   
   # Define data tables to check
-  data_tables <- c(
-    "vald_fd_jumps", 
-    "vald_fd_dj", 
-    "vald_fd_rsi", 
-    "vald_fd_sl_jumps", 
-    "vald_fd_imtp",
-    "vald_fd_rebound", 
-    "vald_nord_all", 
-    "vald_dynamo"
-  )
-  
   # Query existing dates from dates table
   existing_dates <- query_dates_table()
   
   # Collect all dates from data tables using a list for efficiency
-  date_list <- vector("list", length(data_tables))
+  date_list <- vector("list", length(DATA_TABLES))
   
-  for (i in seq_along(data_tables)) {
-    dates <- query_data_table_dates(data_tables[i])
+  for (i in seq_along(DATA_TABLES)) {
+    dates <- query_data_table_dates(DATA_TABLES[i])
     if (length(dates) > 0) {
       date_list[[i]] <- dates
     }
@@ -1014,20 +992,9 @@ reconcile_dates_table <- function() {
   }
   
   # Gather all dates present in data tables
-  data_tables <- c(
-    "vald_fd_jumps", 
-    "vald_fd_dj", 
-    "vald_fd_rsi", 
-    "vald_fd_sl_jumps", 
-    "vald_fd_imtp",
-    "vald_fd_rebound", 
-    "vald_nord_all", 
-    "vald_dynamo"
-  )
-  
-  date_list <- vector("list", length(data_tables))
-  for (i in seq_along(data_tables)) {
-    date_list[[i]] <- query_data_table_dates(data_tables[i])
+  date_list <- vector("list", length(DATA_TABLES))
+  for (i in seq_along(DATA_TABLES)) {
+    date_list[[i]] <- query_data_table_dates(DATA_TABLES[i])
   }
   
   valid_dates <- unique(as.Date(unlist(date_list), origin = "1970-01-01"))
