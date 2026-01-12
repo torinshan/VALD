@@ -793,7 +793,7 @@ reconcile_tests_table <- function() {
     return(0L)
   }
   
-  sanitized_ids <- sanitize_sql_string(to_remove)
+  sanitized_ids <- sapply(to_remove, sanitize_sql_string)
   id_list <- paste0("'", sanitized_ids, "'", collapse = ", ")
   
   delete_sql <- glue::glue("
@@ -1011,7 +1011,8 @@ reconcile_dates_table <- function() {
     return(0L)
   }
   
-  date_strings <- paste0("'", format(to_remove, "%Y-%m-%d"), "'", collapse = ", ")
+  sanitized_dates <- sapply(format(to_remove, "%Y-%m-%d"), sanitize_sql_string)
+  date_strings <- paste0("'", sanitized_dates, "'", collapse = ", ")
   delete_sql <- glue::glue("
     DELETE FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.dates`
     WHERE date IN ({date_strings})
