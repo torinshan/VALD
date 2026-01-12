@@ -1061,7 +1061,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       # This ensures it auto-deletes even if manual cleanup fails
       # FIX: BigQuery expects expiration_time as INTEGER milliseconds since epoch
       # Using 2 minutes (120 seconds) as expiration window per V2.4.3 requirements
-      staging_expiration_ms <- as.integer(as.numeric(Sys.time() + 120) * 1000)
+      # Using round() to avoid truncation that could cause premature expiration
+      staging_expiration_ms <- as.integer(round(as.numeric(Sys.time() + 120) * 1000))
       
       log_info("Creating temporary staging table: {staging_name} (2-minute expiration)")
       tryCatch({
@@ -3156,9 +3157,9 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
   # Bilateral calculations: Only calculate when both sides have data, otherwise use available side
   # repCount = SUM (NA treated as 0 for sum)
   # Force/impulse/ROM = MEAN of available sides (not 0, which would be misleading)
-  # FIX: Use 0 (double) instead of 0L (integer) for fcoalesce to match repCount type (result of mean())
+  # FIX: Use 0.0 (explicit double) instead of 0L (integer) for fcoalesce to match repCount type (result of mean())
   dynamo_reps_wide[, `:=`(
-    repCount_bilateral = data.table::fcoalesce(repCount_left, 0) + data.table::fcoalesce(repCount_right, 0),
+    repCount_bilateral = data.table::fcoalesce(repCount_left, 0.0) + data.table::fcoalesce(repCount_right, 0.0),
     maxForceNewtons_bilateral = data.table::fcase(
       !is.na(maxForceNewtons_left) & !is.na(maxForceNewtons_right), (maxForceNewtons_left + maxForceNewtons_right) / 2,
       !is.na(maxForceNewtons_left), maxForceNewtons_left,
@@ -4819,13 +4820,13 @@ tryCatch({
 })
 
 # Helper function to determine status text based on flags
-# Status priority: SUCCESS > ERROR: Upload issue > FAILED > SKIPPED
+# Status priority: SUCCESS > TIMEOUT/PARTIAL > FAILED > SKIPPED
 get_fetch_status <- function(complete, timeout, skipped, failed = FALSE) {
   if (isTRUE(complete)) return("SUCCESS")
   if (isTRUE(timeout)) return("TIMEOUT/PARTIAL")
-  if (isTRUE(skipped)) return("SKIPPED")
   if (isTRUE(failed)) return("FAILED")
-  return("FAILED")
+  if (isTRUE(skipped)) return("SKIPPED")
+  return("FAILED")  # Default for unhandled cases
 }
 
 get_process_status <- function(processed, upload_failed, skipped = FALSE) {
