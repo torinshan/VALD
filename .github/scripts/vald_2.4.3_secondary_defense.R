@@ -78,17 +78,17 @@ script_start_time <- Sys.time()
 
 log_info <- function(msg) {
   ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC")
-  cat(sprintf("[%s] [INFO] %s\n", ts, glue::glue(msg)))
+  cat(sprintf("[%s] [INFO] %s\n", ts, glue::glue(msg, .envir = parent.frame())))
 }
 
 log_warn <- function(msg) {
   ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC")
-  cat(sprintf("[%s] [WARN] %s\n", ts, glue::glue(msg)))
+  cat(sprintf("[%s] [WARN] %s\n", ts, glue::glue(msg, .envir = parent.frame())))
 }
 
 log_error <- function(msg) {
   ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC")
-  cat(sprintf("[%s] [ERROR] %s\n", ts, glue::glue(msg)))
+  cat(sprintf("[%s] [ERROR] %s\n", ts, glue::glue(msg, .envir = parent.frame())))
 }
 
 # ============================================================================
@@ -580,7 +580,7 @@ query_tests_table_ids <- function() {
     return(test_ids)
     
   }, error = function(e) {
-    log_warn("Could not query tests table: {e$message}")
+    log_warn(paste0("Could not query tests table: ", conditionMessage(e)))
     return(character(0))
   })
 }
