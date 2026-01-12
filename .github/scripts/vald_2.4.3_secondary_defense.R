@@ -4,14 +4,16 @@
 # ============================================================================
 # Version: 2.4.3
 # Date: January 2026
-# Purpose: Re-fetch and process unaccounted test_IDs from the filter log
+# Purpose: Sync reference tables and re-fetch unaccounted test_IDs
 # Execution: GitHub Actions - runs hourly to catch any missing data
 #
 # This script:
-# 1. Queries the filtered_test_ids_log table for RECONCILIATION entries
-# 2. Re-fetches the specific test_IDs using appropriate valdr functions
-# 3. Processes and saves the data using the same logic as the main script
-# 4. Purges the log entries once test_IDs are successfully accounted for
+# 1. Syncs the 'tests' table to include all test_IDs from actual data tables
+# 2. Syncs the 'dates' table to include all dates from actual data tables
+# 3. Queries the filtered_test_ids_log table for RECONCILIATION entries
+# 4. Re-fetches the specific test_IDs using appropriate valdr functions
+# 5. Processes and saves the data using the same logic as the main script
+# 6. Purges the log entries once test_IDs are successfully accounted for
 # ============================================================================
 
 # ============================================================================
@@ -506,20 +508,415 @@ verify_test_ids_saved <- function(test_ids, data_source) {
 }
 
 # ============================================================================
+# Sync Test IDs from Data Tables to Tests Table
+# ============================================================================
+
+#' Query all test_IDs from a data table with required metadata for tests table
+#' @param table_name The name of the data table to query
+#' @return data.table with test_ID, vald_id, date, test_type (if available)
+query_data_table_test_ids <- function(table_name) {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, table_name)
+    
+    if (!safe_table_exists(tbl)) {
+      log_info("Table {table_name} does not exist - skipping")
+      return(data.table::data.table())
+    }
+    
+    # First check which columns exist in the table
+    meta <- bigrquery::bq_table_meta(tbl)
+    available_cols <- sapply(meta$schema$fields, function(f) f$name)
+    
+    # Build SELECT clause with available columns
+    select_cols <- c("test_ID")
+    if ("vald_id" %in% available_cols) {
+      select_cols <- c(select_cols, "vald_id")
+    }
+    if ("date" %in% available_cols) {
+      select_cols <- c(select_cols, "date")
+    }
+    if ("test_type" %in% available_cols) {
+      select_cols <- c(select_cols, "test_type")
+    }
+    
+    # Query the table
+    select_clause <- paste(select_cols, collapse = ", ")
+    sql <- glue::glue("SELECT DISTINCT {select_clause} FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}`")
+    
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% 
+      bigrquery::bq_table_download()
+    
+    dt <- data.table::as.data.table(result)
+    log_info("Found {nrow(dt)} test_IDs in {table_name}")
+    
+    return(dt)
+    
+  }, error = function(e) {
+    log_warn("Could not query {table_name}: {e$message}")
+    return(data.table::data.table())
+  })
+}
+
+#' Query existing test_IDs from the tests reference table
+#' @return Character vector of test_IDs in the tests table
+query_tests_table_ids <- function() {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "tests")
+    
+    if (!safe_table_exists(tbl)) {
+      log_info("Tests table does not exist - will create it")
+      return(character(0))
+    }
+    
+    sql <- glue::glue("SELECT DISTINCT test_ID FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.tests`")
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% 
+      bigrquery::bq_table_download()
+    
+    test_ids <- as.character(result$test_ID)
+    log_info("Found {length(test_ids)} test_IDs in tests table")
+    
+    return(test_ids)
+    
+  }, error = function(e) {
+    log_warn("Could not query tests table: {e$message}")
+    return(character(0))
+  })
+}
+
+#' Sync test_IDs from data tables to the tests reference table
+#' This ensures the tests table is complete with all test_IDs from actual data
+#' @return Number of test_IDs synced
+sync_tests_table <- function() {
+  log_info("=== SYNCING TESTS TABLE ===")
+  
+  # Define data tables to check
+  data_tables <- c(
+    "vald_fd_jumps", 
+    "vald_fd_dj", 
+    "vald_fd_rsi", 
+    "vald_fd_sl_jumps", 
+    "vald_fd_imtp",
+    "vald_fd_rebound", 
+    "vald_nord_all", 
+    "vald_dynamo"
+  )
+  
+  # Query existing test_IDs from tests table
+  existing_test_ids <- query_tests_table_ids()
+  
+  # Collect all test_IDs from data tables
+  all_data_test_ids <- list()
+  
+  for (table_name in data_tables) {
+    dt <- query_data_table_test_ids(table_name)
+    if (nrow(dt) > 0) {
+      all_data_test_ids[[table_name]] <- dt
+    }
+  }
+  
+  if (length(all_data_test_ids) == 0) {
+    log_info("No test_IDs found in any data tables - nothing to sync")
+    return(0L)
+  }
+  
+  # Combine all data table results
+  combined <- data.table::rbindlist(all_data_test_ids, use.names = TRUE, fill = TRUE)
+  
+  # Get unique test_IDs by taking first occurrence (prioritize keeping first seen)
+  combined <- unique(combined, by = "test_ID")
+  
+  total_data_test_ids <- nrow(combined)
+  log_info("Total unique test_IDs across all data tables: {total_data_test_ids}")
+  log_info("Existing test_IDs in tests table: {length(existing_test_ids)}")
+  
+  # Find test_IDs missing from tests table
+  missing_test_ids <- combined[!(test_ID %in% existing_test_ids)]
+  n_missing <- nrow(missing_test_ids)
+  
+  if (n_missing == 0) {
+    log_info("Tests table is complete - no missing test_IDs")
+    return(0L)
+  }
+  
+  log_warn("Found {n_missing} test_IDs in data tables that are missing from tests table")
+  
+  # Prepare data for tests table insert
+  # Required columns: test_ID, vald_id, date, test_type
+  tests_to_add <- missing_test_ids[, .(test_ID)]
+  
+  # Add vald_id if available
+  if ("vald_id" %in% names(missing_test_ids)) {
+    tests_to_add[, vald_id := missing_test_ids$vald_id]
+  } else {
+    tests_to_add[, vald_id := NA_character_]
+  }
+  
+  # Add date if available
+  if ("date" %in% names(missing_test_ids)) {
+    tests_to_add[, date := missing_test_ids$date]
+  } else {
+    tests_to_add[, date := as.Date(NA)]
+  }
+  
+  # Add test_type if available
+  if ("test_type" %in% names(missing_test_ids)) {
+    tests_to_add[, test_type := missing_test_ids$test_type]
+  } else {
+    tests_to_add[, test_type := NA_character_]
+  }
+  
+  # Upload missing test_IDs to tests table
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "tests")
+    
+    # Check if table exists
+    if (!safe_table_exists(tbl)) {
+      log_info("Creating tests table...")
+      bigrquery::bq_table_upload(tbl, tests_to_add, write_disposition = "WRITE_TRUNCATE")
+      log_info("Created tests table with {nrow(tests_to_add)} records")
+      return(nrow(tests_to_add))
+    }
+    
+    # Use MERGE to upsert missing records
+    # First, upload to a temp table, then merge
+    temp_table_name <- "tests_sync_temp"
+    temp_tbl <- bigrquery::bq_table(ds, temp_table_name)
+    
+    # Upload to temp table
+    bigrquery::bq_table_upload(temp_tbl, tests_to_add, write_disposition = "WRITE_TRUNCATE")
+    
+    # Execute merge
+    merge_sql <- glue::glue("
+      MERGE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.tests` T
+      USING `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{temp_table_name}` S
+      ON T.test_ID = S.test_ID
+      WHEN NOT MATCHED THEN
+        INSERT (test_ID, vald_id, date, test_type)
+        VALUES (S.test_ID, S.vald_id, S.date, S.test_type)
+    ")
+    
+    bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+    
+    # Clean up temp table
+    bigrquery::bq_table_delete(temp_tbl)
+    
+    log_info("Synced {nrow(tests_to_add)} missing test_IDs to tests table")
+    return(nrow(tests_to_add))
+    
+  }, error = function(e) {
+    log_error("Failed to sync tests table: {e$message}")
+    return(0L)
+  })
+}
+
+#' Query existing dates from the dates reference table
+#' @return Vector of dates in the dates table
+query_dates_table <- function() {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "dates")
+    
+    if (!safe_table_exists(tbl)) {
+      log_info("Dates table does not exist - will create it")
+      return(as.Date(character(0)))
+    }
+    
+    sql <- glue::glue("SELECT DISTINCT date FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.dates`")
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% 
+      bigrquery::bq_table_download()
+    
+    dates <- as.Date(result$date)
+    log_info("Found {length(dates)} dates in dates table")
+    
+    return(dates)
+    
+  }, error = function(e) {
+    log_warn("Could not query dates table: {e$message}")
+    return(as.Date(character(0)))
+  })
+}
+
+#' Query all unique dates from a data table
+#' @param table_name The name of the data table to query
+#' @return Vector of unique dates
+query_data_table_dates <- function(table_name) {
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, table_name)
+    
+    if (!safe_table_exists(tbl)) {
+      return(as.Date(character(0)))
+    }
+    
+    # Check if date column exists
+    meta <- bigrquery::bq_table_meta(tbl)
+    available_cols <- sapply(meta$schema$fields, function(f) f$name)
+    
+    if (!"date" %in% available_cols) {
+      log_info("Table {table_name} has no 'date' column - skipping")
+      return(as.Date(character(0)))
+    }
+    
+    sql <- glue::glue("SELECT DISTINCT date FROM `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}` WHERE date IS NOT NULL")
+    result <- bigrquery::bq_project_query(CONFIG$gcp_project, sql) %>% 
+      bigrquery::bq_table_download()
+    
+    dates <- as.Date(result$date)
+    log_info("Found {length(dates)} unique dates in {table_name}")
+    
+    return(dates)
+    
+  }, error = function(e) {
+    log_warn("Could not query dates from {table_name}: {e$message}")
+    return(as.Date(character(0)))
+  })
+}
+
+#' Sync dates from data tables to the dates reference table
+#' This ensures the dates table is complete with all dates from actual data
+#' @return Number of dates synced
+sync_dates_table <- function() {
+  log_info("=== SYNCING DATES TABLE ===")
+  
+  # Define data tables to check
+  data_tables <- c(
+    "vald_fd_jumps", 
+    "vald_fd_dj", 
+    "vald_fd_rsi", 
+    "vald_fd_sl_jumps", 
+    "vald_fd_imtp",
+    "vald_fd_rebound", 
+    "vald_nord_all", 
+    "vald_dynamo"
+  )
+  
+  # Query existing dates from dates table
+  existing_dates <- query_dates_table()
+  
+  # Collect all dates from data tables
+  all_data_dates <- as.Date(character(0))
+  
+  for (table_name in data_tables) {
+    dates <- query_data_table_dates(table_name)
+    if (length(dates) > 0) {
+      all_data_dates <- c(all_data_dates, dates)
+    }
+  }
+  
+  # Get unique dates
+  all_data_dates <- unique(all_data_dates)
+  all_data_dates <- all_data_dates[!is.na(all_data_dates)]
+  
+  if (length(all_data_dates) == 0) {
+    log_info("No dates found in any data tables - nothing to sync")
+    return(0L)
+  }
+  
+  log_info("Total unique dates across all data tables: {length(all_data_dates)}")
+  log_info("Existing dates in dates table: {length(existing_dates)}")
+  
+  # Find dates missing from dates table
+  missing_dates <- all_data_dates[!(all_data_dates %in% existing_dates)]
+  n_missing <- length(missing_dates)
+  
+  if (n_missing == 0) {
+    log_info("Dates table is complete - no missing dates")
+    return(0L)
+  }
+  
+  log_warn("Found {n_missing} dates in data tables that are missing from dates table")
+  
+  # Prepare data for dates table insert
+  # Columns: date, source, updated
+  dates_to_add <- data.table::data.table(
+    date = missing_dates,
+    source = "SecondaryDefense",
+    updated = Sys.time()
+  )
+  
+  # Upload missing dates to dates table
+  tryCatch({
+    ds <- bigrquery::bq_dataset(CONFIG$gcp_project, CONFIG$bq_dataset)
+    tbl <- bigrquery::bq_table(ds, "dates")
+    
+    # Check if table exists
+    if (!safe_table_exists(tbl)) {
+      log_info("Creating dates table...")
+      bigrquery::bq_table_upload(tbl, dates_to_add, write_disposition = "WRITE_TRUNCATE")
+      log_info("Created dates table with {nrow(dates_to_add)} records")
+      return(nrow(dates_to_add))
+    }
+    
+    # Use MERGE to upsert missing records
+    temp_table_name <- "dates_sync_temp"
+    temp_tbl <- bigrquery::bq_table(ds, temp_table_name)
+    
+    # Upload to temp table
+    bigrquery::bq_table_upload(temp_tbl, dates_to_add, write_disposition = "WRITE_TRUNCATE")
+    
+    # Execute merge
+    merge_sql <- glue::glue("
+      MERGE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.dates` T
+      USING `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{temp_table_name}` S
+      ON T.date = S.date
+      WHEN NOT MATCHED THEN
+        INSERT (date, source, updated)
+        VALUES (S.date, S.source, S.updated)
+    ")
+    
+    bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+    
+    # Clean up temp table
+    bigrquery::bq_table_delete(temp_tbl)
+    
+    log_info("Synced {nrow(dates_to_add)} missing dates to dates table")
+    return(nrow(dates_to_add))
+    
+  }, error = function(e) {
+    log_error("Failed to sync dates table: {e$message}")
+    return(0L)
+  })
+}
+
+# ============================================================================
 # Main Execution
 # ============================================================================
 log_info("=== STARTING SECONDARY DEFENSE PROCESSING ===")
 
-# Step 1: Query unaccounted test_IDs
+# Step 1: Sync tests table from data tables
+# This ensures the tests table contains all test_IDs from actual data tables
+log_info("=== STEP 1: SYNC TESTS TABLE ===")
+n_tests_synced <- sync_tests_table()
+if (n_tests_synced > 0) {
+  log_info("Tests table sync complete: added {n_tests_synced} missing test_IDs")
+} else {
+  log_info("Tests table sync complete: no missing test_IDs")
+}
+
+# Step 2: Sync dates table from data tables
+# This ensures the dates table contains all dates from actual data tables
+log_info("=== STEP 2: SYNC DATES TABLE ===")
+n_dates_synced <- sync_dates_table()
+if (n_dates_synced > 0) {
+  log_info("Dates table sync complete: added {n_dates_synced} missing dates")
+} else {
+  log_info("Dates table sync complete: no missing dates")
+}
+
+# Step 3: Query unaccounted test_IDs from filter log
+log_info("=== STEP 3: PROCESS UNACCOUNTED TEST IDS ===")
 unaccounted <- query_unaccounted_test_ids()
 
 if (nrow(unaccounted) == 0) {
-  log_info("No unaccounted test_IDs found - nothing to do")
-  log_info("=== SECONDARY DEFENSE COMPLETE (no work needed) ===")
+  log_info("No unaccounted test_IDs found in filter log - nothing more to do")
+  log_info("=== SECONDARY DEFENSE COMPLETE ===")
   quit(status = 0)
 }
 
-# Step 2: Split by data source
+# Step 4: Split by data source
 fd_test_ids <- unaccounted[data_source == "ForceDecks", test_ID]
 nord_test_ids <- unaccounted[data_source == "NordBord", test_ID]
 
@@ -527,7 +924,7 @@ log_info("Unaccounted test_IDs: {length(fd_test_ids)} ForceDecks, {length(nord_t
 
 processed_ids <- character(0)
 
-# Step 3: Process ForceDecks test_IDs
+# Step 5: Process ForceDecks test_IDs
 if (length(fd_test_ids) > 0) {
   log_info("=== Processing ForceDecks Recovery ===")
   
@@ -597,7 +994,7 @@ if (length(fd_test_ids) > 0) {
   }
 }
 
-# Step 4: Process NordBord test_IDs
+# Step 6: Process NordBord test_IDs
 if (length(nord_test_ids) > 0) {
   log_info("=== Processing NordBord Recovery ===")
   
@@ -626,7 +1023,7 @@ if (length(nord_test_ids) > 0) {
   }
 }
 
-# Step 5: Purge successfully processed test_IDs from the log
+# Step 7: Purge successfully processed test_IDs from the log
 if (length(processed_ids) > 0) {
   log_info("=== Purging Processed Test IDs ===")
   purge_processed_test_ids(processed_ids)
