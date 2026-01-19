@@ -439,7 +439,7 @@ DYNAMO_CONFIG <- list(
 )
 
 # ============================================================================
-# Production Column Schema (54 columns total - V3.0.0)
+# Production Column Schema (54 columns total - V2.4.3)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
   # Identifiers (6 columns)
@@ -2983,7 +2983,7 @@ standardize_data_types <- function(dt) {
 ensure_numeric_types <- function(dt, expected_columns = character()) {
   data.table::setDT(dt)
   
-  # Define columns that should always be numeric based on PRODUCTION_CMJ_COLUMNS
+  # Define patterns that identify numeric columns across all table types
   numeric_patterns <- c(
     "height", "weight", "force", "power", "velocity", "impulse", "duration", 
     "ratio", "rsi", "stiffness", "time", "depth", "work", "rfd", "readiness",
@@ -3001,27 +3001,26 @@ ensure_numeric_types <- function(dt, expected_columns = character()) {
     numeric_cols <- union(numeric_cols, intersect(expected_columns, names(dt)))
   }
   
+  # Helper function to convert column to numeric with logging
+  convert_to_numeric <- function(col, col_class, dt) {
+    tryCatch({
+      dt[, (col) := as.numeric(get(col))]
+      log_info("Type safety: Converted {col} from {col_class} to numeric")
+      TRUE
+    }, error = function(e) {
+      log_warn("Could not convert {col} to numeric: {e$message}")
+      FALSE
+    })
+  }
+  
   # Ensure these columns are numeric type (not logical/boolean)
   for (col in numeric_cols) {
     if (col %in% names(dt)) {
       col_class <- class(dt[[col]])[1]
       
-      # If column is logical (boolean) or character but should be numeric, convert it
-      if (col_class %in% c("logical", "character", "factor")) {
-        tryCatch({
-          dt[, (col) := as.numeric(get(col))]
-          log_info("Type safety: Converted {col} from {col_class} to numeric")
-        }, error = function(e) {
-          log_warn("Could not convert {col} to numeric: {e$message}")
-        })
-      } else if (!is.numeric(dt[[col]])) {
-        # For any other non-numeric type, try to convert
-        tryCatch({
-          dt[, (col) := as.numeric(get(col))]
-          log_info("Type safety: Converted {col} from {col_class} to numeric")
-        }, error = function(e) {
-          log_warn("Could not convert {col} to numeric: {e$message}")
-        })
+      # If column is logical (boolean), character, or factor but should be numeric, convert it
+      if (col_class %in% c("logical", "character", "factor") || !is.numeric(dt[[col]])) {
+        convert_to_numeric(col, col_class, dt)
       }
     }
   }
