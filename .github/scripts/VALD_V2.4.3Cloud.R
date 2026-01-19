@@ -1417,12 +1417,11 @@ safe_table_exists <- function(tbl) {
       log_warn("bq_table_exists returned empty logical for {tbl_name} - treating as FALSE")
       return(FALSE)
     }
-    # Use anyNA to handle vectors, and check first element only
+    # isTRUE handles NA values and ensures single logical value
+    # Logs warning if NA detected
     if (anyNA(result)) {
       log_warn("bq_table_exists returned NA for {tbl_name} - treating as FALSE")
-      return(FALSE)
     }
-    # Ensure we return a single logical value using isTRUE
     return(isTRUE(result[1]))
   }, error = function(e) {
     tbl_name <- tryCatch({
