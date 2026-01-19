@@ -1634,9 +1634,37 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       log_info("Executing MERGE for {table_name}...")
       
-      # Execute merge and capture job details
+      # Execute merge and capture job details with enhanced error handling
       # Note: bq_project_query() may return a bq_job (older bigrquery) or bq_table (bigrquery >= 1.4.0)
-      query_result <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      query_result <- tryCatch({
+        bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      }, error = function(e) {
+        # Enhanced error handling: extract job details from error object
+        error_msg <- conditionMessage(e)
+        
+        # Try to extract job ID from error message for better debugging
+        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+", error_msg))
+        if (length(job_id_match) > 0) {
+          log_error("MERGE job failed - Job ID: {job_id_match}")
+        }
+        
+        # Log the full error for debugging
+        log_error("MERGE query failed: {error_msg}")
+        
+        # Try to drop staging table even on failure
+        tryCatch({
+          staging_exists <- safe_table_exists(staging_tbl)
+          if (staging_exists) {
+            bigrquery::bq_table_delete(staging_tbl)
+            log_info("Cleaned up staging table after query failure")
+          }
+        }, error = function(cleanup_err) {
+          log_warn("Could not clean up staging table: {cleanup_err$message}")
+        })
+        
+        # Re-throw with more context
+        stop(sprintf("BigQuery MERGE failed for table '%s': %s", table_name, error_msg), call. = FALSE)
+      })
       
       # Check if we got a bq_job or bq_table
       # In bigrquery >= 1.4.0, bq_project_query() returns a bq_table by default
