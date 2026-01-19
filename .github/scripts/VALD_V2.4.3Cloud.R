@@ -439,7 +439,7 @@ DYNAMO_CONFIG <- list(
 )
 
 # ============================================================================
-# Production Column Schema (55 columns total - V3.0.0)
+# Production Column Schema (54 columns total - V2.4.3)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
   # Identifiers (6 columns)
@@ -508,10 +508,9 @@ PRODUCTION_CMJ_COLUMNS <- c(
   # Stiffness (1 column)
   "cmj_stiffness",
   
-  # Landing Metrics (3 columns)
+  # Landing Metrics (2 columns)
   "relative_peak_landing_force",
   "landing_impulse",
-  "peak_drop_force",
   
   # Readiness & Performance (5 columns)
   "jump_height_readiness",
@@ -1472,6 +1471,10 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     return(invisible(TRUE))
   }
   
+  # FIX: Ensure numeric columns are properly typed before BigQuery upload
+  # This prevents type inference errors when columns contain all NA values
+  data <- ensure_numeric_types(data)
+  
   # Cloud: Write to BigQuery
   staging_tbl <- NULL  # Track staging table for cleanup
   staging_name <- NULL
@@ -1495,7 +1498,17 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     }
     
     # 2. Check for NULL/NA values in key column
-    null_keys <- sum(is.na(data[[key]]) | data[[key]] == "")
+    # Handle different key column types (character, Date, numeric)
+    # Note: Date and numeric types only need NA check; empty string check is character-specific
+    key_is_na <- is.na(data[[key]])
+    if (is.character(data[[key]])) {
+      key_is_empty <- data[[key]] == ""
+      null_keys <- sum(key_is_na | key_is_empty, na.rm = TRUE)
+    } else {
+      # For Date, numeric, and other types: only check for NA
+      null_keys <- sum(key_is_na, na.rm = TRUE)
+    }
+    
     if (null_keys > 0) {
       log_error("MERGE WILL FAIL: Found {null_keys} NULL/empty keys in column '{key}'")
       stop(sprintf("Cannot MERGE: %d NULL/empty values in key column '%s'", null_keys, key))
@@ -2959,6 +2972,61 @@ standardize_data_types <- function(dt) {
       }
     }
   }
+  return(dt)
+}
+
+# ============================================================================
+# BigQuery Type Safety: Ensure Numeric Columns Are Properly Typed
+# ============================================================================
+# Fixes issue where columns with all NA values are inferred as BOOLEAN by as_bq_fields()
+# This causes MERGE failures like "Value of type BOOL cannot be assigned to T.column, which has type STRING"
+# Note: This function is a safety net called immediately before BigQuery upload,
+# complementing standardize_data_types() which is called during data processing
+ensure_numeric_types <- function(dt, expected_columns = character()) {
+  data.table::setDT(dt)
+  
+  # Define patterns that identify numeric columns across all table types
+  numeric_patterns <- c(
+    "height", "weight", "force", "power", "velocity", "impulse", "duration", 
+    "ratio", "rsi", "stiffness", "time", "depth", "work", "rfd", "readiness",
+    "score", "asymmetry", "acceleration", "displacement"
+  )
+  
+  # Combine patterns for efficient matching
+  pattern_regex <- paste(numeric_patterns, collapse = "|")
+  
+  # Get all columns that should be numeric based on patterns
+  numeric_cols <- names(dt)[grepl(pattern_regex, names(dt), ignore.case = TRUE)]
+  
+  # Also check expected_columns if provided
+  if (length(expected_columns) > 0) {
+    numeric_cols <- union(numeric_cols, intersect(expected_columns, names(dt)))
+  }
+  
+  # Helper function to convert column to numeric with logging
+  convert_to_numeric <- function(col, col_class, dt) {
+    tryCatch({
+      dt[, (col) := as.numeric(get(col))]
+      log_info("Type safety: Converted {col} from {col_class} to numeric")
+      TRUE
+    }, error = function(e) {
+      log_warn("Could not convert {col} to numeric: {e$message}")
+      FALSE
+    })
+  }
+  
+  # Ensure these columns are numeric type (not logical/boolean)
+  for (col in numeric_cols) {
+    if (col %in% names(dt)) {
+      col_class <- class(dt[[col]])[1]
+      
+      # If column is logical (boolean), character, or factor but should be numeric, convert it
+      if (col_class %in% c("logical", "character", "factor") || !is.numeric(dt[[col]])) {
+        convert_to_numeric(col, col_class, dt)
+      }
+    }
+  }
+  
   return(dt)
 }
 
@@ -5293,15 +5361,19 @@ if (fd_changed) {
             dates_df <- dates_df[!is.na(date)]
             dates_df <- unique(dates_df, by = "date")
             
-            if (nrow(dates_df) > 0) {
+            # Defensive check: ensure nrow returns a valid number
+            n_dates <- nrow(dates_df)
+            if (!is.null(n_dates) && !is.na(n_dates) && n_dates > 0) {
               bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-              log_and_store("Updated dates table: {nrow(dates_df)} dates from {n_processed} processed tests")
+              log_and_store("Updated dates table: {n_dates} dates from {n_processed} processed tests")
             }
             
-            if (nrow(tests_df) > 0) {
+            # Defensive check: ensure nrow returns a valid number
+            n_tests <- nrow(tests_df)
+            if (!is.null(n_tests) && !is.na(n_tests) && n_tests > 0) {
               bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
               update_status("refs_updated", TRUE)
-              log_and_store("Updated tests table: {nrow(tests_df)} processed tests (of {n_fetched} fetched)")
+              log_and_store("Updated tests table: {n_tests} processed tests (of {n_fetched} fetched)")
             }
             
             # Log gap for awareness
