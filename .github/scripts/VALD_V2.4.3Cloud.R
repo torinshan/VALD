@@ -1639,18 +1639,54 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       query_result <- tryCatch({
         bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
       }, error = function(e) {
-        # Enhanced error handling: extract job details from error object
+        # Enhanced error handling: extract comprehensive job details from error object
         error_msg <- conditionMessage(e)
         
         # Try to extract job ID from error message for better debugging
-        # BigQuery job IDs follow pattern: job_[chars].[region] (e.g., job_K-BX-4imQgnH54FXL9YzB0CUvsfN.US)
-        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+\\.[A-Z0-9]+", error_msg))
-        if (length(job_id_match) > 0) {
+        # BigQuery job IDs follow pattern: job_[chars].[region] (e.g., job_K-BX-4imQgnH54FXL9YzB0CUvsfN.US or job_XXX.us-central1)
+        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+\\.[A-Za-z0-9-]+", error_msg))
+        if (length(job_id_match)) {
           log_error("MERGE job failed - Job ID: {job_id_match[1]}")
         }
         
         # Log the full error for debugging
         log_error("MERGE query failed: {error_msg}")
+        
+        # Try to extract structured error information from the error object
+        # BigQuery errors may contain additional metadata
+        if (!is.null(e$parent)) {
+          log_error("Parent error: {conditionMessage(e$parent)}")
+        }
+        
+        # Check if error object has response details (httr/httr2 errors)
+        if (!is.null(e$message) && grepl("API", error_msg, ignore.case = TRUE)) {
+          log_error("This appears to be a BigQuery API error")
+          
+          # Common BigQuery error patterns to help diagnose issues
+          if (grepl("schema", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Schema mismatch between data and table")
+            log_error("ACTION NEEDED: Check column names, types, or add missing columns to table")
+          } else if (grepl("quota", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: BigQuery quota exceeded")
+            log_error("ACTION NEEDED: Check project quotas or reduce data volume")
+          } else if (grepl("permission|authorized", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Insufficient permissions")
+            log_error("ACTION NEEDED: Verify service account has BigQuery Data Editor role")
+          } else if (grepl("not found|does not exist", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Table or dataset not found")
+            log_error("ACTION NEEDED: Verify dataset '{CONFIG$bq_dataset}' exists in project '{CONFIG$gcp_project}'")
+          } else if (grepl("duplicate|already exists", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Duplicate key in MERGE operation")
+            log_error("ACTION NEEDED: Check for duplicate test_IDs in data")
+          } else if (grepl("timeout|deadline", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Query timeout")
+            log_error("ACTION NEEDED: Reduce data volume or optimize MERGE query")
+          }
+        }
+        
+        # Log data shape for context
+        log_error("Data being merged: {nrow(data)} rows, {ncol(data)} columns")
+        log_error("Table: {table_name}, Key: {key}")
         
         # Try to drop staging table even on failure
         tryCatch({
@@ -1687,6 +1723,28 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
           if (!is.null(error_location)) {
             log_error("Error location: {error_location}")
           }
+          
+          # Provide diagnostic suggestions based on error reason/message
+          if (grepl("schema", error_msg, ignore.case = TRUE) || error_reason == "invalidQuery") {
+            log_error("LIKELY CAUSE: Schema mismatch or invalid query")
+            log_error("ACTION NEEDED: Check column names, types, or MERGE query syntax")
+          } else if (grepl("quota", error_msg, ignore.case = TRUE) || error_reason == "quotaExceeded") {
+            log_error("LIKELY CAUSE: BigQuery quota exceeded")
+            log_error("ACTION NEEDED: Check project quotas or reduce data volume")
+          } else if (grepl("permission|authorized", error_msg, ignore.case = TRUE) || error_reason == "accessDenied") {
+            log_error("LIKELY CAUSE: Insufficient permissions")
+            log_error("ACTION NEEDED: Verify service account has BigQuery Data Editor role")
+          } else if (grepl("not found", error_msg, ignore.case = TRUE) || error_reason == "notFound") {
+            log_error("LIKELY CAUSE: Table, dataset, or column not found")
+            log_error("ACTION NEEDED: Verify all referenced tables/columns exist")
+          } else if (grepl("duplicate", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Duplicate key in MERGE operation")
+            log_error("ACTION NEEDED: Check for duplicate values in key column '{key}'")
+          }
+          
+          # Log data shape for context
+          log_error("Data being merged: {nrow(data)} rows, {ncol(data)} columns")
+          log_error("Table: {table_name}, Key: {key}")
           
           # Try to drop staging table even on failure
           tryCatch({
