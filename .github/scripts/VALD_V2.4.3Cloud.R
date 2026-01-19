@@ -5126,7 +5126,18 @@ if (fd_changed) {
           if (length(missing_cols) > 0) {
             log_warn("Missing {length(missing_cols)} columns - adding as NA")
             for (col in missing_cols) {
-              cmj_clean[, (col) := NA]
+              # Ensure correct NA type based on expected column type
+              # Character columns: MDC status fields and fatigue category
+              if (col %in% c("jh_mdc_status", "rsi_mdc_status", "epf_mdc_status", "fatigue_category",
+                             "test_ID", "vald_id", "full_name", "team", "test_type")) {
+                cmj_clean[, (col) := NA_character_]
+              } else if (col == "date") {
+                # Date column should be NA with Date class
+                cmj_clean[, (col) := as.Date(NA)]
+              } else {
+                # All other columns are numeric
+                cmj_clean[, (col) := NA_real_]
+              }
             }
           }
           
