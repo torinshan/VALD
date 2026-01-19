@@ -1,0 +1,62 @@
+# R files
+.Rhistory
+.RData
+.Rproj.user
+*.Rproj
+.Renviron
+packrat/
+renv/
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Credentials
+*.json
+*.key
+.env
+.credentials
+credentials/
+service-account*.json
+gcp-key*.json
+
+# Logs
+*.log
+logs/
+*.out
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+*~
+.#*
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node modules (if any)
+node_modules/
+
+# BigQuery temp files
+bq-results-*.csv

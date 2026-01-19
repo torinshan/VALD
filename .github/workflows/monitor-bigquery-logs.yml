@@ -1,0 +1,130 @@
+name: Monitor BigQuery Logs (Every 15m)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # Every 15 minutes
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Number of days to look back for logs"
+        required: false
+        default: "3"
+        type: string
+
+env:
+  GCP_PROJECT: sac-vald-hub
+  BQ_DATASET: analytics
+  BQ_LOCATION: US
+  LOOKBACK_DAYS: 3
+  BIGRQUERY_USE_BQ_STORAGE: 'false'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  monitor-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Show current time
+        run: |
+          echo "UTC now: $(date -u)"
+          echo "LA  now: $(TZ=America/Los_Angeles date)"
+      
+      - uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/884700516106/locations/global/workloadIdentityPools/gha-pool/providers/github
+          service_account: gha-bq@sac-vald-hub.iam.gserviceaccount.com
+          create_credentials_file: true
+          token_format: access_token
+          access_token_lifetime: 3600s
+      
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          install_components: bq
+      
+      - name: Test BigQuery access
+        run: |
+          gcloud auth list
+          bq ls --project_id="${GCP_PROJECT}" || echo "BigQuery test failed"
+      
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      
+      - name: Install R dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache-version: 1
+          extra-packages: |
+            any::bigrquery
+            any::dplyr
+            any::tidyr
+            any::lubridate
+            any::stringr
+            any::data.table
+          dependencies: '"hard"'
+      
+      - name: System libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      
+      - name: Verify script exists
+        run: test -f .github/scripts/monitor_bigquery_logs.R
+      
+      - name: Run log monitoring script
+        env:
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || env.LOOKBACK_DAYS }}
+        run: |
+          set -e
+          echo "=========================================="
+          echo "  Running BigQuery Log Monitor"
+          echo "=========================================="
+          echo "Project: ${GCP_PROJECT}"
+          echo "Dataset: ${BQ_DATASET}"
+          echo "Lookback: ${LOOKBACK_DAYS} days"
+          echo "=========================================="
+          echo ""
+          Rscript .github/scripts/monitor_bigquery_logs.R
+      
+      - name: Check for critical errors
+        if: always()
+        id: check_errors
+        run: |
+          # Query for recent critical errors (last hour)
+          RECENT_ERRORS=$(bq query --use_legacy_sql=false --format=csv \
+            "SELECT COUNT(*) as error_count 
+             FROM \`${GCP_PROJECT}.${BQ_DATASET}.vald_processing_log\`
+             WHERE level = 'ERROR' 
+               AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)" \
+            2>/dev/null | tail -n1 || echo "0")
+          
+          echo "Recent errors (last hour): ${RECENT_ERRORS}"
+          echo "error_count=${RECENT_ERRORS}" >> "$GITHUB_OUTPUT"
+          
+          # Set warning if errors found (but don't fail the workflow)
+          if [ "${RECENT_ERRORS}" -gt "0" ]; then
+            echo "⚠️  Found ${RECENT_ERRORS} error(s) in the last hour"
+          else
+            echo "✅ No errors in the last hour"
+          fi
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "  Log Monitoring Complete"
+          echo "=========================================="
+          echo "Status: ${{ job.status }}"
+          echo "Recent Errors: ${{ steps.check_errors.outputs.error_count || '0' }}"
+          echo "Timestamp: $(date -u)"
+          echo "=========================================="
