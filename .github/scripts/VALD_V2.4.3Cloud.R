@@ -1499,11 +1499,13 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
     # 2. Check for NULL/NA values in key column
     # Handle different key column types (character, Date, numeric)
+    # Note: Date and numeric types only need NA check; empty string check is character-specific
     key_is_na <- is.na(data[[key]])
     if (is.character(data[[key]])) {
       key_is_empty <- data[[key]] == ""
       null_keys <- sum(key_is_na | key_is_empty, na.rm = TRUE)
     } else {
+      # For Date, numeric, and other types: only check for NA
       null_keys <- sum(key_is_na, na.rm = TRUE)
     }
     
