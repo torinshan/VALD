@@ -1417,11 +1417,12 @@ safe_table_exists <- function(tbl) {
       log_warn("bq_table_exists returned empty logical for {tbl_name} - treating as FALSE")
       return(FALSE)
     }
-    if (is.na(result)) {
+    # isTRUE handles NA values and ensures single logical value
+    # Logs warning if NA detected
+    if (anyNA(result)) {
       log_warn("bq_table_exists returned NA for {tbl_name} - treating as FALSE")
-      return(FALSE)
     }
-    return(result)
+    return(isTRUE(result[1]))
   }, error = function(e) {
     tbl_name <- tryCatch({
       if (!is.null(tbl) && !is.null(tbl$table)) tbl$table else "unknown_table"
@@ -1503,14 +1504,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     log_info("Pre-flight checks passed (new data): {nrow(data)} unique keys, no NULLs")
     
     # Check if table exists BEFORE using it in conditionals
-    # FIX: Moved up from below, with NA handling
-    table_exists <- tryCatch({
-      result <- bigrquery::bq_table_exists(tbl)
-      if (is.na(result)) FALSE else result
-    }, error = function(e) {
-      log_warn("Could not check table existence: {e$message}")
-      FALSE
-    })
+    # Use safe_table_exists to handle all edge cases (NULL, NA, length==0, vector)
+    table_exists <- safe_table_exists(tbl)
     
     # 3. Query existing keys from BigQuery table (MERGE mode only)
     if (mode == "MERGE" && table_exists) {
@@ -1599,8 +1594,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         )
       }, error = function(e) {
         # If table already exists from previous failed run, delete and recreate
-        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
-        if (!is.na(staging_exists) && staging_exists) {
+        staging_exists <- safe_table_exists(staging_tbl)
+        if (staging_exists) {
           log_warn("Staging table {staging_name} already exists, deleting old one")
           bigrquery::bq_table_delete(staging_tbl)
           bigrquery::bq_table_create(
@@ -1639,9 +1634,74 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       
       log_info("Executing MERGE for {table_name}...")
       
-      # Execute merge and capture job details
+      # Execute merge and capture job details with enhanced error handling
       # Note: bq_project_query() may return a bq_job (older bigrquery) or bq_table (bigrquery >= 1.4.0)
-      query_result <- bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      query_result <- tryCatch({
+        bigrquery::bq_project_query(CONFIG$gcp_project, merge_sql)
+      }, error = function(e) {
+        # Enhanced error handling: extract comprehensive job details from error object
+        error_msg <- conditionMessage(e)
+        
+        # Try to extract job ID from error message for better debugging
+        # BigQuery job IDs follow pattern: job_[chars].[region] (e.g., job_K-BX-4imQgnH54FXL9YzB0CUvsfN.US or job_XXX.us-central1)
+        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+\\.[A-Za-z0-9-]+", error_msg))
+        if (length(job_id_match)) {
+          log_error("MERGE job failed - Job ID: {job_id_match[1]}")
+        }
+        
+        # Log the full error for debugging
+        log_error("MERGE query failed: {error_msg}")
+        
+        # Try to extract structured error information from the error object
+        # BigQuery errors may contain additional metadata
+        if (!is.null(e$parent)) {
+          log_error("Parent error: {conditionMessage(e$parent)}")
+        }
+        
+        # Check if error object has response details (httr/httr2 errors)
+        if (!is.null(e$message) && grepl("API", error_msg, ignore.case = TRUE)) {
+          log_error("This appears to be a BigQuery API error")
+          
+          # Common BigQuery error patterns to help diagnose issues
+          if (grepl("schema", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Schema mismatch between data and table")
+            log_error("ACTION NEEDED: Check column names, types, or add missing columns to table")
+          } else if (grepl("quota", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: BigQuery quota exceeded")
+            log_error("ACTION NEEDED: Check project quotas or reduce data volume")
+          } else if (grepl("permission|authorized", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Insufficient permissions")
+            log_error("ACTION NEEDED: Verify service account has BigQuery Data Editor role")
+          } else if (grepl("not found|does not exist", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Table or dataset not found")
+            log_error("ACTION NEEDED: Verify dataset '{CONFIG$bq_dataset}' exists in project '{CONFIG$gcp_project}'")
+          } else if (grepl("duplicate|already exists", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Duplicate key in MERGE operation")
+            log_error("ACTION NEEDED: Check for duplicate test_IDs in data")
+          } else if (grepl("timeout|deadline", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Query timeout")
+            log_error("ACTION NEEDED: Reduce data volume or optimize MERGE query")
+          }
+        }
+        
+        # Log data shape for context
+        log_error("Data being merged: {nrow(data)} rows, {ncol(data)} columns")
+        log_error("Table: {table_name}, Key: {key}")
+        
+        # Try to drop staging table even on failure
+        tryCatch({
+          staging_exists <- safe_table_exists(staging_tbl)
+          if (staging_exists) {
+            bigrquery::bq_table_delete(staging_tbl)
+            log_info("Cleaned up staging table after query failure")
+          }
+        }, error = function(cleanup_err) {
+          log_warn("Could not clean up staging table: {conditionMessage(cleanup_err)}")
+        })
+        
+        # Re-throw with more context
+        stop(sprintf("BigQuery MERGE failed for table '%s': %s", table_name, error_msg), call. = FALSE)
+      })
       
       # Check if we got a bq_job or bq_table
       # In bigrquery >= 1.4.0, bq_project_query() returns a bq_table by default
@@ -1664,6 +1724,28 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
             log_error("Error location: {error_location}")
           }
           
+          # Provide diagnostic suggestions based on error reason/message
+          if (grepl("schema", error_msg, ignore.case = TRUE) || error_reason == "invalidQuery") {
+            log_error("LIKELY CAUSE: Schema mismatch or invalid query")
+            log_error("ACTION NEEDED: Check column names, types, or MERGE query syntax")
+          } else if (grepl("quota", error_msg, ignore.case = TRUE) || error_reason == "quotaExceeded") {
+            log_error("LIKELY CAUSE: BigQuery quota exceeded")
+            log_error("ACTION NEEDED: Check project quotas or reduce data volume")
+          } else if (grepl("permission|authorized", error_msg, ignore.case = TRUE) || error_reason == "accessDenied") {
+            log_error("LIKELY CAUSE: Insufficient permissions")
+            log_error("ACTION NEEDED: Verify service account has BigQuery Data Editor role")
+          } else if (grepl("not found", error_msg, ignore.case = TRUE) || error_reason == "notFound") {
+            log_error("LIKELY CAUSE: Table, dataset, or column not found")
+            log_error("ACTION NEEDED: Verify all referenced tables/columns exist")
+          } else if (grepl("duplicate", error_msg, ignore.case = TRUE)) {
+            log_error("LIKELY CAUSE: Duplicate key in MERGE operation")
+            log_error("ACTION NEEDED: Check for duplicate values in key column '{key}'")
+          }
+          
+          # Log data shape for context
+          log_error("Data being merged: {nrow(data)} rows, {ncol(data)} columns")
+          log_error("Table: {table_name}, Key: {key}")
+          
           # Try to drop staging table even on failure
           tryCatch({
             staging_exists <- safe_table_exists(staging_tbl)
@@ -1672,7 +1754,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
               log_info("Cleaned up staging table after failure")
             }
           }, error = function(cleanup_err) {
-            log_warn("Could not clean up staging table: {cleanup_err$message}")
+            log_warn("Could not clean up staging table: {conditionMessage(cleanup_err)}")
           })
           
           stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
@@ -1719,12 +1801,12 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
           log_info("Cleaned up staging table {staging_name} after error")
         }
       }, error = function(cleanup_err) {
-        log_warn("Could not clean up staging table {staging_name}: {cleanup_err$message}")
+        log_warn("Could not clean up staging table {staging_name}: {conditionMessage(cleanup_err)}")
         log_warn("Staging table will auto-expire in 2 minutes")
       })
     }
     
-    record_error(paste0("BQ_", table_name), e$message)
+    record_error(paste0("BQ_", table_name), conditionMessage(e))
     invisible(FALSE)
   })
 }
