@@ -1505,22 +1505,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     log_info("Pre-flight checks passed (new data): {nrow(data)} unique keys, no NULLs")
     
     # Check if table exists BEFORE using it in conditionals
-    # FIX: Moved up from below, with NA handling
-    # ROBUST FIX: Handle all edge cases (NULL, NA, length==0, vector)
-    table_exists <- tryCatch({
-      result <- bigrquery::bq_table_exists(tbl)
-      # Handle NULL
-      if (is.null(result)) return(FALSE)
-      # Handle empty logical vector
-      if (length(result) == 0) return(FALSE)
-      # Handle NA - use isTRUE to ensure single logical value
-      if (anyNA(result)) return(FALSE)
-      # Ensure we return a single logical value
-      return(isTRUE(result[1]))
-    }, error = function(e) {
-      log_warn("Could not check table existence: {e$message}")
-      FALSE
-    })
+    # Use safe_table_exists to handle all edge cases (NULL, NA, length==0, vector)
+    table_exists <- safe_table_exists(tbl)
     
     # 3. Query existing keys from BigQuery table (MERGE mode only)
     if (mode == "MERGE" && table_exists) {
