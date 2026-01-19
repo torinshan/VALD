@@ -69,17 +69,35 @@ jobs:
         # Only runtime dependencies needed for production
         extra-packages: |
           any::bigrquery
+          any::DBI
           any::dplyr
           any::tidyr
           any::readr
           any::stringr
+          any::purrr
+          any::tibble
           any::data.table
+          any::hms
           any::lubridate
           any::httr2
           any::jsonlite
+          any::xml2
+          any::curl
           any::valdr
+          any::gargle
+          any::rlang
+          any::lifecycle
+          any::glue
+          any::slider
+          any::R.utils
           any::logger
           any::readxl
+          any::bit64
+          any::isotree
+          any::foreach
+          any::doParallel
+          any::furrr
+          any::future
         # Prevent dev dependencies from being installed
         dependencies: '"hard"'
         cache: true
