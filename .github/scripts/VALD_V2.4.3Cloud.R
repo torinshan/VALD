@@ -1643,8 +1643,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         error_msg <- conditionMessage(e)
         
         # Try to extract job ID from error message for better debugging
-        # BigQuery job IDs follow pattern: job_[chars].[region]
-        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_.-]+", error_msg))
+        # BigQuery job IDs follow pattern: job_[chars].[region] (e.g., job_K-BX-4imQgnH54FXL9YzB0CUvsfN.US)
+        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+\\.[A-Z0-9]+", error_msg))
         if (length(job_id_match) > 0) {
           log_error("MERGE job failed - Job ID: {job_id_match[1]}")
         }
@@ -1660,7 +1660,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
             log_info("Cleaned up staging table after query failure")
           }
         }, error = function(cleanup_err) {
-          log_warn("Could not clean up staging table: {cleanup_err$message}")
+          log_warn("Could not clean up staging table: {conditionMessage(cleanup_err)}")
         })
         
         # Re-throw with more context
@@ -1696,7 +1696,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
               log_info("Cleaned up staging table after failure")
             }
           }, error = function(cleanup_err) {
-            log_warn("Could not clean up staging table: {cleanup_err$message}")
+            log_warn("Could not clean up staging table: {conditionMessage(cleanup_err)}")
           })
           
           stop(sprintf("BigQuery MERGE failed: [%s] %s", error_reason, error_msg))
@@ -1743,12 +1743,12 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
           log_info("Cleaned up staging table {staging_name} after error")
         }
       }, error = function(cleanup_err) {
-        log_warn("Could not clean up staging table {staging_name}: {cleanup_err$message}")
+        log_warn("Could not clean up staging table {staging_name}: {conditionMessage(cleanup_err)}")
         log_warn("Staging table will auto-expire in 2 minutes")
       })
     }
     
-    record_error(paste0("BQ_", table_name), e$message)
+    record_error(paste0("BQ_", table_name), conditionMessage(e))
     invisible(FALSE)
   })
 }
