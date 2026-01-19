@@ -1397,7 +1397,12 @@ validate_row_count <- function(dt, min_rows = 0, max_rows = Inf, context = "data
 safe_table_exists <- function(tbl) {
   tryCatch({
     result <- bigrquery::bq_table_exists(tbl)
-    # bq_table_exists can return NA - convert to FALSE
+    # bq_table_exists can return NA, NULL, or logical(0) - all must be converted to FALSE
+    # to prevent "missing value where TRUE/FALSE needed" errors in if statements
+    if (is.null(result) || length(result) == 0) {
+      log_warn("bq_table_exists returned NULL or empty for {tbl$table} - treating as FALSE")
+      return(FALSE)
+    }
     if (is.na(result)) {
       log_warn("bq_table_exists returned NA for {tbl$table} - treating as FALSE")
       return(FALSE)
@@ -4175,7 +4180,7 @@ log_and_store("Start date reset for {LOG_RUN_TYPE}: {fetch_start_date}")
 if (fd_changed) {
   tryCatch({
     log_and_store("=== FORCEDECKS BRANCH START ===")
-    log_and_store("API Start date: {CONFIG$start_date}")
+    log_and_store("API Start date: {fetch_start_date}")
     
     fd_data <- adaptive_fetch_forcedecks(
       timeout_seconds = CONFIG$timeout_fd_full,
