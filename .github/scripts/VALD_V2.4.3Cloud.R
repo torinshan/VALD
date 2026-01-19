@@ -5241,6 +5241,33 @@ if (fd_changed) {
               log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
             }
           
+            # ======================================================================
+            # V2.4.4: Type Enforcement - Ensure all columns match BigQuery schema
+            # ======================================================================
+            log_info("Enforcing column types for BigQuery compatibility...")
+            
+            # Define STRING columns based on BigQuery schema
+            string_cols <- c("test_ID", "vald_id", "full_name", "team", "test_type",
+                           "jh_mdc_status", "rsi_mdc_status", "epf_mdc_status", "fatigue_category")
+            
+            # Enforce STRING type
+            for (col in intersect(string_cols, names(cmj_export))) {
+              cmj_export[, (col) := as.character(get(col))]
+            }
+            
+            # Enforce DATE type
+            if ("date" %in% names(cmj_export)) {
+              cmj_export[, date := as.Date(date)]
+            }
+            
+            # Enforce FLOAT type for all numeric columns
+            numeric_cols <- setdiff(names(cmj_export), c(string_cols, "date"))
+            for (col in numeric_cols) {
+              cmj_export[, (col) := as.numeric(get(col))]
+            }
+            
+            log_info("Type enforcement complete: {length(intersect(string_cols, names(cmj_export)))} STRING, 1 DATE, {length(numeric_cols)} FLOAT columns")
+          
             upload_success <- bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
                       partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
             if (isTRUE(upload_success)) {
