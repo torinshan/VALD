@@ -439,7 +439,7 @@ DYNAMO_CONFIG <- list(
 )
 
 # ============================================================================
-# Production Column Schema (55 columns total - V3.0.0)
+# Production Column Schema (54 columns total - V3.0.0)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
   # Identifiers (6 columns)
@@ -508,10 +508,9 @@ PRODUCTION_CMJ_COLUMNS <- c(
   # Stiffness (1 column)
   "cmj_stiffness",
   
-  # Landing Metrics (3 columns)
+  # Landing Metrics (2 columns)
   "relative_peak_landing_force",
   "landing_impulse",
-  "peak_drop_force",
   
   # Readiness & Performance (5 columns)
   "jump_height_readiness",
@@ -1508,7 +1507,7 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
       null_keys <- sum(key_is_na, na.rm = TRUE)
     }
     
-    if (!is.na(null_keys) && null_keys > 0) {
+    if (null_keys > 0) {
       log_error("MERGE WILL FAIL: Found {null_keys} NULL/empty keys in column '{key}'")
       stop(sprintf("Cannot MERGE: %d NULL/empty values in key column '%s'", null_keys, key))
     }
@@ -2979,6 +2978,8 @@ standardize_data_types <- function(dt) {
 # ============================================================================
 # Fixes issue where columns with all NA values are inferred as BOOLEAN by as_bq_fields()
 # This causes MERGE failures like "Value of type BOOL cannot be assigned to T.column, which has type STRING"
+# Note: This function is a safety net called immediately before BigQuery upload,
+# complementing standardize_data_types() which is called during data processing
 ensure_numeric_types <- function(dt, expected_columns = character()) {
   data.table::setDT(dt)
   
@@ -2989,12 +2990,11 @@ ensure_numeric_types <- function(dt, expected_columns = character()) {
     "score", "asymmetry", "acceleration", "displacement"
   )
   
+  # Combine patterns for efficient matching
+  pattern_regex <- paste(numeric_patterns, collapse = "|")
+  
   # Get all columns that should be numeric based on patterns
-  numeric_cols <- names(dt)[sapply(names(dt), function(col) {
-    any(sapply(numeric_patterns, function(pattern) {
-      grepl(pattern, col, ignore.case = TRUE)
-    }))
-  })]
+  numeric_cols <- names(dt)[grepl(pattern_regex, names(dt), ignore.case = TRUE)]
   
   # Also check expected_columns if provided
   if (length(expected_columns) > 0) {
@@ -3010,9 +3010,7 @@ ensure_numeric_types <- function(dt, expected_columns = character()) {
       if (col_class %in% c("logical", "character", "factor")) {
         tryCatch({
           dt[, (col) := as.numeric(get(col))]
-          if (col_class == "logical") {
-            log_info("Type safety: Converted {col} from {col_class} to numeric (all-NA column)")
-          }
+          log_info("Type safety: Converted {col} from {col_class} to numeric")
         }, error = function(e) {
           log_warn("Could not convert {col} to numeric: {e$message}")
         })
