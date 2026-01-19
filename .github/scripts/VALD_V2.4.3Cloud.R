@@ -1472,6 +1472,10 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     return(invisible(TRUE))
   }
   
+  # FIX: Ensure numeric columns are properly typed before BigQuery upload
+  # This prevents type inference errors when columns contain all NA values
+  data <- ensure_numeric_types(data)
+  
   # Cloud: Write to BigQuery
   staging_tbl <- NULL  # Track staging table for cleanup
   staging_name <- NULL
@@ -1495,8 +1499,16 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     }
     
     # 2. Check for NULL/NA values in key column
-    null_keys <- sum(is.na(data[[key]]) | data[[key]] == "")
-    if (null_keys > 0) {
+    # Handle different key column types (character, Date, numeric)
+    key_is_na <- is.na(data[[key]])
+    if (is.character(data[[key]])) {
+      key_is_empty <- data[[key]] == ""
+      null_keys <- sum(key_is_na | key_is_empty, na.rm = TRUE)
+    } else {
+      null_keys <- sum(key_is_na, na.rm = TRUE)
+    }
+    
+    if (!is.na(null_keys) && null_keys > 0) {
       log_error("MERGE WILL FAIL: Found {null_keys} NULL/empty keys in column '{key}'")
       stop(sprintf("Cannot MERGE: %d NULL/empty values in key column '%s'", null_keys, key))
     }
@@ -2959,6 +2971,63 @@ standardize_data_types <- function(dt) {
       }
     }
   }
+  return(dt)
+}
+
+# ============================================================================
+# BigQuery Type Safety: Ensure Numeric Columns Are Properly Typed
+# ============================================================================
+# Fixes issue where columns with all NA values are inferred as BOOLEAN by as_bq_fields()
+# This causes MERGE failures like "Value of type BOOL cannot be assigned to T.column, which has type STRING"
+ensure_numeric_types <- function(dt, expected_columns = character()) {
+  data.table::setDT(dt)
+  
+  # Define columns that should always be numeric based on PRODUCTION_CMJ_COLUMNS
+  numeric_patterns <- c(
+    "height", "weight", "force", "power", "velocity", "impulse", "duration", 
+    "ratio", "rsi", "stiffness", "time", "depth", "work", "rfd", "readiness",
+    "score", "asymmetry", "acceleration", "displacement"
+  )
+  
+  # Get all columns that should be numeric based on patterns
+  numeric_cols <- names(dt)[sapply(names(dt), function(col) {
+    any(sapply(numeric_patterns, function(pattern) {
+      grepl(pattern, col, ignore.case = TRUE)
+    }))
+  })]
+  
+  # Also check expected_columns if provided
+  if (length(expected_columns) > 0) {
+    numeric_cols <- union(numeric_cols, intersect(expected_columns, names(dt)))
+  }
+  
+  # Ensure these columns are numeric type (not logical/boolean)
+  for (col in numeric_cols) {
+    if (col %in% names(dt)) {
+      col_class <- class(dt[[col]])[1]
+      
+      # If column is logical (boolean) or character but should be numeric, convert it
+      if (col_class %in% c("logical", "character", "factor")) {
+        tryCatch({
+          dt[, (col) := as.numeric(get(col))]
+          if (col_class == "logical") {
+            log_info("Type safety: Converted {col} from {col_class} to numeric (all-NA column)")
+          }
+        }, error = function(e) {
+          log_warn("Could not convert {col} to numeric: {e$message}")
+        })
+      } else if (!is.numeric(dt[[col]])) {
+        # For any other non-numeric type, try to convert
+        tryCatch({
+          dt[, (col) := as.numeric(get(col))]
+          log_info("Type safety: Converted {col} from {col_class} to numeric")
+        }, error = function(e) {
+          log_warn("Could not convert {col} to numeric: {e$message}")
+        })
+      }
+    }
+  }
+  
   return(dt)
 }
 
@@ -5293,15 +5362,19 @@ if (fd_changed) {
             dates_df <- dates_df[!is.na(date)]
             dates_df <- unique(dates_df, by = "date")
             
-            if (nrow(dates_df) > 0) {
+            # Defensive check: ensure nrow returns a valid number
+            n_dates <- nrow(dates_df)
+            if (!is.null(n_dates) && !is.na(n_dates) && n_dates > 0) {
               bq_upsert(dates_df, "dates", key = "date", mode = "MERGE")
-              log_and_store("Updated dates table: {nrow(dates_df)} dates from {n_processed} processed tests")
+              log_and_store("Updated dates table: {n_dates} dates from {n_processed} processed tests")
             }
             
-            if (nrow(tests_df) > 0) {
+            # Defensive check: ensure nrow returns a valid number
+            n_tests <- nrow(tests_df)
+            if (!is.null(n_tests) && !is.na(n_tests) && n_tests > 0) {
               bq_upsert(tests_df, "tests", key = "test_ID", mode = "MERGE")
               update_status("refs_updated", TRUE)
-              log_and_store("Updated tests table: {nrow(tests_df)} processed tests (of {n_fetched} fetched)")
+              log_and_store("Updated tests table: {n_tests} processed tests (of {n_fetched} fetched)")
             }
             
             # Log gap for awareness
