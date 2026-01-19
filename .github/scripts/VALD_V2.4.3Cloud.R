@@ -4870,6 +4870,52 @@ if (fd_changed) {
             if (length(temp_cols) > 0) cmj_clean[, (temp_cols) := NULL]
           }
           
+          # ======================================================================
+          # V3.0.0: CMJ Compensation Detection (Split-Path Architecture)
+          # ======================================================================
+          # Path A (Wide): Use full pivot data for compensation detection
+          # Path B (Streamlined): Continue with production 55-column schema
+          log_info("Running CMJ compensation detection...")
+          
+          # Check if we have wide data from trials_wide (before averaging)
+          # For cloud version, we need to recreate or store the wide data earlier
+          # For now, run compensation detection with available columns in cmj_clean
+          compensation_results <- tryCatch({
+            # Create a temporary wide-format dataset for compensation detection
+            # In full implementation, this would use the pre-averaged trials_wide
+            # For now, use cmj_clean with available readiness metrics
+            run_compensation_detection(cmj_clean)
+          }, error = function(e) {
+            log_warn("Compensation detection failed: {e$message}")
+            # Return fallback with NA fatigue_category
+            data.table::data.table(
+              test_ID = if (exists("cmj_clean") && nrow(cmj_clean) > 0) cmj_clean$test_ID else character(0),
+              fatigue_category = NA_character_
+            )
+          })
+          
+          # Merge fatigue_category into cmj_clean (Path B)
+          if (nrow(compensation_results) > 0 && "test_ID" %in% names(cmj_clean)) {
+            # Remove if already exists
+            if ("fatigue_category" %in% names(cmj_clean)) {
+              cmj_clean[, fatigue_category := NULL]
+            }
+            
+            cmj_clean <- merge(cmj_clean, compensation_results, by = "test_ID", all.x = TRUE)
+            
+            n_categorized <- sum(!is.na(cmj_clean$fatigue_category))
+            log_and_store("Merged fatigue_category: {n_categorized}/{nrow(cmj_clean)} tests categorized")
+            
+            # Log distribution
+            if (n_categorized > 0) {
+              fatigue_dist <- cmj_clean[!is.na(fatigue_category), .N, by = fatigue_category]
+              log_info("Fatigue distribution: {paste(paste0(fatigue_dist$fatigue_category, '=', fatigue_dist$N), collapse = ', ')}")
+            }
+          } else {
+            log_warn("No compensation results - adding NA fatigue_category")
+            cmj_clean[, fatigue_category := NA_character_]
+          }
+          
           # Clean up QC columns
           qc_cols <- c("event_datetime", "session_id", "physics_flag", "flag_bw_delta", 
                        "flag_session_contamination", "flag_multiple_extremes", 
