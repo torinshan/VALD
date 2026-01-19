@@ -3171,7 +3171,14 @@ process_nordbord <- function(nord_raw, roster) {
   
   for (col in NORD_EXPORT_COLUMNS) {
     if (!col %in% names(nord_raw)) {
-      nord_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        nord_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        nord_raw[, (col) := as.Date(NA)]
+      } else {
+        nord_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3213,7 +3220,14 @@ process_imtp <- function(imtp_raw) {
   
   for (col in IMTP_EXPORT_COLUMNS) {
     if (!col %in% names(imtp_raw)) {
-      imtp_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type")) {
+        imtp_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        imtp_raw[, (col) := as.Date(NA)]
+      } else {
+        imtp_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3341,7 +3355,14 @@ process_dj <- function(dj_raw) {
   
   for (col in DJ_EXPORT_COLUMNS) {
     if (!col %in% names(dj_raw)) {
-      dj_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id")) {
+        dj_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        dj_raw[, (col) := as.Date(NA)]
+      } else {
+        dj_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3555,7 +3576,14 @@ process_sl_jumps <- function(slj_raw) {
   
   for (col in SLJ_EXPORT_COLUMNS) {
     if (!col %in% names(slj_wide)) {
-      slj_wide[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        slj_wide[, (col) := NA_character_]
+      } else if (col == "date") {
+        slj_wide[, (col) := as.Date(NA)]
+      } else {
+        slj_wide[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3713,7 +3741,14 @@ process_rsi <- function(rsi_raw) {
   
   for (col in RSI_EXPORT_COLUMNS) {
     if (!col %in% names(rsi_wide)) {
-      rsi_wide[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        rsi_wide[, (col) := NA_character_]
+      } else if (col == "date") {
+        rsi_wide[, (col) := as.Date(NA)]
+      } else {
+        rsi_wide[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3990,7 +4025,15 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
   # Ensure all export columns exist
   for (col in DYNAMO_EXPORT_COLUMNS) {
     if (!col %in% names(dynamo_clean)) {
-      dynamo_clean[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "athleteId", "test_metric", "test_body_part", 
+                     "test_movement", "test_position", "trial_limb")) {
+        dynamo_clean[, (col) := NA_character_]
+      } else if (col == "date") {
+        dynamo_clean[, (col) := as.Date(NA)]
+      } else {
+        dynamo_clean[, (col) := NA_real_]
+      }
     }
   }
   
@@ -5126,7 +5169,18 @@ if (fd_changed) {
           if (length(missing_cols) > 0) {
             log_warn("Missing {length(missing_cols)} columns - adding as NA")
             for (col in missing_cols) {
-              cmj_clean[, (col) := NA]
+              # Ensure correct NA type based on expected column type
+              # Character columns: MDC status fields and fatigue category
+              if (col %in% c("jh_mdc_status", "rsi_mdc_status", "epf_mdc_status", "fatigue_category",
+                             "test_ID", "vald_id", "full_name", "team", "test_type")) {
+                cmj_clean[, (col) := NA_character_]
+              } else if (col == "date") {
+                # Date column should be NA with Date class
+                cmj_clean[, (col) := as.Date(NA)]
+              } else {
+                # All other columns are numeric
+                cmj_clean[, (col) := NA_real_]
+              }
             }
           }
           
@@ -5186,6 +5240,33 @@ if (fd_changed) {
             } else {
               log_info("Deduplication: All {n_after_dedup} test_IDs are unique")
             }
+          
+            # ======================================================================
+            # V2.4.4: Type Enforcement - Ensure all columns match BigQuery schema
+            # ======================================================================
+            log_info("Enforcing column types for BigQuery compatibility...")
+            
+            # Define STRING columns based on BigQuery schema
+            string_cols <- c("test_ID", "vald_id", "full_name", "team", "test_type",
+                           "jh_mdc_status", "rsi_mdc_status", "epf_mdc_status", "fatigue_category")
+            
+            # Enforce STRING type
+            for (col in intersect(string_cols, names(cmj_export))) {
+              cmj_export[, (col) := as.character(get(col))]
+            }
+            
+            # Enforce DATE type
+            if ("date" %in% names(cmj_export)) {
+              cmj_export[, date := as.Date(date)]
+            }
+            
+            # Enforce FLOAT type for all numeric columns
+            numeric_cols <- setdiff(names(cmj_export), c(string_cols, "date"))
+            for (col in numeric_cols) {
+              cmj_export[, (col) := as.numeric(get(col))]
+            }
+            
+            log_info("Type enforcement complete: {length(intersect(string_cols, names(cmj_export)))} STRING, 1 DATE, {length(numeric_cols)} FLOAT columns")
           
             upload_success <- bq_upsert(cmj_export, "vald_fd_jumps", key = "test_ID", mode = "MERGE",
                       partition_field = "date", cluster_fields = c("team", "test_type", "vald_id"))
