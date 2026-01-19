@@ -1,38 +1,43 @@
 #!/usr/bin/env Rscript
 # ============================================================================
-# VALD V2 Data Processing Script - Cloud Version
+# VALD V3 Data Processing Script - Cloud Version
 # ============================================================================
-# Version: 2.4.3-cloud
+# Version: 3.0.1-cloud
 # Date: January 2026
-# Purpose: Fetch, process, and export VALD ForceDecks and Nordbord data
+# Purpose: Fetch, process, and export VALD ForceDecks, Nordbord, and DynaMo data
 # Execution: GitHub Actions with BigQuery persistence (Cloud-Only)
 # 
-# Cloud-Specific Features:
-# - Environment variable configuration (no hardcoded credentials)
-# - BigQuery authentication via service account JSON
-# - Change detection gate check (STANDDOWN if no new data)
-# - Independent ForceDecks/NordBord error handling
-# - Structured logging with BigQuery persistence
-# - Exit code management for workflow status
-# - Sequential bundled fetch (parallel removed - keyring incompatible)
-# - 15-minute timeout with graceful partial data handling
-# - MERGE mode ensures subsequent runs fill gaps
+# V3.0.1 Updates:
+# - DynaMo Integration: Full DynaMo handheld dynamometer data fetch and processing
+# - DynaMo API: Direct httr2 calls to VALD DynaMo endpoint (separate from valdr)
+# - DynaMo Schema: 19-column export with bilateral/asymmetry calculations
+# - New Functions: fetch_dynamo_data(), process_dynamo()
+# - Movement/Position/BodyRegion standardization mapping tables for DynaMo
+# - Rep-level data extraction with Left/Right/Bilateral pivot
 #
-# V2.4.3 Updates (Continued):
-# - New vs Old Data Tracking: Query existing test_IDs from BigQuery before processing
-# - Score Calculation: Use combined historical + new data for accurate readiness/performance scores
-# - Deduplication: Prioritize old data over new (only export new data)
-# - Filtered Test ID Logging: Track test_IDs filtered at each processing stage
-# - Reconciliation: Compare API test_IDs against saved test_IDs at end of run
-# - New table: filtered_test_ids_log for audit trail
+# V3.0.0 Updates:
+# - CMJ Compensation Detection: New fatigue_category column classifying tests as
+#   NORMAL, ENHANCED_READINESS, TRUE_FATIGUE, MUSCULAR_COMPENSATION,
+#   ELASTIC_DOMINANT, ELEVATED_ASYMMETRY, MEASUREMENT_ERROR, or INSUFFICIENT_DATA
+# - Split-Path Architecture: Path A (Wide) retains 307 columns for compensation
+#   detection, Path B (Streamlined) exports 55-column production schema
+# - New Compensation Functions: standardize_compensation_columns(),
+#   calculate_bilateral_columns(), engineer_efficiency_features(),
+#   engineer_asymmetry_features(), apply_physics_validation(),
+#   classify_fatigue_pattern(), refine_with_compensation_indicators(),
+#   run_compensation_detection()
+# - COMPENSATION_CONFIG: Configurable readiness thresholds and physics bounds
+# - Production Schema: 54 -> 55 columns (added fatigue_category)
+# - Added library(isotree) for future Isolation Forest support
 #
-# V2.4.3 Updates (Original):
+# V2.4.3 Updates:
 # - RSI Scaling: Corrected 100x error (now decimal form: 0.43 not 43.2)
 # - Readiness Calculation: Changed from observation-based to time-based 30-day window
 # - MDC Thresholds: Athlete-specific with population fallback (not static)
 # - New columns: mdc_tier, jh_mdc_threshold, rsi_mdc_threshold, epf_mdc_threshold
 # - NordBord Body Weight: Now pulls from ForceDecks fd_raw (not roster)
 # - process_rsi() Bug Fix: Group by test_ID to preserve multiple same-day tests
+# - Fixed CMJ rbindlist class attribute mismatch with ignore.attr = TRUE
 #
 # V2.4.2 Updates:
 # - Nordbord: unilateral detection, 14-column schema
@@ -40,6 +45,17 @@
 # - SL Jumps: limb detection, QC layers, 34-column schema
 # - RSI: limb detection, 22-column schema
 # - DJ: QC layers, new ratios, 27-column schema
+# 
+# Cloud-Specific Features:
+# - Environment variable configuration (no hardcoded credentials)
+# - BigQuery authentication via service account JSON
+# - Change detection gate check (STANDDOWN if no new data)
+# - Independent ForceDecks/NordBord/DynaMo error handling
+# - Structured logging with BigQuery persistence
+# - Exit code management for workflow status
+# - Sequential bundled fetch (parallel removed - keyring incompatible)
+# - 15-minute timeout with graceful partial data handling
+# - MERGE mode ensures subsequent runs fill gaps
 # ============================================================================
 
 # ============================================================================
@@ -337,6 +353,9 @@ tryCatch({
     library(logger)
     library(readxl)
     library(bit64)  # Required for 64-bit integer timestamps (expiration_time)
+    library(isotree)  # For Isolation Forest anomaly detection (V3.0.0)
+    library(foreach); library(doParallel)  # For parallel processing (V3.0.1)
+    library(furrr); library(future)  # For future-based parallel processing
   })
   update_status("packages_loaded", TRUE)
 }, error = function(e) {
@@ -379,18 +398,29 @@ CONFIG <- list(
   z_threshold_medium = 4,
   z_threshold_large = 3,
   
-  # Timeout Settings
-  timeout_fd_full = 900,        # 15 minutes max for full fetch
-  timeout_fd_hard_limit = 840,  # 14 minutes - start saving before hard timeout
-  timeout_nordbord = 300,
+  # Timeout Settings (V3.0.1: Changed to Inf for cloud)
+  timeout_fd_full = Inf,            # Allow full execution time
+  timeout_fd_hard_limit = 840,      # 14 minutes - start saving before hard timeout
+  timeout_nordbord = Inf,           # Allow full execution time
   max_same_cursor = 3,
   max_retries = 3,
-  min_time_for_full_fetch = 120L, # Minimum time needed for all-in-one fetch
-  min_time_for_operation = 30L,   # Minimum time needed for any operation
+  min_time_for_full_fetch = 120L,   # Minimum time needed for all-in-one fetch
+  min_time_for_operation = 30L,     # Minimum time needed for any operation
   
   # Sequential Processing Configuration
-  batch_size = 50L,             # Batch size for sequential trial fetching (reduced for frequent time checks)
-  time_buffer_seconds = 60L,    # Reserve time for final processing
+  batch_size = 50L,                 # Batch size for sequential trial fetching
+  time_buffer_seconds = 60L,        # Reserve time for final processing
+  
+  # DynaMo Settings (V3.0.1)
+  dynamo_page_size = 50L,
+  dynamo_rate_limit_ms = 200,
+  dynamo_min_reps = 1L,
+  dynamo_min_force = 0,
+  
+  # Parallel Fetch Settings (V3.0.1)
+  parallel_n_workers = 4,
+  parallel_stagger_sec = 0.5,
+  parallel_socket_timeout = 6000,   # 100 minutes
   
   # BigQuery Configuration (from environment)
   gcp_project = Sys.getenv("GCP_PROJECT", "sac-vald-hub"),
@@ -399,7 +429,7 @@ CONFIG <- list(
 )
 
 # ============================================================================
-# Production Column Schema (54 columns total)
+# Production Column Schema (55 columns total - V3.0.0)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
   # Identifiers (6 columns)
@@ -488,7 +518,10 @@ PRODUCTION_CMJ_COLUMNS <- c(
   # Asymmetry Metrics (3 columns)
   "landing_impulse_asymmetry",
   "peak_takeoff_force_asymmetry",
-  "eccentric_braking_impulse_asymmetry"
+  "eccentric_braking_impulse_asymmetry",
+  
+  # Compensation Detection (1 column - V3.0.0)
+  "fatigue_category"
 )
 
 # ============================================================================
@@ -579,6 +612,45 @@ MDC_THRESHOLDS_STATIC <- list(
   eccentric_force_pct = 0.07,
   imtp_peak_force_pct = 0.05,
   nordic_peak_force_pct = 0.07
+)
+
+# ============================================================================
+# CMJ Compensation Detection Configuration (V3.0.0)
+# ============================================================================
+COMPENSATION_CONFIG <- list(
+  # Baseline calculation parameters
+  baseline_window_days = 56L,
+  baseline_exclusion_days = 7L,
+  min_baseline_sessions = 6L,
+
+  # Risk thresholds
+  anomaly_threshold_elevated = 0.65,
+  anomaly_threshold_high = 0.80,
+
+  # Isolation Forest hyperparameters
+  iforest_ntrees = 100L,
+  iforest_sample_size = 256L,
+
+  # Physics validation thresholds
+  physics = list(
+    rsi_mod_floor = 15,
+    rsi_mod_ceiling = 100,
+    ct_floor = 0.4,
+    ct_ceiling = 1.2,
+    jh_floor_inches = 5,
+    jh_ceiling_inches = 45,
+    asym_impossible_threshold = 50
+  ),
+
+  # Data-driven readiness thresholds (from CMJ Readiness Analysis Report v2)
+  readiness_thresholds = list(
+    epf_yellow = -6.9,
+    epf_red = -13.9,
+    rsi_yellow = -11.0,
+    rsi_red = -22.0,
+    jh_yellow = -7.7,
+    jh_red = -15.4
+  )
 )
 
 # ============================================================================
