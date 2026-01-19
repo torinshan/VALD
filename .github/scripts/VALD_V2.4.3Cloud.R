@@ -4881,7 +4881,26 @@ if (fd_changed) {
                 # Add missing columns to existing_only efficiently (all at once)
                 missing_cols <- setdiff(names(cmj_clean), names(existing_only))
                 if (length(missing_cols) > 0) {
-                  existing_only[, (missing_cols) := NA]
+                  # Initialize with appropriate NA type based on column type in cmj_clean
+                  for (col in missing_cols) {
+                    col_val <- cmj_clean[[col]]
+                    na_val <- if (inherits(col_val, "character") || inherits(col_val, "factor")) {
+                      NA_character_
+                    } else if (inherits(col_val, "numeric") || inherits(col_val, "double") || inherits(col_val, "integer")) {
+                      NA_real_
+                    } else if (inherits(col_val, "POSIXct")) {
+                      as.POSIXct(NA)
+                    } else if (inherits(col_val, "POSIXlt")) {
+                      as.POSIXlt(NA)
+                    } else if (inherits(col_val, "Date")) {
+                      as.Date(NA)
+                    } else if (inherits(col_val, "logical")) {
+                      NA
+                    } else {
+                      NA
+                    }
+                    existing_only[, (col) := na_val]
+                  }
                 }
                 
                 # Add is_new_data column to existing_only (all FALSE)
