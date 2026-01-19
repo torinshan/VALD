@@ -3171,7 +3171,14 @@ process_nordbord <- function(nord_raw, roster) {
   
   for (col in NORD_EXPORT_COLUMNS) {
     if (!col %in% names(nord_raw)) {
-      nord_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        nord_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        nord_raw[, (col) := as.Date(NA)]
+      } else {
+        nord_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3213,7 +3220,14 @@ process_imtp <- function(imtp_raw) {
   
   for (col in IMTP_EXPORT_COLUMNS) {
     if (!col %in% names(imtp_raw)) {
-      imtp_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type")) {
+        imtp_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        imtp_raw[, (col) := as.Date(NA)]
+      } else {
+        imtp_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3341,7 +3355,14 @@ process_dj <- function(dj_raw) {
   
   for (col in DJ_EXPORT_COLUMNS) {
     if (!col %in% names(dj_raw)) {
-      dj_raw[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id")) {
+        dj_raw[, (col) := NA_character_]
+      } else if (col == "date") {
+        dj_raw[, (col) := as.Date(NA)]
+      } else {
+        dj_raw[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3555,7 +3576,14 @@ process_sl_jumps <- function(slj_raw) {
   
   for (col in SLJ_EXPORT_COLUMNS) {
     if (!col %in% names(slj_wide)) {
-      slj_wide[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        slj_wide[, (col) := NA_character_]
+      } else if (col == "date") {
+        slj_wide[, (col) := as.Date(NA)]
+      } else {
+        slj_wide[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3713,7 +3741,14 @@ process_rsi <- function(rsi_raw) {
   
   for (col in RSI_EXPORT_COLUMNS) {
     if (!col %in% names(rsi_wide)) {
-      rsi_wide[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "test_type", "trial_limb")) {
+        rsi_wide[, (col) := NA_character_]
+      } else if (col == "date") {
+        rsi_wide[, (col) := as.Date(NA)]
+      } else {
+        rsi_wide[, (col) := NA_real_]
+      }
     }
   }
   
@@ -3990,7 +4025,15 @@ process_dynamo <- function(dynamo_tests, dynamo_details) {
   # Ensure all export columns exist
   for (col in DYNAMO_EXPORT_COLUMNS) {
     if (!col %in% names(dynamo_clean)) {
-      dynamo_clean[, (col) := NA]
+      # Ensure correct NA type based on expected column type
+      if (col %in% c("test_ID", "vald_id", "athleteId", "test_metric", "test_body_part", 
+                     "test_movement", "test_position", "trial_limb")) {
+        dynamo_clean[, (col) := NA_character_]
+      } else if (col == "date") {
+        dynamo_clean[, (col) := as.Date(NA)]
+      } else {
+        dynamo_clean[, (col) := NA_real_]
+      }
     }
   }
   
