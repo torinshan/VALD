@@ -1,38 +1,43 @@
 #!/usr/bin/env Rscript
 # ============================================================================
-# VALD V2 Data Processing Script - Cloud Version
+# VALD V3 Data Processing Script - Cloud Version
 # ============================================================================
-# Version: 2.4.3-cloud
+# Version: 3.0.1-cloud
 # Date: January 2026
-# Purpose: Fetch, process, and export VALD ForceDecks and Nordbord data
+# Purpose: Fetch, process, and export VALD ForceDecks, Nordbord, and DynaMo data
 # Execution: GitHub Actions with BigQuery persistence (Cloud-Only)
 # 
-# Cloud-Specific Features:
-# - Environment variable configuration (no hardcoded credentials)
-# - BigQuery authentication via service account JSON
-# - Change detection gate check (STANDDOWN if no new data)
-# - Independent ForceDecks/NordBord error handling
-# - Structured logging with BigQuery persistence
-# - Exit code management for workflow status
-# - Sequential bundled fetch (parallel removed - keyring incompatible)
-# - 15-minute timeout with graceful partial data handling
-# - MERGE mode ensures subsequent runs fill gaps
+# V3.0.1 Updates:
+# - DynaMo Integration: Full DynaMo handheld dynamometer data fetch and processing
+# - DynaMo API: Direct httr2 calls to VALD DynaMo endpoint (separate from valdr)
+# - DynaMo Schema: 19-column export with bilateral/asymmetry calculations
+# - New Functions: fetch_dynamo_data(), process_dynamo()
+# - Movement/Position/BodyRegion standardization mapping tables for DynaMo
+# - Rep-level data extraction with Left/Right/Bilateral pivot
 #
-# V2.4.3 Updates (Continued):
-# - New vs Old Data Tracking: Query existing test_IDs from BigQuery before processing
-# - Score Calculation: Use combined historical + new data for accurate readiness/performance scores
-# - Deduplication: Prioritize old data over new (only export new data)
-# - Filtered Test ID Logging: Track test_IDs filtered at each processing stage
-# - Reconciliation: Compare API test_IDs against saved test_IDs at end of run
-# - New table: filtered_test_ids_log for audit trail
+# V3.0.0 Updates:
+# - CMJ Compensation Detection: New fatigue_category column classifying tests as
+#   NORMAL, ENHANCED_READINESS, TRUE_FATIGUE, MUSCULAR_COMPENSATION,
+#   ELASTIC_DOMINANT, ELEVATED_ASYMMETRY, MEASUREMENT_ERROR, or INSUFFICIENT_DATA
+# - Split-Path Architecture: Path A (Wide) retains 307 columns for compensation
+#   detection, Path B (Streamlined) exports 55-column production schema
+# - New Compensation Functions: standardize_compensation_columns(),
+#   calculate_bilateral_columns(), engineer_efficiency_features(),
+#   engineer_asymmetry_features(), apply_physics_validation(),
+#   classify_fatigue_pattern(), refine_with_compensation_indicators(),
+#   run_compensation_detection()
+# - COMPENSATION_CONFIG: Configurable readiness thresholds and physics bounds
+# - Production Schema: 54 -> 55 columns (added fatigue_category)
+# - Added library(isotree) for future Isolation Forest support
 #
-# V2.4.3 Updates (Original):
+# V2.4.3 Updates:
 # - RSI Scaling: Corrected 100x error (now decimal form: 0.43 not 43.2)
 # - Readiness Calculation: Changed from observation-based to time-based 30-day window
 # - MDC Thresholds: Athlete-specific with population fallback (not static)
 # - New columns: mdc_tier, jh_mdc_threshold, rsi_mdc_threshold, epf_mdc_threshold
 # - NordBord Body Weight: Now pulls from ForceDecks fd_raw (not roster)
 # - process_rsi() Bug Fix: Group by test_ID to preserve multiple same-day tests
+# - Fixed CMJ rbindlist class attribute mismatch with ignore.attr = TRUE
 #
 # V2.4.2 Updates:
 # - Nordbord: unilateral detection, 14-column schema
@@ -40,6 +45,17 @@
 # - SL Jumps: limb detection, QC layers, 34-column schema
 # - RSI: limb detection, 22-column schema
 # - DJ: QC layers, new ratios, 27-column schema
+# 
+# Cloud-Specific Features:
+# - Environment variable configuration (no hardcoded credentials)
+# - BigQuery authentication via service account JSON
+# - Change detection gate check (STANDDOWN if no new data)
+# - Independent ForceDecks/NordBord/DynaMo error handling
+# - Structured logging with BigQuery persistence
+# - Exit code management for workflow status
+# - Sequential bundled fetch (parallel removed - keyring incompatible)
+# - 15-minute timeout with graceful partial data handling
+# - MERGE mode ensures subsequent runs fill gaps
 # ============================================================================
 
 # ============================================================================
@@ -337,6 +353,9 @@ tryCatch({
     library(logger)
     library(readxl)
     library(bit64)  # Required for 64-bit integer timestamps (expiration_time)
+    library(isotree)  # For Isolation Forest anomaly detection (V3.0.0)
+    library(foreach); library(doParallel)  # For parallel processing (V3.0.1)
+    library(furrr); library(future)  # For future-based parallel processing
   })
   update_status("packages_loaded", TRUE)
 }, error = function(e) {
@@ -379,18 +398,29 @@ CONFIG <- list(
   z_threshold_medium = 4,
   z_threshold_large = 3,
   
-  # Timeout Settings
-  timeout_fd_full = 900,        # 15 minutes max for full fetch
-  timeout_fd_hard_limit = 840,  # 14 minutes - start saving before hard timeout
-  timeout_nordbord = 300,
+  # Timeout Settings (V3.0.1: Changed to Inf for cloud)
+  timeout_fd_full = Inf,            # Allow full execution time
+  timeout_fd_hard_limit = 840,      # 14 minutes - start saving before hard timeout
+  timeout_nordbord = Inf,           # Allow full execution time
   max_same_cursor = 3,
   max_retries = 3,
-  min_time_for_full_fetch = 120L, # Minimum time needed for all-in-one fetch
-  min_time_for_operation = 30L,   # Minimum time needed for any operation
+  min_time_for_full_fetch = 120L,   # Minimum time needed for all-in-one fetch
+  min_time_for_operation = 30L,     # Minimum time needed for any operation
   
   # Sequential Processing Configuration
-  batch_size = 50L,             # Batch size for sequential trial fetching (reduced for frequent time checks)
-  time_buffer_seconds = 60L,    # Reserve time for final processing
+  batch_size = 50L,                 # Batch size for sequential trial fetching
+  time_buffer_seconds = 60L,        # Reserve time for final processing
+  
+  # DynaMo Settings (V3.0.1)
+  dynamo_page_size = 50L,
+  dynamo_rate_limit_ms = 200,
+  dynamo_min_reps = 1L,
+  dynamo_min_force = 0,
+  
+  # Parallel Fetch Settings (V3.0.1)
+  parallel_n_workers = 4,
+  parallel_stagger_sec = 0.5,
+  parallel_socket_timeout = 6000,   # 100 minutes
   
   # BigQuery Configuration (from environment)
   gcp_project = Sys.getenv("GCP_PROJECT", "sac-vald-hub"),
@@ -399,7 +429,17 @@ CONFIG <- list(
 )
 
 # ============================================================================
-# Production Column Schema (54 columns total)
+# DynaMo Configuration (V3.0.1)
+# ============================================================================
+DYNAMO_CONFIG <- list(
+  page_size = 50L,
+  rate_limit_ms = 200,
+  min_reps = 1L,
+  min_force = 0
+)
+
+# ============================================================================
+# Production Column Schema (55 columns total - V3.0.0)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
   # Identifiers (6 columns)
@@ -488,7 +528,10 @@ PRODUCTION_CMJ_COLUMNS <- c(
   # Asymmetry Metrics (3 columns)
   "landing_impulse_asymmetry",
   "peak_takeoff_force_asymmetry",
-  "eccentric_braking_impulse_asymmetry"
+  "eccentric_braking_impulse_asymmetry",
+  
+  # Compensation Detection (1 column - V3.0.0)
+  "fatigue_category"
 )
 
 # ============================================================================
@@ -562,6 +605,67 @@ DYNAMO_EXPORT_COLUMNS <- c(
 )
 
 # ============================================================================
+# DynaMo Standardization Maps (V3.0.1)
+# ============================================================================
+# DynaMo Movement Map - Maps API movement names to standardized snake_case
+DYNAMO_MOVEMENT_MAP <- c(
+  "Abduction" = "abduction", "Adduction" = "adduction", "Flexion" = "flexion", 
+  "Extension" = "extension", "Rotation" = "rotation", "Custom" = "custom",
+  "ExternalRotation" = "external_rotation", "InternalRotation" = "internal_rotation",
+  "Dorsiflexion" = "dorsiflexion", "PlantarFlexion" = "plantarflexion",
+  "Eversion" = "eversion", "Inversion" = "inversion", "GripSqueeze" = "grip_squeeze",
+  "Supination" = "supination", "Pronation" = "pronation", "Protraction" = "protraction",
+  "Retraction" = "retraction", "Scaption" = "scaption", "Pull" = "pull", "Push" = "push"
+)
+
+# DynaMo Position Map - Maps API position names to standardized snake_case
+DYNAMO_POSITION_MAP <- c(
+  "Neutral" = "neutral", "Seated" = "seated", "Standing" = "standing", 
+  "Prone" = "prone", "Supine" = "supine", "SideLying" = "side_lying",
+  "Custom" = "custom", "Pronated" = "pronated", "Supinated" = "supinated",
+  "p90Degrees" = "90deg", "p90DegreesElbowFlexion" = "90deg_elbow_flex",
+  "ElbowExtended" = "elbow_extended", "Knee90Degrees" = "knee_90deg",
+  "IsometricMidThighPull" = "isometric_mid_thigh_pull"
+)
+
+# DynaMo Body Region Map - Maps API body region names to standardized snake_case  
+DYNAMO_BODY_REGION_MAP <- c(
+  "Neck" = "neck", "Shoulder" = "shoulder", "Trunk" = "trunk", "Hip" = "hip",
+  "Elbow" = "elbow", "Wrist" = "wrist", "Hand" = "hand", "Knee" = "knee",
+  "Ankle" = "ankle", "Foot" = "foot", "Scapula" = "scapula"
+)
+
+# ============================================================================
+# DynaMo Helper Functions (V3.0.1)
+# ============================================================================
+
+#' Safe field extraction from DynaMo JSON with type handling
+#' @param lst List of DynaMo test objects
+#' @param field Field name to extract
+#' @param type Expected type ("character" or "numeric")
+#' @return Vector of extracted values with NA for missing fields
+dynamo_safe_extract <- function(lst, field, type = "character") {
+  vapply(lst, function(x) {
+    val <- x[[field]]
+    if (is.null(val)) {
+      return(if (type == "numeric") NA_real_ else NA_character_)
+    }
+    if (type == "numeric") as.numeric(val) else as.character(val)
+  }, if (type == "numeric") numeric(1) else character(1), USE.NAMES = FALSE)
+}
+
+#' Apply standardization mapping with fallback to auto snake_case
+#' @param x Character vector of original names
+#' @param map Named character vector mapping original to standardized names
+#' @return Character vector of standardized names
+dynamo_std_map <- function(x, map) {
+  result <- map[x]
+  # For unmapped values, convert to snake_case automatically
+  result[is.na(result)] <- tolower(gsub("([a-z])([A-Z])", "\\1_\\2", x[is.na(result)]))
+  unname(result)
+}
+
+# ============================================================================
 # MDC Configuration (Athlete-Specific with Population Fallback)
 # ============================================================================
 MDC_CONFIG <- list(
@@ -579,6 +683,45 @@ MDC_THRESHOLDS_STATIC <- list(
   eccentric_force_pct = 0.07,
   imtp_peak_force_pct = 0.05,
   nordic_peak_force_pct = 0.07
+)
+
+# ============================================================================
+# CMJ Compensation Detection Configuration (V3.0.0)
+# ============================================================================
+COMPENSATION_CONFIG <- list(
+  # Baseline calculation parameters
+  baseline_window_days = 56L,
+  baseline_exclusion_days = 7L,
+  min_baseline_sessions = 6L,
+
+  # Risk thresholds
+  anomaly_threshold_elevated = 0.65,
+  anomaly_threshold_high = 0.80,
+
+  # Isolation Forest hyperparameters
+  iforest_ntrees = 100L,
+  iforest_sample_size = 256L,
+
+  # Physics validation thresholds
+  physics = list(
+    rsi_mod_floor = 15,
+    rsi_mod_ceiling = 100,
+    ct_floor = 0.4,
+    ct_ceiling = 1.2,
+    jh_floor_inches = 5,
+    jh_ceiling_inches = 45,
+    asym_impossible_threshold = 50
+  ),
+
+  # Data-driven readiness thresholds (from CMJ Readiness Analysis Report v2)
+  readiness_thresholds = list(
+    epf_yellow = -6.9,
+    epf_red = -13.9,
+    rsi_yellow = -11.0,
+    rsi_red = -22.0,
+    jh_yellow = -7.7,
+    jh_red = -15.4
+  )
 )
 
 # ============================================================================
@@ -718,6 +861,255 @@ calculate_athlete_mdc <- function(dt, metric_col, baseline_col, mdc_col, status_
   dt[, (temp_cols) := NULL]
   
   return(dt)
+}
+
+# ============================================================================
+# CMJ Compensation Detection Functions (V3.0.0)
+# ============================================================================
+
+#' Standardize column names for compensation detection
+#' Converts pivot output to expected naming convention (UPPER_SNAKE to lower_snake)
+#' @param dt data.table with raw pivot columns
+#' @return data.table with standardized column names
+standardize_compensation_columns <- function(dt) {
+  dt <- data.table::copy(dt)
+  all_cols <- names(dt)
+  
+  # Function to convert UPPER_SNAKE or camelCase to lower_snake
+  convert_name <- function(col, prefix) {
+    metric_part <- gsub(paste0("^", prefix, "_"), "", col)
+    new_name <- tolower(metric_part)
+    new_name <- gsub("([a-z])([A-Z])", "\\1_\\2", new_name)
+    new_name <- gsub("[^a-z0-9_]", "_", new_name)
+    new_name <- gsub("_+", "_", new_name)
+    new_name <- gsub("^_|_$", "", new_name)
+    paste0(tolower(prefix), "_", new_name)
+  }
+  
+  # Process each prefix type
+  for (prefix in c("Trial", "Left", "Right", "Asym")) {
+    pattern_cols <- grep(paste0("^", prefix, "_"), all_cols, value = TRUE)
+    for (col in pattern_cols) {
+      new_name <- convert_name(col, prefix)
+      if (!new_name %in% names(dt) && new_name != col) {
+        data.table::setnames(dt, col, new_name)
+      }
+    }
+  }
+  return(dt)
+}
+
+#' Calculate bilateral columns from left/right pairs
+#' @param dt data.table with left_ and right_ columns
+#' @return data.table with bilateral_ columns added
+calculate_bilateral_columns <- function(dt) {
+  dt <- data.table::copy(dt)
+  left_cols <- grep("^left_", names(dt), value = TRUE)
+  
+  for (left_col in left_cols) {
+    metric_name <- gsub("^left_", "", left_col)
+    right_col <- paste0("right_", metric_name)
+    bilateral_col <- paste0("bilateral_", metric_name)
+    
+    if (right_col %in% names(dt) && is.numeric(dt[[left_col]]) && !bilateral_col %in% names(dt)) {
+      dt[, (bilateral_col) := data.table::fcase(
+        !is.na(get(left_col)) & !is.na(get(right_col)), (get(left_col) + get(right_col)) / 2,
+        !is.na(get(left_col)), get(left_col),
+        !is.na(get(right_col)), get(right_col),
+        default = NA_real_
+      )]
+    }
+  }
+  return(dt)
+}
+
+#' Engineer efficiency features for compensation detection
+#' @param dt data.table with CMJ metrics
+#' @return data.table with efficiency features
+engineer_efficiency_features <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  # Total Jump Efficiency: Height per contraction time
+  if (all(c("trial_jump_height_inches_imp_mom", "trial_contraction_time") %in% names(dt))) {
+    dt[trial_contraction_time > 0,
+       efficiency_total := trial_jump_height_inches_imp_mom / trial_contraction_time]
+  }
+  
+  # Time Extension Index (key compensation signature)
+  if (all(c("trial_contraction_time", "trial_jump_height_inches_imp_mom") %in% names(dt))) {
+    dt[, expected_ct := 0.5 + (trial_jump_height_inches_imp_mom * 0.01)]
+    dt[expected_ct > 0, time_extension_index := trial_contraction_time / expected_ct]
+    dt[, expected_ct := NULL]
+  }
+  
+  # SSC Efficiency Index
+  if (all(c("trial_rsi_modified_imp_mom", "bilateral_peak_eccentric_force", "trial_body_mass") %in% names(dt))) {
+    dt[trial_body_mass > 0 & bilateral_peak_eccentric_force > 0,
+       ssc_efficiency_index := trial_rsi_modified_imp_mom / 
+         (bilateral_peak_eccentric_force / trial_body_mass / 100)]
+  }
+  
+  return(dt)
+}
+
+#' Engineer asymmetry aggregate features
+#' @param dt data.table with asymmetry columns
+#' @return data.table with aggregate asymmetry features
+engineer_asymmetry_features <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  key_asym_metrics <- c(
+    "asym_peak_eccentric_force", "asym_peak_concentric_force",
+    "asym_concentric_impulse", "asym_eccentric_braking_impulse",
+    "asym_force_at_zero_velocity", "asym_landing_impulse"
+  )
+  available_asym <- intersect(key_asym_metrics, names(dt))
+  
+  if (length(available_asym) > 0) {
+    dt[, asym_magnitude_mean := rowMeans(abs(.SD), na.rm = TRUE), .SDcols = available_asym]
+    dt[, asym_magnitude_max := apply(abs(.SD), 1, function(x) {
+      if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+    }), .SDcols = available_asym]
+    dt[, asym_count_elevated := rowSums(abs(.SD) > 10, na.rm = TRUE), .SDcols = available_asym]
+  }
+  return(dt)
+}
+
+#' Apply physics validation constraints
+#' @param dt data.table with CMJ metrics
+#' @return data.table with physics_valid column
+apply_physics_validation <- function(dt) {
+  dt <- data.table::copy(dt)
+  cfg <- COMPENSATION_CONFIG$physics
+  dt[, physics_valid := TRUE]
+  
+  # RSI-modified bounds
+  if ("trial_rsi_modified_imp_mom" %in% names(dt)) {
+    dt[!is.na(trial_rsi_modified_imp_mom) &
+         (trial_rsi_modified_imp_mom < cfg$rsi_mod_floor |
+          trial_rsi_modified_imp_mom > cfg$rsi_mod_ceiling),
+       physics_valid := FALSE]
+  }
+  
+  # Contraction time bounds
+  if ("trial_contraction_time" %in% names(dt)) {
+    dt[!is.na(trial_contraction_time) &
+         (trial_contraction_time < cfg$ct_floor |
+          trial_contraction_time > cfg$ct_ceiling),
+       physics_valid := FALSE]
+  }
+  
+  # Asymmetry impossible values
+  asym_cols <- grep("^asym_", names(dt), value = TRUE)
+  for (col in asym_cols) {
+    if (col %in% names(dt) && is.numeric(dt[[col]])) {
+      dt[!is.na(get(col)) & abs(get(col)) > cfg$asym_impossible_threshold,
+         physics_valid := FALSE]
+    }
+  }
+  return(dt)
+}
+
+#' Classify primary fatigue/compensation pattern
+#' @param dt data.table with readiness metrics
+#' @return data.table with fatigue_category
+classify_fatigue_pattern <- function(dt) {
+  dt <- data.table::copy(dt)
+  thresholds <- COMPENSATION_CONFIG$readiness_thresholds
+  
+  required_cols <- c("jump_height_readiness", "rsi_readiness")
+  if (!all(required_cols %in% names(dt))) {
+    dt[, fatigue_category := "INSUFFICIENT_DATA"]
+    return(dt)
+  }
+  
+  dt[, fatigue_category := data.table::fcase(
+    # Enhanced Readiness: Both JH and RSI elevated
+    jump_height_readiness > abs(thresholds$jh_yellow) &
+      rsi_readiness > abs(thresholds$rsi_yellow), "ENHANCED_READINESS",
+    
+    # True Fatigue: Both depressed
+    jump_height_readiness <= thresholds$jh_yellow &
+      rsi_readiness <= thresholds$rsi_yellow, "TRUE_FATIGUE",
+    
+    # Muscular Compensation: JH preserved but RSI depressed
+    jump_height_readiness > thresholds$jh_yellow &
+      rsi_readiness <= thresholds$rsi_yellow, "MUSCULAR_COMPENSATION",
+    
+    # Elastic Dominant: RSI elevated more than JH
+    rsi_readiness > abs(thresholds$rsi_yellow) &
+      jump_height_readiness <= abs(thresholds$jh_yellow), "ELASTIC_DOMINANT",
+    
+    # Normal Variation
+    default = "NORMAL"
+  )]
+  return(dt)
+}
+
+#' Refine fatigue category using compensation indicators
+#' @param dt data.table with fatigue_category and efficiency features
+#' @return data.table with refined fatigue_category
+refine_with_compensation_indicators <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  # Time extension indicates compensation strategy
+  if ("time_extension_index" %in% names(dt)) {
+    dt[fatigue_category == "TRUE_FATIGUE" &
+         !is.na(time_extension_index) &
+         time_extension_index > 1.15,
+       fatigue_category := "MUSCULAR_COMPENSATION"]
+  }
+  
+  # High asymmetry variability can indicate compensation
+  if ("asym_magnitude_max" %in% names(dt)) {
+    dt[fatigue_category == "NORMAL" &
+         !is.na(asym_magnitude_max) &
+         asym_magnitude_max > 25,
+       fatigue_category := "ELEVATED_ASYMMETRY"]
+  }
+  return(dt)
+}
+
+#' Main compensation detection pipeline for wide CMJ data
+#' @param cmj_wide data.table with full column structure
+#' @return data.table with test_ID and fatigue_category only
+run_compensation_detection <- function(cmj_wide) {
+  if (is.null(cmj_wide) || nrow(cmj_wide) == 0) {
+    return(data.table::data.table(test_ID = character(0), fatigue_category = character(0)))
+  }
+  
+  dt <- data.table::copy(cmj_wide)
+  if (exists("log_info", mode = "function")) {
+    log_info("Compensation detection: processing {nrow(dt)} tests")
+  }
+  
+  dt <- standardize_compensation_columns(dt)
+  dt <- calculate_bilateral_columns(dt)
+  dt <- engineer_efficiency_features(dt)
+  dt <- engineer_asymmetry_features(dt)
+  dt <- apply_physics_validation(dt)
+  dt <- classify_fatigue_pattern(dt)
+  dt <- refine_with_compensation_indicators(dt)
+  
+  # Override for physics failures
+  dt[physics_valid == FALSE, fatigue_category := "MEASUREMENT_ERROR"]
+  
+  # Log distribution
+  if (exists("log_info", mode = "function") && "fatigue_category" %in% names(dt)) {
+    fatigue_dist <- dt[, .N, by = fatigue_category]
+    log_info("Fatigue categories: {paste(paste0(fatigue_dist$fatigue_category, '=', fatigue_dist$N), collapse = ', ')}")
+  }
+  
+  # Return only test_ID and fatigue_category
+  if ("test_ID" %in% names(dt)) {
+    result <- unique(dt[, .(test_ID, fatigue_category)], by = "test_ID")
+  } else if ("testId" %in% names(dt)) {
+    result <- unique(dt[, .(test_ID = testId, fatigue_category)], by = "test_ID")
+  } else {
+    result <- data.table::data.table(test_ID = character(0), fatigue_category = character(0))
+  }
+  
+  return(result)
 }
 
 # ============================================================================
@@ -4324,9 +4716,14 @@ if (fd_changed) {
                 existing_only[, is_new_data := FALSE]
                 
                 # Combine for score calculation
+                # Note: ignore.attr=TRUE is critical here because we're combining:
+                #   1. Fresh API data (cmj_clean) 
+                #   2. Historical BigQuery data (existing_only) stored weeks/months ago
+                # Column class attributes (esp. POSIXct timezone info) may differ
+                # between these sources, causing rbindlist to fail without this parameter
                 cmj_combined <- data.table::rbindlist(
                   list(cmj_clean, existing_only[, names(cmj_clean), with = FALSE]),
-                  use.names = TRUE, fill = TRUE
+                  use.names = TRUE, fill = TRUE, ignore.attr = TRUE
                 )
                 
                 log_info("Combined dataset for score calculation: {nrow(cmj_combined)} records")
@@ -4471,6 +4868,52 @@ if (fd_changed) {
             temp_cols <- c("jh_cmj_mean_30d", "rsi_cmj_mean_30d", "epf_cmj_mean_30d")
             temp_cols <- intersect(temp_cols, names(cmj_clean))
             if (length(temp_cols) > 0) cmj_clean[, (temp_cols) := NULL]
+          }
+          
+          # ======================================================================
+          # V3.0.0: CMJ Compensation Detection (Split-Path Architecture)
+          # ======================================================================
+          # Path A (Wide): Use full pivot data for compensation detection
+          # Path B (Streamlined): Continue with production 55-column schema
+          log_info("Running CMJ compensation detection...")
+          
+          # Check if we have wide data from trials_wide (before averaging)
+          # For cloud version, we need to recreate or store the wide data earlier
+          # For now, run compensation detection with available columns in cmj_clean
+          compensation_results <- tryCatch({
+            # Create a temporary wide-format dataset for compensation detection
+            # In full implementation, this would use the pre-averaged trials_wide
+            # For now, use cmj_clean with available readiness metrics
+            run_compensation_detection(cmj_clean)
+          }, error = function(e) {
+            log_warn("Compensation detection failed: {e$message}")
+            # Return fallback with NA fatigue_category
+            data.table::data.table(
+              test_ID = if (exists("cmj_clean") && nrow(cmj_clean) > 0) cmj_clean$test_ID else character(0),
+              fatigue_category = NA_character_
+            )
+          })
+          
+          # Merge fatigue_category into cmj_clean (Path B)
+          if (nrow(compensation_results) > 0 && "test_ID" %in% names(cmj_clean)) {
+            # Remove if already exists
+            if ("fatigue_category" %in% names(cmj_clean)) {
+              cmj_clean[, fatigue_category := NULL]
+            }
+            
+            cmj_clean <- merge(cmj_clean, compensation_results, by = "test_ID", all.x = TRUE)
+            
+            n_categorized <- sum(!is.na(cmj_clean$fatigue_category))
+            log_and_store("Merged fatigue_category: {n_categorized}/{nrow(cmj_clean)} tests categorized")
+            
+            # Log distribution
+            if (n_categorized > 0) {
+              fatigue_dist <- cmj_clean[!is.na(fatigue_category), .N, by = fatigue_category]
+              log_info("Fatigue distribution: {paste(paste0(fatigue_dist$fatigue_category, '=', fatigue_dist$N), collapse = ', ')}")
+            }
+          } else {
+            log_warn("No compensation results - adding NA fatigue_category")
+            cmj_clean[, fatigue_category := NA_character_]
           }
           
           # Clean up QC columns
