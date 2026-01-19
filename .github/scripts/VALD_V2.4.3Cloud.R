@@ -1417,11 +1417,13 @@ safe_table_exists <- function(tbl) {
       log_warn("bq_table_exists returned empty logical for {tbl_name} - treating as FALSE")
       return(FALSE)
     }
-    if (is.na(result)) {
+    # Use anyNA to handle vectors, and check first element only
+    if (anyNA(result)) {
       log_warn("bq_table_exists returned NA for {tbl_name} - treating as FALSE")
       return(FALSE)
     }
-    return(result)
+    # Ensure we return a single logical value using isTRUE
+    return(isTRUE(result[1]))
   }, error = function(e) {
     tbl_name <- tryCatch({
       if (!is.null(tbl) && !is.null(tbl$table)) tbl$table else "unknown_table"
@@ -1504,9 +1506,17 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
     
     # Check if table exists BEFORE using it in conditionals
     # FIX: Moved up from below, with NA handling
+    # ROBUST FIX: Handle all edge cases (NULL, NA, length==0, vector)
     table_exists <- tryCatch({
       result <- bigrquery::bq_table_exists(tbl)
-      if (is.na(result)) FALSE else result
+      # Handle NULL
+      if (is.null(result)) return(FALSE)
+      # Handle empty logical vector
+      if (length(result) == 0) return(FALSE)
+      # Handle NA - use isTRUE to ensure single logical value
+      if (anyNA(result)) return(FALSE)
+      # Ensure we return a single logical value
+      return(isTRUE(result[1]))
     }, error = function(e) {
       log_warn("Could not check table existence: {e$message}")
       FALSE
@@ -1599,8 +1609,8 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         )
       }, error = function(e) {
         # If table already exists from previous failed run, delete and recreate
-        staging_exists <- bigrquery::bq_table_exists(staging_tbl)
-        if (!is.na(staging_exists) && staging_exists) {
+        staging_exists <- safe_table_exists(staging_tbl)
+        if (staging_exists) {
           log_warn("Staging table {staging_name} already exists, deleting old one")
           bigrquery::bq_table_delete(staging_tbl)
           bigrquery::bq_table_create(
