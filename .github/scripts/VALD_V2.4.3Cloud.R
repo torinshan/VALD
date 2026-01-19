@@ -1643,9 +1643,10 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         error_msg <- conditionMessage(e)
         
         # Try to extract job ID from error message for better debugging
-        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_-]+", error_msg))
+        # BigQuery job IDs follow pattern: job_[chars].[region]
+        job_id_match <- regmatches(error_msg, regexpr("job_[A-Za-z0-9_.-]+", error_msg))
         if (length(job_id_match) > 0) {
-          log_error("MERGE job failed - Job ID: {job_id_match}")
+          log_error("MERGE job failed - Job ID: {job_id_match[1]}")
         }
         
         # Log the full error for debugging
