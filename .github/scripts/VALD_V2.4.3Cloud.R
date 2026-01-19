@@ -429,6 +429,16 @@ CONFIG <- list(
 )
 
 # ============================================================================
+# DynaMo Configuration (V3.0.1)
+# ============================================================================
+DYNAMO_CONFIG <- list(
+  page_size = 50L,
+  rate_limit_ms = 200,
+  min_reps = 1L,
+  min_force = 0
+)
+
+# ============================================================================
 # Production Column Schema (55 columns total - V3.0.0)
 # ============================================================================
 PRODUCTION_CMJ_COLUMNS <- c(
@@ -593,6 +603,67 @@ DYNAMO_EXPORT_COLUMNS <- c(
   "impulse_bilateral", "impulse_left", "impulse_right",
   "rom_left", "rom_right", "trial_limb"
 )
+
+# ============================================================================
+# DynaMo Standardization Maps (V3.0.1)
+# ============================================================================
+# DynaMo Movement Map - Maps API movement names to standardized snake_case
+DYNAMO_MOVEMENT_MAP <- c(
+  "Abduction" = "abduction", "Adduction" = "adduction", "Flexion" = "flexion", 
+  "Extension" = "extension", "Rotation" = "rotation", "Custom" = "custom",
+  "ExternalRotation" = "external_rotation", "InternalRotation" = "internal_rotation",
+  "Dorsiflexion" = "dorsiflexion", "PlantarFlexion" = "plantarflexion",
+  "Eversion" = "eversion", "Inversion" = "inversion", "GripSqueeze" = "grip_squeeze",
+  "Supination" = "supination", "Pronation" = "pronation", "Protraction" = "protraction",
+  "Retraction" = "retraction", "Scaption" = "scaption", "Pull" = "pull", "Push" = "push"
+)
+
+# DynaMo Position Map - Maps API position names to standardized snake_case
+DYNAMO_POSITION_MAP <- c(
+  "Neutral" = "neutral", "Seated" = "seated", "Standing" = "standing", 
+  "Prone" = "prone", "Supine" = "supine", "SideLying" = "side_lying",
+  "Custom" = "custom", "Pronated" = "pronated", "Supinated" = "supinated",
+  "p90Degrees" = "90deg", "p90DegreesElbowFlexion" = "90deg_elbow_flex",
+  "ElbowExtended" = "elbow_extended", "Knee90Degrees" = "knee_90deg",
+  "IsometricMidThighPull" = "isometric_mid_thigh_pull"
+)
+
+# DynaMo Body Region Map - Maps API body region names to standardized snake_case  
+DYNAMO_BODY_REGION_MAP <- c(
+  "Neck" = "neck", "Shoulder" = "shoulder", "Trunk" = "trunk", "Hip" = "hip",
+  "Elbow" = "elbow", "Wrist" = "wrist", "Hand" = "hand", "Knee" = "knee",
+  "Ankle" = "ankle", "Foot" = "foot", "Scapula" = "scapula"
+)
+
+# ============================================================================
+# DynaMo Helper Functions (V3.0.1)
+# ============================================================================
+
+#' Safe field extraction from DynaMo JSON with type handling
+#' @param lst List of DynaMo test objects
+#' @param field Field name to extract
+#' @param type Expected type ("character" or "numeric")
+#' @return Vector of extracted values with NA for missing fields
+dynamo_safe_extract <- function(lst, field, type = "character") {
+  vapply(lst, function(x) {
+    val <- x[[field]]
+    if (is.null(val)) {
+      return(if (type == "numeric") NA_real_ else NA_character_)
+    }
+    if (type == "numeric") as.numeric(val) else as.character(val)
+  }, if (type == "numeric") numeric(1) else character(1), USE.NAMES = FALSE)
+}
+
+#' Apply standardization mapping with fallback to auto snake_case
+#' @param x Character vector of original names
+#' @param map Named character vector mapping original to standardized names
+#' @return Character vector of standardized names
+dynamo_std_map <- function(x, map) {
+  result <- map[x]
+  # For unmapped values, convert to snake_case automatically
+  result[is.na(result)] <- tolower(gsub("([a-z])([A-Z])", "\\1_\\2", x[is.na(result)]))
+  unname(result)
+}
 
 # ============================================================================
 # MDC Configuration (Athlete-Specific with Population Fallback)
@@ -790,6 +861,255 @@ calculate_athlete_mdc <- function(dt, metric_col, baseline_col, mdc_col, status_
   dt[, (temp_cols) := NULL]
   
   return(dt)
+}
+
+# ============================================================================
+# CMJ Compensation Detection Functions (V3.0.0)
+# ============================================================================
+
+#' Standardize column names for compensation detection
+#' Converts pivot output to expected naming convention (UPPER_SNAKE to lower_snake)
+#' @param dt data.table with raw pivot columns
+#' @return data.table with standardized column names
+standardize_compensation_columns <- function(dt) {
+  dt <- data.table::copy(dt)
+  all_cols <- names(dt)
+  
+  # Function to convert UPPER_SNAKE or camelCase to lower_snake
+  convert_name <- function(col, prefix) {
+    metric_part <- gsub(paste0("^", prefix, "_"), "", col)
+    new_name <- tolower(metric_part)
+    new_name <- gsub("([a-z])([A-Z])", "\\1_\\2", new_name)
+    new_name <- gsub("[^a-z0-9_]", "_", new_name)
+    new_name <- gsub("_+", "_", new_name)
+    new_name <- gsub("^_|_$", "", new_name)
+    paste0(tolower(prefix), "_", new_name)
+  }
+  
+  # Process each prefix type
+  for (prefix in c("Trial", "Left", "Right", "Asym")) {
+    pattern_cols <- grep(paste0("^", prefix, "_"), all_cols, value = TRUE)
+    for (col in pattern_cols) {
+      new_name <- convert_name(col, prefix)
+      if (!new_name %in% names(dt) && new_name != col) {
+        data.table::setnames(dt, col, new_name)
+      }
+    }
+  }
+  return(dt)
+}
+
+#' Calculate bilateral columns from left/right pairs
+#' @param dt data.table with left_ and right_ columns
+#' @return data.table with bilateral_ columns added
+calculate_bilateral_columns <- function(dt) {
+  dt <- data.table::copy(dt)
+  left_cols <- grep("^left_", names(dt), value = TRUE)
+  
+  for (left_col in left_cols) {
+    metric_name <- gsub("^left_", "", left_col)
+    right_col <- paste0("right_", metric_name)
+    bilateral_col <- paste0("bilateral_", metric_name)
+    
+    if (right_col %in% names(dt) && is.numeric(dt[[left_col]]) && !bilateral_col %in% names(dt)) {
+      dt[, (bilateral_col) := data.table::fcase(
+        !is.na(get(left_col)) & !is.na(get(right_col)), (get(left_col) + get(right_col)) / 2,
+        !is.na(get(left_col)), get(left_col),
+        !is.na(get(right_col)), get(right_col),
+        default = NA_real_
+      )]
+    }
+  }
+  return(dt)
+}
+
+#' Engineer efficiency features for compensation detection
+#' @param dt data.table with CMJ metrics
+#' @return data.table with efficiency features
+engineer_efficiency_features <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  # Total Jump Efficiency: Height per contraction time
+  if (all(c("trial_jump_height_inches_imp_mom", "trial_contraction_time") %in% names(dt))) {
+    dt[trial_contraction_time > 0,
+       efficiency_total := trial_jump_height_inches_imp_mom / trial_contraction_time]
+  }
+  
+  # Time Extension Index (key compensation signature)
+  if (all(c("trial_contraction_time", "trial_jump_height_inches_imp_mom") %in% names(dt))) {
+    dt[, expected_ct := 0.5 + (trial_jump_height_inches_imp_mom * 0.01)]
+    dt[expected_ct > 0, time_extension_index := trial_contraction_time / expected_ct]
+    dt[, expected_ct := NULL]
+  }
+  
+  # SSC Efficiency Index
+  if (all(c("trial_rsi_modified_imp_mom", "bilateral_peak_eccentric_force", "trial_body_mass") %in% names(dt))) {
+    dt[trial_body_mass > 0 & bilateral_peak_eccentric_force > 0,
+       ssc_efficiency_index := trial_rsi_modified_imp_mom / 
+         (bilateral_peak_eccentric_force / trial_body_mass / 100)]
+  }
+  
+  return(dt)
+}
+
+#' Engineer asymmetry aggregate features
+#' @param dt data.table with asymmetry columns
+#' @return data.table with aggregate asymmetry features
+engineer_asymmetry_features <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  key_asym_metrics <- c(
+    "asym_peak_eccentric_force", "asym_peak_concentric_force",
+    "asym_concentric_impulse", "asym_eccentric_braking_impulse",
+    "asym_force_at_zero_velocity", "asym_landing_impulse"
+  )
+  available_asym <- intersect(key_asym_metrics, names(dt))
+  
+  if (length(available_asym) > 0) {
+    dt[, asym_magnitude_mean := rowMeans(abs(.SD), na.rm = TRUE), .SDcols = available_asym]
+    dt[, asym_magnitude_max := apply(abs(.SD), 1, function(x) {
+      if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+    }), .SDcols = available_asym]
+    dt[, asym_count_elevated := rowSums(abs(.SD) > 10, na.rm = TRUE), .SDcols = available_asym]
+  }
+  return(dt)
+}
+
+#' Apply physics validation constraints
+#' @param dt data.table with CMJ metrics
+#' @return data.table with physics_valid column
+apply_physics_validation <- function(dt) {
+  dt <- data.table::copy(dt)
+  cfg <- COMPENSATION_CONFIG$physics
+  dt[, physics_valid := TRUE]
+  
+  # RSI-modified bounds
+  if ("trial_rsi_modified_imp_mom" %in% names(dt)) {
+    dt[!is.na(trial_rsi_modified_imp_mom) &
+         (trial_rsi_modified_imp_mom < cfg$rsi_mod_floor |
+          trial_rsi_modified_imp_mom > cfg$rsi_mod_ceiling),
+       physics_valid := FALSE]
+  }
+  
+  # Contraction time bounds
+  if ("trial_contraction_time" %in% names(dt)) {
+    dt[!is.na(trial_contraction_time) &
+         (trial_contraction_time < cfg$ct_floor |
+          trial_contraction_time > cfg$ct_ceiling),
+       physics_valid := FALSE]
+  }
+  
+  # Asymmetry impossible values
+  asym_cols <- grep("^asym_", names(dt), value = TRUE)
+  for (col in asym_cols) {
+    if (col %in% names(dt) && is.numeric(dt[[col]])) {
+      dt[!is.na(get(col)) & abs(get(col)) > cfg$asym_impossible_threshold,
+         physics_valid := FALSE]
+    }
+  }
+  return(dt)
+}
+
+#' Classify primary fatigue/compensation pattern
+#' @param dt data.table with readiness metrics
+#' @return data.table with fatigue_category
+classify_fatigue_pattern <- function(dt) {
+  dt <- data.table::copy(dt)
+  thresholds <- COMPENSATION_CONFIG$readiness_thresholds
+  
+  required_cols <- c("jump_height_readiness", "rsi_readiness")
+  if (!all(required_cols %in% names(dt))) {
+    dt[, fatigue_category := "INSUFFICIENT_DATA"]
+    return(dt)
+  }
+  
+  dt[, fatigue_category := data.table::fcase(
+    # Enhanced Readiness: Both JH and RSI elevated
+    jump_height_readiness > abs(thresholds$jh_yellow) &
+      rsi_readiness > abs(thresholds$rsi_yellow), "ENHANCED_READINESS",
+    
+    # True Fatigue: Both depressed
+    jump_height_readiness <= thresholds$jh_yellow &
+      rsi_readiness <= thresholds$rsi_yellow, "TRUE_FATIGUE",
+    
+    # Muscular Compensation: JH preserved but RSI depressed
+    jump_height_readiness > thresholds$jh_yellow &
+      rsi_readiness <= thresholds$rsi_yellow, "MUSCULAR_COMPENSATION",
+    
+    # Elastic Dominant: RSI elevated more than JH
+    rsi_readiness > abs(thresholds$rsi_yellow) &
+      jump_height_readiness <= abs(thresholds$jh_yellow), "ELASTIC_DOMINANT",
+    
+    # Normal Variation
+    default = "NORMAL"
+  )]
+  return(dt)
+}
+
+#' Refine fatigue category using compensation indicators
+#' @param dt data.table with fatigue_category and efficiency features
+#' @return data.table with refined fatigue_category
+refine_with_compensation_indicators <- function(dt) {
+  dt <- data.table::copy(dt)
+  
+  # Time extension indicates compensation strategy
+  if ("time_extension_index" %in% names(dt)) {
+    dt[fatigue_category == "TRUE_FATIGUE" &
+         !is.na(time_extension_index) &
+         time_extension_index > 1.15,
+       fatigue_category := "MUSCULAR_COMPENSATION"]
+  }
+  
+  # High asymmetry variability can indicate compensation
+  if ("asym_magnitude_max" %in% names(dt)) {
+    dt[fatigue_category == "NORMAL" &
+         !is.na(asym_magnitude_max) &
+         asym_magnitude_max > 25,
+       fatigue_category := "ELEVATED_ASYMMETRY"]
+  }
+  return(dt)
+}
+
+#' Main compensation detection pipeline for wide CMJ data
+#' @param cmj_wide data.table with full column structure
+#' @return data.table with test_ID and fatigue_category only
+run_compensation_detection <- function(cmj_wide) {
+  if (is.null(cmj_wide) || nrow(cmj_wide) == 0) {
+    return(data.table::data.table(test_ID = character(0), fatigue_category = character(0)))
+  }
+  
+  dt <- data.table::copy(cmj_wide)
+  if (exists("log_info", mode = "function")) {
+    log_info("Compensation detection: processing {nrow(dt)} tests")
+  }
+  
+  dt <- standardize_compensation_columns(dt)
+  dt <- calculate_bilateral_columns(dt)
+  dt <- engineer_efficiency_features(dt)
+  dt <- engineer_asymmetry_features(dt)
+  dt <- apply_physics_validation(dt)
+  dt <- classify_fatigue_pattern(dt)
+  dt <- refine_with_compensation_indicators(dt)
+  
+  # Override for physics failures
+  dt[physics_valid == FALSE, fatigue_category := "MEASUREMENT_ERROR"]
+  
+  # Log distribution
+  if (exists("log_info", mode = "function") && "fatigue_category" %in% names(dt)) {
+    fatigue_dist <- dt[, .N, by = fatigue_category]
+    log_info("Fatigue categories: {paste(paste0(fatigue_dist$fatigue_category, '=', fatigue_dist$N), collapse = ', ')}")
+  }
+  
+  # Return only test_ID and fatigue_category
+  if ("test_ID" %in% names(dt)) {
+    result <- unique(dt[, .(test_ID, fatigue_category)], by = "test_ID")
+  } else if ("testId" %in% names(dt)) {
+    result <- unique(dt[, .(test_ID = testId, fatigue_category)], by = "test_ID")
+  } else {
+    result <- data.table::data.table(test_ID = character(0), fatigue_category = character(0))
+  }
+  
+  return(result)
 }
 
 # ============================================================================
