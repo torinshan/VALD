@@ -4324,8 +4324,11 @@ if (fd_changed) {
                 existing_only[, is_new_data := FALSE]
                 
                 # Combine for score calculation
-                # Note: ignore.attr=TRUE prevents class attribute mismatch errors
-                # when combining new data with BigQuery historical data
+                # Note: ignore.attr=TRUE is critical here because we're combining:
+                #   1. Fresh API data (cmj_clean) 
+                #   2. Historical BigQuery data (existing_only) stored weeks/months ago
+                # Column class attributes (esp. POSIXct timezone info) may differ
+                # between these sources, causing rbindlist to fail without this parameter
                 cmj_combined <- data.table::rbindlist(
                   list(cmj_clean, existing_only[, names(cmj_clean), with = FALSE]),
                   use.names = TRUE, fill = TRUE, ignore.attr = TRUE
