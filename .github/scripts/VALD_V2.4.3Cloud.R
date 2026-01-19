@@ -4324,9 +4324,11 @@ if (fd_changed) {
                 existing_only[, is_new_data := FALSE]
                 
                 # Combine for score calculation
+                # Note: ignore.attr=TRUE prevents class attribute mismatch errors
+                # when combining new data with BigQuery historical data
                 cmj_combined <- data.table::rbindlist(
                   list(cmj_clean, existing_only[, names(cmj_clean), with = FALSE]),
-                  use.names = TRUE, fill = TRUE
+                  use.names = TRUE, fill = TRUE, ignore.attr = TRUE
                 )
                 
                 log_info("Combined dataset for score calculation: {nrow(cmj_combined)} records")
