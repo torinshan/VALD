@@ -1571,16 +1571,42 @@ bq_upsert <- function(data, table_name, key = "test_ID", mode = c("MERGE", "TRUN
         expiration_time = NULL
       )
     } else {
-      # Table exists - check for schema compatibility
-      existing_schema <- bigrquery::bq_table_meta(tbl)$schema$fields
-      existing_cols <- sapply(existing_schema, function(f) f$name)
-      new_cols <- names(data)
-      
-      missing_in_existing <- setdiff(new_cols, existing_cols)
-      if (length(missing_in_existing) > 0) {
-        log_warn("New columns not in existing table: {paste(missing_in_existing, collapse = ', ')}")
-        log_warn("MERGE may fail due to schema mismatch - consider adding columns to table first")
-      }
+      # V3.0.2 Schema Evolution: Add missing columns to existing table
+      tryCatch({
+        existing_schema <- bigrquery::bq_table_meta(tbl)$schema$fields
+        existing_cols <- sapply(existing_schema, function(f) f$name)
+        new_cols <- setdiff(names(data), existing_cols)
+
+        if (length(new_cols) > 0) {
+          log_info("Schema evolution: Adding {length(new_cols)} new column(s) to {table_name}: {paste(new_cols, collapse=', ')}")
+
+          # Build ALTER TABLE statements for each new column
+          for (col in new_cols) {
+            # Determine BigQuery type from R data type
+            col_data <- data[[col]]
+            bq_type <- if (is.numeric(col_data)) {
+              "FLOAT64"
+            } else if (inherits(col_data, c("POSIXct", "POSIXlt"))) {
+              "TIMESTAMP"
+            } else if (inherits(col_data, c("Date", "IDate"))) {
+              "DATE"
+            } else if (is.logical(col_data)) {
+              "BOOL"
+            } else if (is.integer(col_data)) {
+              "INT64"
+            } else {
+              "STRING"
+            }
+
+            alter_sql <- glue::glue("ALTER TABLE `{CONFIG$gcp_project}.{CONFIG$bq_dataset}.{table_name}` ADD COLUMN `{col}` {bq_type}")
+            bigrquery::bq_project_query(CONFIG$gcp_project, alter_sql)
+            log_info("Added column `{col}` ({bq_type}) to {table_name}")
+          }
+        }
+      }, error = function(e) {
+        log_warn("Schema evolution check failed for {table_name}: {e$message}")
+        # Continue anyway - the MERGE will fail if there's a real issue
+      })
     }
     
     if (mode == "TRUNCATE") {
