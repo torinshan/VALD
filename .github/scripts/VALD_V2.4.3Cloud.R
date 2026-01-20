@@ -2964,7 +2964,9 @@ standardize_data_types <- function(dt) {
   data.table::setDT(dt)
   for (col in names(dt)) {
     if (is.factor(dt[[col]])) dt[, (col) := as.character(get(col))]
-    if (grepl("height|weight|force|power|velocity|impulse|duration|ratio|rsi|stiffness", col, ignore.case = TRUE)) {
+    # Convert numeric metric columns - but exclude *_status and *_category columns (V3.0.2 fix)
+    if (grepl("height|weight|force|power|velocity|impulse|duration|ratio|rsi|stiffness", col, ignore.case = TRUE) &&
+        !grepl("_status$|_category$", col, ignore.case = TRUE)) {
       if (!is.numeric(dt[[col]])) {
         tryCatch({
           dt[, (col) := as.numeric(get(col))]
@@ -2996,7 +2998,11 @@ ensure_numeric_types <- function(dt, expected_columns = character()) {
   pattern_regex <- paste(numeric_patterns, collapse = "|")
   
   # Get all columns that should be numeric based on patterns
-  numeric_cols <- names(dt)[grepl(pattern_regex, names(dt), ignore.case = TRUE)]
+  # EXCLUDE columns ending in _status or _category (these are STRING columns) - V3.0.2 fix
+  numeric_cols <- names(dt)[
+    grepl(pattern_regex, names(dt), ignore.case = TRUE) &
+    !grepl("_status$|_category$", names(dt), ignore.case = TRUE)
+  ]
   
   # Also check expected_columns if provided
   if (length(expected_columns) > 0) {
