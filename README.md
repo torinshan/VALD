@@ -68,6 +68,7 @@ The main orchestration pipeline that runs on-demand or scheduled intervals:
 - **Tertiary FD Defense**: Position-specific defensive player analysis
 - **Workload Calc**: Standalone workload calculation workflow
 - **Debug Auth**: Authentication troubleshooting utilities
+- **Monitor BigQuery Logs**: Automated log monitoring that runs every 15 minutes to analyze errors and issues from the last 3 days
 
 ## Data Structure
 
@@ -91,6 +92,34 @@ The main orchestration pipeline that runs on-demand or scheduled intervals:
 4. **Model Training**: Individual models learn the relationship between prior workload and subsequent readiness metrics
 5. **Prediction**: Models predict expected readiness for upcoming sessions
 6. **Alerting**: Deviations from predicted readiness flag potential fatigue or injury risk
+
+## Log Monitoring
+
+The system includes automated log monitoring to track errors and issues:
+
+### Features
+- **Automated Monitoring**: Runs every 15 minutes via GitHub Actions
+- **Historical Analysis**: Reviews logs from the last 3 days (configurable)
+- **Comprehensive Reporting**: Generates summaries including:
+  - Error counts and classifications (Authentication, Timeout, API, BigQuery, etc.)
+  - Warning summaries
+  - Workflow run statistics (success/failure rates)
+  - Common issue patterns
+  - Daily activity summaries
+
+### Running Manually
+The log monitor can be triggered manually via GitHub Actions:
+1. Go to Actions → "Monitor BigQuery Logs (Every 15m)"
+2. Click "Run workflow"
+3. Optionally specify number of days to look back (default: 3)
+
+### Log Table
+All processing logs are stored in the `vald_processing_log` BigQuery table with:
+- `timestamp`: When the log entry was created
+- `level`: Log level (INFO, WARN, ERROR)
+- `message`: Log message content
+- `run_id`: GitHub workflow run identifier
+- `repository`: Repository name
 
 ## Configuration
 
