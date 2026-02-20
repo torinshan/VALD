@@ -4,18 +4,18 @@ on:
   # TEMPORARILY DISABLED: Related to VALD API issues (2026-01-05)
   # schedule:
   #   - cron: "*/15 * * * *"
-  workflow_dispatch:
-    inputs:
-      skip_training:
-        description: "Skip model training (ingest only)"
-        required: false
-        type: boolean
-        default: false
-      start_date:
+  #workflow_dispatch:
+    #inputs:
+      #skip_training:
+        #description: "Skip model training (ingest only)"
+        #required: false
+        #type: boolean
+        #default: false
+      #start_date:
         description: "Model training start date (YYYY-MM-DD)"
         required: false
         default: "2025-03-01"
-      end_date:
+      #end_date:
         description: "Model training end date (YYYY-MM-DD)"
         required: false
         default: "2026-12-31"
