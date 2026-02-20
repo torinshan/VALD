@@ -1,6 +1,6 @@
 name: Saturday Data Makeup (WIF)
 
-on:
+#on:
   schedule:
     - cron: "0 17 * * 6" # 9 AM Pacific on Saturdays (17:00 UTC)
   workflow_dispatch:
