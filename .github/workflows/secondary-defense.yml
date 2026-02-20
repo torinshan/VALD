@@ -1,6 +1,6 @@
 name: VALD Secondary Defense (Hourly)
 
-on:
+#on:
   schedule:
     - cron: "0 * * * *"  # Run every hour at :00
   workflow_dispatch:  # Allow manual trigger
